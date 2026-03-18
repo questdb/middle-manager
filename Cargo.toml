@@ -3,6 +3,8 @@ name = "middle-manager"
 version = "0.1.0"
 edition = "2021"
 description = "A dual-panel file manager TUI inspired by Far Manager"
+license = "Apache-2.0"
+repository = "https://github.com/questdb/middle-manager"
 
 [dependencies]
 ratatui = "0.29"
