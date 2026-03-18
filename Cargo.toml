@@ -1,0 +1,12 @@
+[package]
+name = "middle-manager"
+version = "0.1.0"
+edition = "2021"
+description = "A dual-panel file manager TUI inspired by Far Manager"
+
+[dependencies]
+ratatui = "0.29"
+crossterm = "0.28"
+chrono = "0.4"
+anyhow = "1"
+unicode-width = "0.2"
