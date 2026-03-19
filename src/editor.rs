@@ -45,6 +45,10 @@ pub struct EditorState {
 
     /// Selection anchor (line, col). Selection spans from anchor to cursor.
     pub selection_anchor: Option<(usize, usize)>,
+    /// True when the selection was set by a search (match highlight).
+    /// The next user-initiated selection (Shift+arrow) will clear it
+    /// and start a fresh selection from the cursor position.
+    search_selection: bool,
 
     /// Last search parameters for find-next/find-previous.
     pub last_search: Option<SearchParams>,
@@ -80,6 +84,7 @@ impl EditorState {
             modified: false,
             status_msg: None,
             selection_anchor: None,
+            search_selection: false,
             last_search: None,
         };
         // Pre-scan first batch of lines for immediate display
@@ -533,18 +538,14 @@ impl EditorState {
 
         let cursor_line = self.cursor_line;
         let cursor_col = self.cursor_col;
-        // For reverse search, the selection anchor marks the START of the current match
-        // and cursor_col marks the END. We need both:
-        //   - Pass 0 (search before cursor): limit_to uses anchor_col (exclude current match)
-        //   - Pass 1 (wrap after cursor): skip_to uses cursor_col (skip past current match)
-        let anchor_col = if reverse {
-            self.selection_anchor
-                .filter(|(l, _)| *l == cursor_line)
-                .map(|(_, c)| c)
-                .unwrap_or(cursor_col)
-        } else {
-            cursor_col
-        };
+        // After a search: cursor is at match START, anchor at match END.
+        // For forward: skip past the match end (anchor_col) to avoid re-finding.
+        // For reverse: limit to before the match start (cursor_col) to avoid re-finding.
+        let anchor_col = self
+            .selection_anchor
+            .filter(|(l, _)| *l == cursor_line)
+            .map(|(_, c)| c)
+            .unwrap_or(cursor_col);
 
         let cursor_plan_idx = plan
             .iter()
@@ -553,11 +554,12 @@ impl EditorState {
 
         // Two passes: from cursor in search direction, then wrap around
         for pass in 0..2 {
-            // For reverse: pass 0 limits at anchor_col, pass 1 skips past cursor_col
+            // Forward: skip past anchor_col (match end) in pass 0, limit at cursor_col in pass 1
+            // Reverse: limit at cursor_col (match start) in pass 0, skip past anchor_col in pass 1
             let col_for_pass = if reverse {
-                if pass == 0 { anchor_col } else { cursor_col }
+                if pass == 0 { cursor_col } else { anchor_col }
             } else {
-                cursor_col
+                if pass == 0 { anchor_col } else { cursor_col }
             };
             let result = self.find_streaming_pass(
                 &plan,
@@ -570,9 +572,13 @@ impl EditorState {
                 pass,
             );
             if let Some((line, col, match_len)) = result {
-                self.selection_anchor = Some((line, col));
+                // Cursor at match START, anchor at match END.
+                // This highlights the match and places the cursor on its
+                // first character, so Shift+Right selects from there.
+                self.selection_anchor = Some((line, col + match_len));
+                self.search_selection = true;
                 self.cursor_line = line;
-                self.cursor_col = col + match_len;
+                self.cursor_col = col;
                 self.desired_col = self.cursor_col;
                 self.scroll_to_cursor();
                 return true;
@@ -908,11 +914,13 @@ impl EditorState {
 
     pub fn clear_selection(&mut self) {
         self.selection_anchor = None;
+        self.search_selection = false;
     }
 
     fn ensure_anchor(&mut self) {
-        if self.selection_anchor.is_none() {
+        if self.selection_anchor.is_none() || self.search_selection {
             self.selection_anchor = Some((self.cursor_line, self.cursor_col));
+            self.search_selection = false;
         }
     }
 
@@ -1411,6 +1419,9 @@ fn rfind_with(
 
 /// Convert a byte position in a chunk to (line_offset, char_column).
 /// `base_line` is the line number at the start of the chunk.
+/// Column counts only non-control characters (excluding \n), matching how the
+/// editor loads lines (read_original_line strips trailing \r, and the display
+/// strips control characters).
 fn byte_pos_to_line_col(chunk: &[u8], byte_pos: usize, base_line: usize) -> (usize, usize) {
     let mut line = base_line;
     let mut last_newline_pos: Option<usize> = None;
@@ -1424,7 +1435,8 @@ fn byte_pos_to_line_col(chunk: &[u8], byte_pos: usize, base_line: usize) -> (usi
         Some(pos) => pos + 1,
         None => 0,
     };
-    // Column in chars (not bytes) from line start to match position
+    // Count chars from line start to match position, excluding trailing \r
+    // before \n, matching how read_original_line strips trailing \r.
     let line_bytes = &chunk[line_start..byte_pos];
     let col = std::str::from_utf8(line_bytes)
         .map(|s| s.chars().count())
@@ -1642,6 +1654,7 @@ mod tests {
         assert_eq!(editor.selection_anchor, Some((0, 0)));
         // Cursor should be at end of last non-empty line
         assert!(editor.cursor_line >= 2);
+        assert!(editor.cursor_col > 0);
     }
 
     // --- Search tests ---
@@ -1661,40 +1674,40 @@ mod tests {
         editor.cursor_col = 0;
         let params = make_search("hello", SearchDirection::Forward, true);
         assert!(editor.find(&params));
-        // Should find first "hello" at line 0, col 0; cursor at end of match
-        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        // Should find first "hello" at line 0, col 0; cursor at match start
         assert_eq!(editor.cursor_line, 0);
-        assert_eq!(editor.cursor_col, 5);
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((0, 5)));
     }
 
     #[test]
     fn search_forward_skips_cursor_position() {
         let mut editor = create_test_editor("hello world\nfoo bar\nhello again\n");
-        // Cursor at end of first "hello"
+        // Simulate: just found first "hello" — cursor at match start (0), anchor at match end (5)
         editor.cursor_line = 0;
-        editor.cursor_col = 5;
-        editor.selection_anchor = Some((0, 0));
+        editor.cursor_col = 0;
+        editor.selection_anchor = Some((0, 5));
         let params = make_search("hello", SearchDirection::Forward, true);
         assert!(editor.find(&params));
         // Should find second "hello" at line 2, col 0
-        assert_eq!(editor.selection_anchor, Some((2, 0)));
         assert_eq!(editor.cursor_line, 2);
-        assert_eq!(editor.cursor_col, 5);
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((2, 5)));
     }
 
     #[test]
     fn search_forward_wraps_around() {
         let mut editor = create_test_editor("hello world\nfoo bar\nhello again\n");
-        // Cursor past the last "hello"
+        // Simulate: just found "hello" on line 2 — cursor at start (0), anchor at end (5)
         editor.cursor_line = 2;
-        editor.cursor_col = 5;
-        editor.selection_anchor = Some((2, 0));
+        editor.cursor_col = 0;
+        editor.selection_anchor = Some((2, 5));
         let params = make_search("hello", SearchDirection::Forward, true);
         assert!(editor.find(&params));
         // Should wrap and find first "hello" at line 0
-        assert_eq!(editor.selection_anchor, Some((0, 0)));
         assert_eq!(editor.cursor_line, 0);
-        assert_eq!(editor.cursor_col, 5);
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((0, 5)));
     }
 
     #[test]
@@ -1705,25 +1718,25 @@ mod tests {
         editor.cursor_col = 11;
         let params = make_search("hello", SearchDirection::Backward, true);
         assert!(editor.find(&params));
-        // Should find "hello" on line 2
-        assert_eq!(editor.selection_anchor, Some((2, 0)));
+        // Should find "hello" on line 2; cursor at match start, anchor at match end
         assert_eq!(editor.cursor_line, 2);
-        assert_eq!(editor.cursor_col, 5);
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((2, 5)));
     }
 
     #[test]
     fn search_backward_does_not_refind_same_match() {
         let mut editor = create_test_editor("hello world\nfoo bar\nhello again\n");
-        // Simulate: just found "hello" on line 2 (cursor at end, anchor at start)
+        // Simulate: just found "hello" on line 2 (cursor at start, anchor at end)
         editor.cursor_line = 2;
-        editor.cursor_col = 5;
-        editor.selection_anchor = Some((2, 0));
+        editor.cursor_col = 0;
+        editor.selection_anchor = Some((2, 5));
         let params = make_search("hello", SearchDirection::Backward, true);
         assert!(editor.find(&params));
         // Should find "hello" on line 0, NOT line 2 again
-        assert_eq!(editor.selection_anchor, Some((0, 0)));
         assert_eq!(editor.cursor_line, 0);
-        assert_eq!(editor.cursor_col, 5);
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((0, 5)));
     }
 
     #[test]
@@ -1734,10 +1747,10 @@ mod tests {
         editor.cursor_col = 0;
         let params = make_search("hello", SearchDirection::Backward, true);
         assert!(editor.find(&params));
-        // Should wrap and find "hello" on line 2
-        assert_eq!(editor.selection_anchor, Some((2, 0)));
+        // Should wrap and find "hello" on line 2; cursor at match start, anchor at match end
         assert_eq!(editor.cursor_line, 2);
-        assert_eq!(editor.cursor_col, 5);
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((2, 5)));
     }
 
     #[test]
@@ -1747,9 +1760,9 @@ mod tests {
         editor.cursor_col = 0;
         let params = make_search("hello", SearchDirection::Forward, false);
         assert!(editor.find(&params));
-        // Should find "Hello" at line 0 (case insensitive)
-        assert_eq!(editor.selection_anchor, Some((0, 0)));
-        assert_eq!(editor.cursor_col, 5);
+        // Should find "Hello" at line 0 (case insensitive); cursor at match start, anchor at match end
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((0, 5)));
     }
 
     #[test]
@@ -1784,8 +1797,9 @@ mod tests {
         editor.cursor_col = 0;
         let params = make_search("brown", SearchDirection::Forward, true);
         assert!(editor.find(&params));
-        assert_eq!(editor.selection_anchor, Some((0, 10)));
-        assert_eq!(editor.cursor_col, 15);
+        // cursor at match start (10), anchor at match end (15)
+        assert_eq!(editor.cursor_col, 10);
+        assert_eq!(editor.selection_anchor, Some((0, 15)));
     }
 
     #[test]
@@ -1796,30 +1810,42 @@ mod tests {
 
         let fwd = make_search("aaa", SearchDirection::Forward, true);
 
-        // First forward: line 0
+        // First forward: line 0 — cursor at match start (0), anchor at match end (3)
         assert!(editor.find(&fwd));
-        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        assert_eq!(editor.cursor_line, 0);
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((0, 3)));
 
         // Second forward: line 2
         assert!(editor.find(&fwd));
-        assert_eq!(editor.selection_anchor, Some((2, 0)));
+        assert_eq!(editor.cursor_line, 2);
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((2, 3)));
 
         // Third forward: line 4
         assert!(editor.find(&fwd));
-        assert_eq!(editor.selection_anchor, Some((4, 0)));
+        assert_eq!(editor.cursor_line, 4);
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((4, 3)));
 
         // Fourth forward: wraps to line 0
         assert!(editor.find(&fwd));
-        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        assert_eq!(editor.cursor_line, 0);
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((0, 3)));
 
         // Now backward from line 0: should wrap to line 4
         let bwd = make_search("aaa", SearchDirection::Backward, true);
         assert!(editor.find(&bwd));
-        assert_eq!(editor.selection_anchor, Some((4, 0)));
+        assert_eq!(editor.cursor_line, 4);
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((4, 3)));
 
         // Backward again: line 2
         assert!(editor.find(&bwd));
-        assert_eq!(editor.selection_anchor, Some((2, 0)));
+        assert_eq!(editor.cursor_line, 2);
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((2, 3)));
     }
 
     #[test]
@@ -1830,24 +1856,25 @@ mod tests {
 
         let fwd = make_search("ab", SearchDirection::Forward, true);
 
-        // First: col 0
+        // First: cursor at match start (0), anchor at match end (2)
         assert!(editor.find(&fwd));
-        assert_eq!(editor.selection_anchor, Some((0, 0)));
-        assert_eq!(editor.cursor_col, 2);
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((0, 2)));
 
-        // Second: col 3
+        // Second: cursor at 3, anchor at 5
         assert!(editor.find(&fwd));
-        assert_eq!(editor.selection_anchor, Some((0, 3)));
-        assert_eq!(editor.cursor_col, 5);
+        assert_eq!(editor.cursor_col, 3);
+        assert_eq!(editor.selection_anchor, Some((0, 5)));
 
-        // Third: col 6
+        // Third: cursor at 6, anchor at 8
         assert!(editor.find(&fwd));
-        assert_eq!(editor.selection_anchor, Some((0, 6)));
-        assert_eq!(editor.cursor_col, 8);
+        assert_eq!(editor.cursor_col, 6);
+        assert_eq!(editor.selection_anchor, Some((0, 8)));
 
         // Wraps back to col 0
         assert!(editor.find(&fwd));
-        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((0, 2)));
     }
 
     #[test]
@@ -1859,21 +1886,316 @@ mod tests {
 
         let bwd = make_search("ab", SearchDirection::Backward, true);
 
-        // First backward: col 6
+        // First backward: cursor at match start (6), anchor at match end (8)
         assert!(editor.find(&bwd));
-        assert_eq!(editor.selection_anchor, Some((0, 6)));
+        assert_eq!(editor.cursor_col, 6);
+        assert_eq!(editor.selection_anchor, Some((0, 8)));
 
-        // Second backward: col 3
+        // Second backward: cursor at 3, anchor at 5
         assert!(editor.find(&bwd));
-        assert_eq!(editor.selection_anchor, Some((0, 3)));
+        assert_eq!(editor.cursor_col, 3);
+        assert_eq!(editor.selection_anchor, Some((0, 5)));
 
-        // Third backward: col 0
+        // Third backward: cursor at 0, anchor at 2
         assert!(editor.find(&bwd));
-        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((0, 2)));
 
         // Wraps to col 6
         assert!(editor.find(&bwd));
+        assert_eq!(editor.cursor_col, 6);
+        assert_eq!(editor.selection_anchor, Some((0, 8)));
+    }
+
+    // --- Selection behavior tests ---
+
+    #[test]
+    fn select_right_single_char() {
+        let mut editor = create_test_editor("hello\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+        editor.select_right();
+        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        assert_eq!(editor.cursor_col, 1);
+        assert_eq!(editor.selected_text(), Some("h".to_string()));
+    }
+
+    #[test]
+    fn select_right_multiple_chars() {
+        let mut editor = create_test_editor("hello\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+        editor.select_right();
+        editor.select_right();
+        editor.select_right();
+        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        assert_eq!(editor.cursor_col, 3);
+        assert_eq!(editor.selected_text(), Some("hel".to_string()));
+    }
+
+    #[test]
+    fn select_right_from_middle() {
+        let mut editor = create_test_editor("hello world\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 6;
+        editor.select_right();
+        editor.select_right();
         assert_eq!(editor.selection_anchor, Some((0, 6)));
+        assert_eq!(editor.cursor_col, 8);
+        assert_eq!(editor.selected_text(), Some("wo".to_string()));
+    }
+
+    #[test]
+    fn select_right_at_line_end_wraps() {
+        let mut editor = create_test_editor("hi\nthere\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 2; // end of "hi"
+        editor.select_right();
+        // Should wrap to start of next line
+        assert_eq!(editor.selection_anchor, Some((0, 2)));
+        assert_eq!(editor.cursor_line, 1);
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selected_text(), Some("\n".to_string()));
+    }
+
+    #[test]
+    fn select_left_single_char() {
+        let mut editor = create_test_editor("hello\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 3;
+        editor.select_left();
+        assert_eq!(editor.selection_anchor, Some((0, 3)));
+        assert_eq!(editor.cursor_col, 2);
+        assert_eq!(editor.selected_text(), Some("l".to_string()));
+    }
+
+    #[test]
+    fn select_left_at_line_start_wraps() {
+        let mut editor = create_test_editor("hello\nworld\n");
+        editor.cursor_line = 1;
+        editor.cursor_col = 0;
+        editor.select_left();
+        assert_eq!(editor.selection_anchor, Some((1, 0)));
+        assert_eq!(editor.cursor_line, 0);
+        assert_eq!(editor.cursor_col, 5); // end of "hello"
+        assert_eq!(editor.selected_text(), Some("\n".to_string()));
+    }
+
+    #[test]
+    fn select_right_then_left_cancels() {
+        let mut editor = create_test_editor("hello\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 2;
+        editor.select_right();
+        editor.select_right();
+        assert_eq!(editor.selected_text(), Some("ll".to_string()));
+        editor.select_left();
+        assert_eq!(editor.selected_text(), Some("l".to_string()));
+        editor.select_left();
+        // Cursor back at anchor — empty selection
+        assert_eq!(editor.cursor_col, 2);
+        assert_eq!(editor.selection_anchor, Some((0, 2)));
+    }
+
+    #[test]
+    fn select_down_selects_to_same_col() {
+        let mut editor = create_test_editor("hello\nworld\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 2;
+        editor.desired_col = 2;
+        editor.select_down();
+        assert_eq!(editor.selection_anchor, Some((0, 2)));
+        assert_eq!(editor.cursor_line, 1);
+        assert_eq!(editor.cursor_col, 2);
+        assert_eq!(editor.selected_text(), Some("llo\nwo".to_string()));
+    }
+
+    #[test]
+    fn select_up_from_second_line() {
+        let mut editor = create_test_editor("hello\nworld\n");
+        editor.cursor_line = 1;
+        editor.cursor_col = 3;
+        editor.desired_col = 3;
+        editor.select_up();
+        assert_eq!(editor.selection_anchor, Some((1, 3)));
+        assert_eq!(editor.cursor_line, 0);
+        assert_eq!(editor.cursor_col, 3);
+        assert_eq!(editor.selected_text(), Some("lo\nwor".to_string()));
+    }
+
+    #[test]
+    fn select_line_end() {
+        let mut editor = create_test_editor("hello world\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+        editor.select_line_end();
+        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        assert_eq!(editor.cursor_col, 11);
+        assert_eq!(editor.selected_text(), Some("hello world".to_string()));
+    }
+
+    #[test]
+    fn select_line_start() {
+        let mut editor = create_test_editor("hello world\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 5;
+        editor.select_line_start();
+        assert_eq!(editor.selection_anchor, Some((0, 5)));
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selected_text(), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn select_after_search_starts_fresh() {
+        let mut editor = create_test_editor("hello world\nfoo bar\nhello again\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+
+        // Search forward — cursor at match start (0), anchor at match end (5)
+        let params = make_search("hello", SearchDirection::Forward, true);
+        assert!(editor.find(&params));
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((0, 5)));
+
+        // Now Shift+Right — ensure_anchor resets anchor to cursor (match start=0), then cursor moves to 1
+        editor.select_right();
+        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        assert_eq!(editor.cursor_col, 1);
+        assert_eq!(editor.selected_text(), Some("h".to_string()));
+    }
+
+    #[test]
+    fn select_after_reverse_search_starts_fresh() {
+        let mut editor = create_test_editor("hello world\nfoo bar\nhello again\n");
+        editor.cursor_line = 2;
+        editor.cursor_col = 11;
+
+        // Backward search — cursor at match start (0), anchor at match end (5)
+        let params = make_search("hello", SearchDirection::Backward, true);
+        assert!(editor.find(&params));
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((2, 5)));
+
+        // Shift+Right — ensure_anchor resets anchor to cursor (match start=0), then cursor moves to 1
+        editor.select_right();
+        assert_eq!(editor.selection_anchor, Some((2, 0)));
+        assert_eq!(editor.cursor_col, 1);
+        assert_eq!(editor.selected_text(), Some("h".to_string()));
+    }
+
+    #[test]
+    fn search_then_select_right_crlf_file() {
+        // File with \r\n line endings — search column must match editor column
+        let mut editor = create_test_editor("hello world\r\nfoo bar\r\nhello again\r\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+
+        let params = make_search("foo", SearchDirection::Forward, true);
+        assert!(editor.find(&params));
+        // cursor at match start (0), anchor at match end (3)
+        assert_eq!(editor.cursor_line, 1);
+        assert_eq!(editor.cursor_col, 0);
+        assert_eq!(editor.selection_anchor, Some((1, 3)));
+
+        // Shift+Right — ensure_anchor resets anchor to cursor (0), cursor moves to 1
+        editor.select_right();
+        assert_eq!(editor.selection_anchor, Some((1, 0)));
+        assert_eq!(editor.cursor_col, 1);
+        // Editor's line 1 is "foo bar" (stripped \r), char at col 0 = 'f'
+        assert_eq!(editor.selected_text(), Some("f".to_string()));
+    }
+
+    #[test]
+    fn select_left_after_forward_search() {
+        let mut editor = create_test_editor("abcdef NEEDLE xyz\nsecond line\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+
+        let params = make_search("NEEDLE", SearchDirection::Forward, true);
+        assert!(editor.find(&params));
+        // Match at col 7; cursor at match start (7), anchor at match end (13)
+        assert_eq!(editor.cursor_col, 7);
+        assert_eq!(editor.selection_anchor, Some((0, 13)));
+        assert!(editor.search_selection);
+
+        // Shift+Left: ensure_anchor resets anchor to cursor (7), cursor moves to 6
+        // Selects char at col 6 = ' ' (space before NEEDLE)
+        editor.select_left();
+        assert_eq!(editor.selection_anchor, Some((0, 7)));
+        assert_eq!(editor.cursor_col, 6);
+        assert_eq!(editor.selected_text(), Some(" ".to_string()));
+    }
+
+    #[test]
+    fn select_left_after_forward_search_cursor_was_elsewhere() {
+        // Simulate: cursor was at col 50 before search, search finds match at col 11
+        let mut editor = create_test_editor(
+            "0123456789 NEEDLE rest of the line with lots of padding chars here\n",
+        );
+        editor.cursor_line = 0;
+        editor.cursor_col = 50; // cursor was here before search
+
+        let params = make_search("NEEDLE", SearchDirection::Forward, true);
+        assert!(editor.find(&params));
+        // Match at col 11; cursor at match start (11), anchor at match end (17)
+        assert_eq!(editor.cursor_col, 11);
+        assert_eq!(editor.selection_anchor, Some((0, 17)));
+
+        // Shift+Left: ensure_anchor resets anchor to cursor (11), cursor moves to 10
+        // Selects char at col 10 = ' ' (space before NEEDLE)
+        // NOT at old cursor pos (50)
+        editor.select_left();
+        assert_eq!(editor.selection_anchor, Some((0, 11)));
+        assert_eq!(editor.cursor_col, 10);
+        assert_eq!(editor.selected_text(), Some(" ".to_string()));
+    }
+
+    #[test]
+    fn search_column_matches_editor_column_crlf() {
+        // Verify search result column matches what the editor sees
+        let mut editor = create_test_editor("abcdef\r\nXYZhello\r\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+
+        let params = make_search("hello", SearchDirection::Forward, true);
+        assert!(editor.find(&params));
+        // Editor's line 1 is "XYZhello" (8 chars, \r stripped)
+        // "hello" starts at col 3; cursor at match start, anchor at match end
+        assert_eq!(editor.cursor_col, 3);
+        assert_eq!(editor.selection_anchor, Some((1, 8))); // 3 + 5
+    }
+
+    #[test]
+    fn clear_selection_resets_anchor() {
+        let mut editor = create_test_editor("hello\n");
+        editor.cursor_col = 0;
+        editor.select_right();
+        editor.select_right();
+        assert!(editor.selection_anchor.is_some());
+        editor.clear_selection();
+        assert!(editor.selection_anchor.is_none());
+        assert_eq!(editor.selected_text(), None);
+    }
+
+    #[test]
+    fn select_right_exact_text_boundary() {
+        // Verify selection of each character position matches expected text
+        let mut editor = create_test_editor("abcde\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+
+        let expected = ["a", "ab", "abc", "abcd", "abcde"];
+        for (i, exp) in expected.iter().enumerate() {
+            editor.select_right();
+            assert_eq!(
+                editor.selected_text(),
+                Some(exp.to_string()),
+                "After {} select_right calls, expected '{}' but got '{:?}'",
+                i + 1,
+                exp,
+                editor.selected_text()
+            );
+        }
     }
 
     // --- Large file / multi-chunk search tests ---

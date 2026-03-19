@@ -8,10 +8,14 @@ use unicode_width::UnicodeWidthChar;
 use crate::editor::EditorState;
 use crate::theme::theme;
 
-const LINE_NUM_WIDTH: usize = 7; // "  1234 " = 7 chars
-
 pub fn render(frame: &mut Frame, area: Rect, editor: &mut EditorState) {
     let t = theme();
+
+    // Compute line number width dynamically based on total lines
+    let total_lines = editor.total_virtual_lines().max(1);
+    let num_digits = ((total_lines as f64).log10().floor() as usize) + 1;
+    let num_digits = num_digits.max(4); // minimum 4 digits
+    let line_num_width = num_digits + 2; // digits + space + separator
 
     let modified_indicator = if editor.modified { " [Modified]" } else { "" };
     let title = format!(" {} {}", editor.path.to_string_lossy(), modified_indicator);
@@ -24,7 +28,7 @@ pub fn render(frame: &mut Frame, area: Rect, editor: &mut EditorState) {
 
     let inner = block.inner(area);
     editor.visible_lines = inner.height.saturating_sub(1) as usize;
-    editor.visible_cols = (inner.width as usize).saturating_sub(LINE_NUM_WIDTH);
+    editor.visible_cols = (inner.width as usize).saturating_sub(line_num_width);
 
     let sel_range = editor.selection_range();
     let content = editor.visible_content();
@@ -68,7 +72,7 @@ pub fn render(frame: &mut Frame, area: Rect, editor: &mut EditorState) {
         );
 
         let mut spans = vec![
-            Span::styled(format!("{:>5} ", line_num), num_style),
+            Span::styled(format!("{:>width$} ", line_num, width = num_digits), num_style),
             Span::styled("\u{2502}", sep_style),
         ];
         spans.extend(text_spans);
@@ -134,7 +138,7 @@ pub fn render(frame: &mut Frame, area: Rect, editor: &mut EditorState) {
         .find(|(vl, _)| *vl == editor.cursor_line)
         .map(|(_, text)| orig_col_to_display_col(text, editor.cursor_col, editor.scroll_x))
         .unwrap_or(0);
-    let cursor_screen_x = inner.x as usize + LINE_NUM_WIDTH + cursor_display_col;
+    let cursor_screen_x = inner.x as usize + line_num_width + cursor_display_col;
     let cursor_screen_y = inner.y as usize + editor.cursor_line.saturating_sub(editor.scroll_y);
 
     if cursor_screen_x < (inner.x + inner.width) as usize
