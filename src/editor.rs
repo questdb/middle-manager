@@ -39,6 +39,10 @@ pub struct EditorState {
     pub scroll_x: usize,
     pub visible_lines: usize,
     pub visible_cols: usize,
+    /// Set by the renderer for mouse click coordinate conversion.
+    pub viewport_x: u16,
+    pub viewport_y: u16,
+    pub line_num_width: usize,
 
     pub modified: bool,
     pub status_msg: Option<String>,
@@ -81,6 +85,9 @@ impl EditorState {
             scroll_x: 0,
             visible_lines: 0,
             visible_cols: 0,
+            viewport_x: 0,
+            viewport_y: 0,
+            line_num_width: 7,
             modified: false,
             status_msg: None,
             selection_anchor: None,
@@ -400,6 +407,61 @@ impl EditorState {
         self.scroll_to_cursor();
     }
 
+    pub fn word_left(&mut self) {
+        if self.cursor_col == 0 {
+            // Jump to end of previous line
+            if self.cursor_line > 0 {
+                self.cursor_line -= 1;
+                self.cursor_col = self.current_line_len();
+            }
+            self.desired_col = self.cursor_col;
+            self.scroll_to_cursor();
+            return;
+        }
+        let text = self.current_line_text();
+        let chars: Vec<char> = text.chars().collect();
+        let mut col = self.cursor_col;
+        // Skip whitespace/punctuation backwards
+        while col > 0 && !chars[col - 1].is_alphanumeric() {
+            col -= 1;
+        }
+        // Skip word characters backwards
+        while col > 0 && chars[col - 1].is_alphanumeric() {
+            col -= 1;
+        }
+        self.cursor_col = col;
+        self.desired_col = col;
+        self.scroll_to_cursor();
+    }
+
+    pub fn word_right(&mut self) {
+        let text = self.current_line_text();
+        let chars: Vec<char> = text.chars().collect();
+        let len = chars.len();
+        if self.cursor_col >= len {
+            // Jump to start of next line
+            if self.cursor_line + 1 < self.total_virtual_lines() {
+                self.cursor_line += 1;
+                self.cursor_col = 0;
+            }
+            self.desired_col = self.cursor_col;
+            self.scroll_to_cursor();
+            return;
+        }
+        let mut col = self.cursor_col;
+        // Skip word characters forward
+        while col < len && chars[col].is_alphanumeric() {
+            col += 1;
+        }
+        // Skip whitespace/punctuation forward
+        while col < len && !chars[col].is_alphanumeric() {
+            col += 1;
+        }
+        self.cursor_col = col;
+        self.desired_col = col;
+        self.scroll_to_cursor();
+    }
+
     pub fn cursor_line_start(&mut self) {
         self.cursor_col = 0;
         self.desired_col = 0;
@@ -453,6 +515,37 @@ impl EditorState {
     fn restore_desired_col(&mut self) {
         let len = self.current_line_len();
         self.cursor_col = self.desired_col.min(len);
+    }
+
+    /// Convert a screen click (col, row) to an editor (line, col) and move cursor there.
+    pub fn click_at(&mut self, screen_col: u16, screen_row: u16) {
+        let text_x = self.viewport_x as usize + self.line_num_width;
+        if (screen_col as usize) < text_x {
+            return; // clicked on line number gutter
+        }
+        if screen_row < self.viewport_y {
+            return;
+        }
+
+        let row_offset = (screen_row - self.viewport_y) as usize;
+        let target_line = self.scroll_y + row_offset;
+        if target_line >= self.total_virtual_lines() {
+            return;
+        }
+
+        let display_col = (screen_col as usize) - text_x;
+
+        // Convert display column to original char column (reverse of orig_col_to_display_col)
+        let orig_col = if let Some(text) = self.get_line_text(target_line) {
+            display_col_to_orig_col(&text, display_col, self.scroll_x)
+        } else {
+            0
+        };
+
+        self.clear_selection();
+        self.cursor_line = target_line;
+        self.cursor_col = orig_col;
+        self.desired_col = orig_col;
     }
 
     pub fn scroll_to_cursor(&mut self) {
@@ -1481,6 +1574,31 @@ fn char_count_in_bytes(data: &[u8]) -> usize {
         .unwrap_or(data.len())
 }
 
+/// Convert a display column back to an original char column,
+/// accounting for tab expansion and control characters.
+fn display_col_to_orig_col(text: &str, display_col: usize, scroll_x: usize) -> usize {
+    let mut dcol = 0;
+    for (i, ch) in text.chars().enumerate() {
+        if i < scroll_x {
+            continue;
+        }
+        // Skip zero-width control chars — they don't occupy display space
+        if ch.is_control() && ch != '\t' {
+            continue;
+        }
+        if dcol >= display_col {
+            return i;
+        }
+        if ch == '\t' {
+            dcol += 4 - (dcol % 4);
+        } else {
+            dcol += 1;
+        }
+    }
+    // Past end of line — clamp to line length
+    text.chars().count()
+}
+
 fn char_to_byte(s: &str, char_pos: usize) -> usize {
     s.char_indices()
         .nth(char_pos)
@@ -2196,6 +2314,217 @@ mod tests {
                 editor.selected_text()
             );
         }
+    }
+
+    // --- Word navigation tests ---
+
+    #[test]
+    fn word_right_basic() {
+        let mut editor = create_test_editor("hello world foo\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+        editor.word_right();
+        assert_eq!(editor.cursor_col, 6); // past "hello " → start of "world"
+        editor.word_right();
+        assert_eq!(editor.cursor_col, 12); // past "world " → start of "foo"
+        editor.word_right();
+        assert_eq!(editor.cursor_col, 15); // end of line
+    }
+
+    #[test]
+    fn word_left_basic() {
+        let mut editor = create_test_editor("hello world foo\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 15;
+        editor.word_left();
+        assert_eq!(editor.cursor_col, 12); // start of "foo"
+        editor.word_left();
+        assert_eq!(editor.cursor_col, 6); // start of "world"
+        editor.word_left();
+        assert_eq!(editor.cursor_col, 0); // start of "hello"
+    }
+
+    #[test]
+    fn word_right_with_punctuation() {
+        let mut editor = create_test_editor("foo.bar(baz)\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+        editor.word_right();
+        assert_eq!(editor.cursor_col, 4); // past "foo." → start of "bar"
+        editor.word_right();
+        assert_eq!(editor.cursor_col, 8); // past "bar(" → start of "baz"
+    }
+
+    #[test]
+    fn word_left_with_punctuation() {
+        let mut editor = create_test_editor("foo.bar(baz)\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 12;
+        editor.word_left();
+        assert_eq!(editor.cursor_col, 8); // start of "baz"
+        editor.word_left();
+        assert_eq!(editor.cursor_col, 4); // start of "bar"
+        editor.word_left();
+        assert_eq!(editor.cursor_col, 0); // start of "foo"
+    }
+
+    #[test]
+    fn word_right_wraps_to_next_line() {
+        let mut editor = create_test_editor("hello\nworld\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 5; // end of "hello"
+        editor.word_right();
+        assert_eq!(editor.cursor_line, 1);
+        assert_eq!(editor.cursor_col, 0);
+    }
+
+    #[test]
+    fn word_left_wraps_to_prev_line() {
+        let mut editor = create_test_editor("hello\nworld\n");
+        editor.cursor_line = 1;
+        editor.cursor_col = 0;
+        editor.word_left();
+        assert_eq!(editor.cursor_line, 0);
+        assert_eq!(editor.cursor_col, 5);
+    }
+
+    // --- Mouse click / display_col_to_orig_col tests ---
+
+    #[test]
+    fn display_col_to_orig_col_basic() {
+        assert_eq!(display_col_to_orig_col("hello", 0, 0), 0);
+        assert_eq!(display_col_to_orig_col("hello", 3, 0), 3);
+        assert_eq!(display_col_to_orig_col("hello", 5, 0), 5); // past end
+        assert_eq!(display_col_to_orig_col("hello", 99, 0), 5); // way past end
+    }
+
+    #[test]
+    fn display_col_to_orig_col_with_tab() {
+        // "a\tb" → display "a   b" (tab expands to 3 spaces, reaching col 4)
+        // display col 0 → orig 0 (a)
+        // display col 1 → orig 1 (tab start)
+        // display col 4 → orig 2 (b)
+        assert_eq!(display_col_to_orig_col("a\tb", 0, 0), 0);
+        assert_eq!(display_col_to_orig_col("a\tb", 1, 0), 1);
+        assert_eq!(display_col_to_orig_col("a\tb", 4, 0), 2);
+    }
+
+    #[test]
+    fn display_col_to_orig_col_with_scroll() {
+        // "hello world" with scroll_x=6 → display "world"
+        // display col 0 → orig 6 (w)
+        // display col 3 → orig 9 (l)
+        assert_eq!(display_col_to_orig_col("hello world", 0, 6), 6);
+        assert_eq!(display_col_to_orig_col("hello world", 3, 6), 9);
+    }
+
+    #[test]
+    fn display_col_to_orig_col_with_control_char() {
+        // "ab\x01cd" → display "abcd" (control stripped)
+        // display col 2 → orig 3 (c, skipping \x01)
+        assert_eq!(display_col_to_orig_col("ab\x01cd", 0, 0), 0);
+        assert_eq!(display_col_to_orig_col("ab\x01cd", 2, 0), 3);
+        assert_eq!(display_col_to_orig_col("ab\x01cd", 3, 0), 4);
+    }
+
+    #[test]
+    fn click_at_positions_cursor() {
+        let mut editor = create_test_editor("hello world\nsecond line\nthird line\n");
+        // Simulate viewport: inner starts at (1, 1), line_num_width=6
+        editor.viewport_x = 1;
+        editor.viewport_y = 1;
+        editor.line_num_width = 6;
+        editor.scroll_y = 0;
+        editor.scroll_x = 0;
+        editor.visible_lines = 10;
+
+        // Click on first char of line 0: screen (7, 1) → text_x=7, display_col=0
+        editor.click_at(7, 1);
+        assert_eq!(editor.cursor_line, 0);
+        assert_eq!(editor.cursor_col, 0);
+
+        // Click on col 5 of line 0: screen (12, 1) → display_col=5
+        editor.click_at(12, 1);
+        assert_eq!(editor.cursor_line, 0);
+        assert_eq!(editor.cursor_col, 5);
+
+        // Click on line 2: screen row 3
+        editor.click_at(7, 3);
+        assert_eq!(editor.cursor_line, 2);
+        assert_eq!(editor.cursor_col, 0);
+    }
+
+    #[test]
+    fn click_at_with_scroll() {
+        let mut editor = create_test_editor("line0\nline1\nline2\nline3\nline4\n");
+        editor.viewport_x = 1;
+        editor.viewport_y = 1;
+        editor.line_num_width = 6;
+        editor.scroll_y = 2; // scrolled: first visible line is line2
+        editor.scroll_x = 0;
+        editor.visible_lines = 3;
+
+        // Click on first visible row → line 2
+        editor.click_at(7, 1);
+        assert_eq!(editor.cursor_line, 2);
+
+        // Click on second visible row → line 3
+        editor.click_at(7, 2);
+        assert_eq!(editor.cursor_line, 3);
+    }
+
+    #[test]
+    fn click_at_clears_selection() {
+        let mut editor = create_test_editor("hello world\n");
+        editor.viewport_x = 1;
+        editor.viewport_y = 1;
+        editor.line_num_width = 6;
+        editor.scroll_y = 0;
+        editor.scroll_x = 0;
+        editor.visible_lines = 10;
+
+        // Set a selection
+        editor.selection_anchor = Some((0, 2));
+        editor.cursor_col = 5;
+        assert!(editor.selection_range().is_some());
+
+        // Click clears it
+        editor.click_at(10, 1);
+        assert!(editor.selection_anchor.is_none());
+    }
+
+    #[test]
+    fn click_on_gutter_ignored() {
+        let mut editor = create_test_editor("hello\n");
+        editor.viewport_x = 1;
+        editor.viewport_y = 1;
+        editor.line_num_width = 6;
+        editor.scroll_y = 0;
+        editor.scroll_x = 0;
+        editor.visible_lines = 10;
+        editor.cursor_line = 0;
+        editor.cursor_col = 3;
+
+        // Click on line number area (col < text_x=7)
+        editor.click_at(3, 1);
+        // Cursor should not move
+        assert_eq!(editor.cursor_col, 3);
+    }
+
+    #[test]
+    fn click_past_end_of_line_clamps() {
+        let mut editor = create_test_editor("hi\n");
+        editor.viewport_x = 1;
+        editor.viewport_y = 1;
+        editor.line_num_width = 6;
+        editor.scroll_y = 0;
+        editor.scroll_x = 0;
+        editor.visible_lines = 10;
+
+        // Click at display col 50 on a 2-char line → clamp to col 2
+        editor.click_at(57, 1);
+        assert_eq!(editor.cursor_line, 0);
+        assert_eq!(editor.cursor_col, 2);
     }
 
     // --- Large file / multi-chunk search tests ---

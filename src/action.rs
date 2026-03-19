@@ -62,6 +62,10 @@ pub enum Action {
     SearchPrompt,
     FindNext,
 
+    // Word navigation (editor)
+    WordLeft,
+    WordRight,
+
     // Editor
     EditBuiltin,
     CursorLeft,

@@ -819,6 +819,8 @@ impl App {
                 KeyCode::Char('f') => Action::SearchPrompt,
                 KeyCode::Char('g') => Action::GotoLinePrompt,
                 KeyCode::Char('q') => Action::DialogCancel,
+                KeyCode::Left => Action::WordLeft,   // Ctrl+Left (Linux)
+                KeyCode::Right => Action::WordRight, // Ctrl+Right (Linux)
                 KeyCode::Home | KeyCode::Up => Action::MoveToTop,
                 KeyCode::End | KeyCode::Down => Action::MoveToBottom,
                 _ => Action::None,
@@ -833,6 +835,9 @@ impl App {
             // Fn+Opt+Up/Down on Mac → Alt+PageUp/PageDown → top/bottom of file
             KeyCode::PageUp if alt => Action::MoveToTop,
             KeyCode::PageDown if alt => Action::MoveToBottom,
+            // Opt+Left/Right on Mac → sends Alt+b/Alt+f (readline-style)
+            KeyCode::Char('b') if alt => Action::WordLeft,
+            KeyCode::Char('f') if alt => Action::WordRight,
             KeyCode::Up if shift => Action::SelectUp,
             KeyCode::Down if shift => Action::SelectDown,
             KeyCode::Left if shift => Action::SelectLeft,
@@ -925,6 +930,8 @@ impl App {
             | Action::SelectPageDown
             | Action::SelectAll
             | Action::CopySelection
+            | Action::WordLeft
+            | Action::WordRight
             | Action::SearchPrompt
             | Action::FindNext => {}
 
@@ -1143,6 +1150,8 @@ impl App {
                 | Action::CursorRight
                 | Action::CursorLineStart
                 | Action::CursorLineEnd
+                | Action::WordLeft
+                | Action::WordRight
                 | Action::MoveToTop
                 | Action::MoveToBottom
                 | Action::PageUp
@@ -1253,6 +1262,16 @@ impl App {
                     e.cursor_line_end();
                 }
             }
+            Action::WordLeft => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.word_left();
+                }
+            }
+            Action::WordRight => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.word_right();
+                }
+            }
             Action::MoveToTop => {
                 if let AppMode::Editing(ref mut e) = self.mode {
                     e.goto_top();
@@ -1351,6 +1370,27 @@ impl App {
                     } else {
                         e.status_msg = Some("No previous search".to_string());
                     }
+                }
+            }
+
+            // Mouse
+            Action::MouseClick(col, row) => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.click_at(col, row);
+                }
+            }
+            Action::MouseScrollUp(_, _) => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.cursor_up();
+                    e.cursor_up();
+                    e.cursor_up();
+                }
+            }
+            Action::MouseScrollDown(_, _) => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.cursor_down();
+                    e.cursor_down();
+                    e.cursor_down();
                 }
             }
 
@@ -1891,9 +1931,13 @@ impl App {
     }
 
     fn handle_mouse_click(&mut self, col: u16, row: u16) {
+        if let AppMode::Editing(ref mut e) = self.mode {
+            e.click_at(col, row);
+            return;
+        }
         if matches!(
             self.mode,
-            AppMode::Viewing(_) | AppMode::HexViewing(_) | AppMode::Editing(_)
+            AppMode::Viewing(_) | AppMode::HexViewing(_)
         ) {
             return;
         }

@@ -29,6 +29,9 @@ pub fn render(frame: &mut Frame, area: Rect, editor: &mut EditorState) {
     let inner = block.inner(area);
     editor.visible_lines = inner.height.saturating_sub(1) as usize;
     editor.visible_cols = (inner.width as usize).saturating_sub(line_num_width);
+    editor.viewport_x = inner.x;
+    editor.viewport_y = inner.y;
+    editor.line_num_width = line_num_width;
 
     let sel_range = editor.selection_range();
     let content = editor.visible_content();
