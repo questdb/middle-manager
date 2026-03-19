@@ -4,6 +4,15 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
+use crate::app::SearchDirection;
+
+#[derive(Clone)]
+pub struct SearchParams {
+    pub query: String,
+    pub direction: SearchDirection,
+    pub case_sensitive: bool,
+}
+
 const INDEX_INTERVAL: usize = 1000;
 
 #[derive(Clone)]
@@ -36,6 +45,9 @@ pub struct EditorState {
 
     /// Selection anchor (line, col). Selection spans from anchor to cursor.
     pub selection_anchor: Option<(usize, usize)>,
+
+    /// Last search parameters for find-next/find-previous.
+    pub last_search: Option<SearchParams>,
 }
 
 #[derive(Clone)]
@@ -68,6 +80,7 @@ impl EditorState {
             modified: false,
             status_msg: None,
             selection_anchor: None,
+            last_search: None,
         };
         // Pre-scan first batch of lines for immediate display
         state.scan_to_line(10_000);
@@ -454,7 +467,149 @@ impl EditorState {
         }
     }
 
-    // --- Visible content for rendering ---
+    // --- Search ---
+
+    pub fn find(&mut self, params: &SearchParams) -> bool {
+        if params.query.is_empty() {
+            return false;
+        }
+        self.scan_to_end();
+        match params.direction {
+            SearchDirection::Forward => self.find_forward(params),
+            SearchDirection::Backward => self.find_backward(params),
+        }
+    }
+
+    fn find_forward(&mut self, params: &SearchParams) -> bool {
+        let query = if params.case_sensitive {
+            params.query.clone()
+        } else {
+            params.query.to_lowercase()
+        };
+        let total = self.total_virtual_lines();
+        let start_line = self.cursor_line;
+        let start_col = self.cursor_col + 1;
+
+        // Search from cursor to end
+        for vline in start_line..total {
+            if let Some(text) = self.get_line_text(vline) {
+                let search_text = if params.case_sensitive {
+                    text.clone()
+                } else {
+                    text.to_lowercase()
+                };
+                let byte_offset = if vline == start_line {
+                    char_to_byte(&search_text, start_col.min(search_text.chars().count()))
+                } else {
+                    0
+                };
+                if let Some(byte_pos) = search_text[byte_offset..].find(&query) {
+                    let col = search_text[..byte_offset + byte_pos].chars().count();
+                    let match_len = query.chars().count();
+                    self.selection_anchor = Some((vline, col));
+                    self.cursor_line = vline;
+                    self.cursor_col = col + match_len;
+                    self.desired_col = self.cursor_col;
+                    self.scroll_to_cursor();
+                    return true;
+                }
+            }
+        }
+
+        // Wrap: search from beginning to cursor
+        for vline in 0..=start_line.min(total.saturating_sub(1)) {
+            if let Some(text) = self.get_line_text(vline) {
+                let search_text = if params.case_sensitive {
+                    text.clone()
+                } else {
+                    text.to_lowercase()
+                };
+                let limit = if vline == start_line {
+                    char_to_byte(
+                        &search_text,
+                        self.cursor_col.min(search_text.chars().count()),
+                    )
+                } else {
+                    search_text.len()
+                };
+                if let Some(byte_pos) = search_text[..limit].find(&query) {
+                    let col = search_text[..byte_pos].chars().count();
+                    let match_len = query.chars().count();
+                    self.selection_anchor = Some((vline, col));
+                    self.cursor_line = vline;
+                    self.cursor_col = col + match_len;
+                    self.desired_col = self.cursor_col;
+                    self.scroll_to_cursor();
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
+
+    fn find_backward(&mut self, params: &SearchParams) -> bool {
+        let query = if params.case_sensitive {
+            params.query.clone()
+        } else {
+            params.query.to_lowercase()
+        };
+        let total = self.total_virtual_lines();
+        let start_line = self.cursor_line;
+        let start_col = self.cursor_col;
+
+        // Search from cursor backward to beginning
+        for vline in (0..=start_line).rev() {
+            if let Some(text) = self.get_line_text(vline) {
+                let search_text = if params.case_sensitive {
+                    text.clone()
+                } else {
+                    text.to_lowercase()
+                };
+                let limit = if vline == start_line {
+                    char_to_byte(
+                        &search_text,
+                        start_col.saturating_sub(1).min(search_text.chars().count()),
+                    )
+                } else {
+                    search_text.len()
+                };
+                if let Some(byte_pos) = search_text[..limit].rfind(&query) {
+                    let col = search_text[..byte_pos].chars().count();
+                    let match_len = query.chars().count();
+                    self.selection_anchor = Some((vline, col));
+                    self.cursor_line = vline;
+                    self.cursor_col = col + match_len;
+                    self.desired_col = self.cursor_col;
+                    self.scroll_to_cursor();
+                    return true;
+                }
+            }
+        }
+
+        // Wrap: search from end backward to cursor
+        for vline in (start_line..total).rev() {
+            if let Some(text) = self.get_line_text(vline) {
+                let search_text = if params.case_sensitive {
+                    text.clone()
+                } else {
+                    text.to_lowercase()
+                };
+                if let Some(byte_pos) = search_text.rfind(&query) {
+                    let col = search_text[..byte_pos].chars().count();
+                    let match_len = query.chars().count();
+                    self.selection_anchor = Some((vline, col));
+                    self.cursor_line = vline;
+                    self.cursor_col = col + match_len;
+                    self.desired_col = self.cursor_col;
+                    self.scroll_to_cursor();
+                    return true;
+                }
+            }
+        }
+
+        false
+    }
 
     // --- Selection ---
 

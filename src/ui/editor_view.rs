@@ -111,7 +111,7 @@ pub fn render(frame: &mut Frame, area: Rect, editor: &mut EditorState) {
         )
     } else {
         format!(
-            " Ln {}, Col {} | Ctrl+C: Copy | Ctrl+A: Select All | F2: Save | Esc: Close ",
+            " Ln {}, Col {} | Ctrl+F: Search | F3/Shift+F3: Next/Prev | Ctrl+C: Copy | Ctrl+A: Select All | F2: Save | Esc: Close ",
             editor.cursor_line + 1,
             editor.cursor_col + 1,
         )

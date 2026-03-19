@@ -25,6 +25,8 @@ pub struct App {
     pub goto_line_input: Option<String>,
     /// Set to true when the UI needs a full terminal clear (e.g. leaving full-screen mode).
     pub needs_clear: bool,
+    /// Search dialog overlay (shown on top of editor).
+    pub search_dialog: Option<SearchDialogState>,
 }
 
 #[derive(Clone)]
@@ -222,6 +224,96 @@ impl MkdirDialogField {
             Self::ProcessMultiple => Self::Input,
             Self::ButtonOk => Self::ProcessMultiple,
             Self::ButtonCancel => Self::ButtonOk,
+        }
+    }
+}
+
+// --- Search dialog ---
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum SearchDirection {
+    Forward,
+    Backward,
+}
+
+#[derive(Clone)]
+pub struct SearchDialogState {
+    pub query: String,
+    pub cursor: usize,
+    pub direction: SearchDirection,
+    pub case_sensitive: bool,
+    pub focused: SearchDialogField,
+}
+
+impl SearchDialogState {
+    pub fn insert_char(&mut self, c: char) {
+        let byte_pos = self.byte_offset(self.cursor);
+        self.query.insert(byte_pos, c);
+        self.cursor += 1;
+    }
+
+    pub fn delete_char_backward(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            let byte_pos = self.byte_offset(self.cursor);
+            self.query.remove(byte_pos);
+        }
+    }
+
+    pub fn cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn cursor_right(&mut self) {
+        let len = self.query.chars().count();
+        if self.cursor < len {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.query.chars().count();
+    }
+
+    fn byte_offset(&self, char_pos: usize) -> usize {
+        self.query
+            .char_indices()
+            .nth(char_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(self.query.len())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum SearchDialogField {
+    Query,
+    Direction,
+    CaseSensitive,
+    ButtonFind,
+    ButtonCancel,
+}
+
+impl SearchDialogField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Query => Self::Direction,
+            Self::Direction => Self::CaseSensitive,
+            Self::CaseSensitive => Self::ButtonFind,
+            Self::ButtonFind => Self::ButtonCancel,
+            Self::ButtonCancel => Self::Query,
+        }
+    }
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Query => Self::ButtonCancel,
+            Self::Direction => Self::Query,
+            Self::CaseSensitive => Self::Direction,
+            Self::ButtonFind => Self::CaseSensitive,
+            Self::ButtonCancel => Self::ButtonFind,
         }
     }
 }
@@ -457,6 +549,7 @@ impl App {
             last_click: None,
             goto_line_input: None,
             needs_clear: false,
+            search_dialog: None,
         }
     }
 
@@ -519,6 +612,11 @@ impl App {
                 KeyCode::Char(c) if c.is_ascii_digit() || c == ':' => Action::DialogInput(c),
                 _ => Action::None,
             };
+        }
+
+        // Search dialog intercepts keys when active
+        if let Some(ref state) = self.search_dialog {
+            return Self::map_search_dialog_key(key, state.focused);
         }
 
         match &self.mode {
@@ -661,6 +759,39 @@ impl App {
         }
     }
 
+    fn map_search_dialog_key(key: KeyEvent, focused: SearchDialogField) -> Action {
+        let on_buttons = matches!(
+            focused,
+            SearchDialogField::ButtonFind | SearchDialogField::ButtonCancel
+        );
+        match key.code {
+            KeyCode::Esc => Action::DialogCancel,
+            KeyCode::Enter => Action::DialogConfirm,
+            KeyCode::Tab => Action::MoveDown,
+            KeyCode::BackTab => Action::MoveUp,
+            KeyCode::Up => Action::MoveUp,
+            KeyCode::Down if on_buttons => Action::None,
+            KeyCode::Down => Action::MoveDown,
+            KeyCode::Left if on_buttons => Action::SwitchPanel,
+            KeyCode::Right if on_buttons => Action::SwitchPanel,
+            KeyCode::Char(' ')
+                if matches!(
+                    focused,
+                    SearchDialogField::Direction | SearchDialogField::CaseSensitive
+                ) =>
+            {
+                Action::Toggle
+            }
+            KeyCode::Char(c) if focused == SearchDialogField::Query => Action::DialogInput(c),
+            KeyCode::Backspace if focused == SearchDialogField::Query => Action::DialogBackspace,
+            KeyCode::Left if focused == SearchDialogField::Query => Action::CursorLeft,
+            KeyCode::Right if focused == SearchDialogField::Query => Action::CursorRight,
+            KeyCode::Home if focused == SearchDialogField::Query => Action::CursorLineStart,
+            KeyCode::End if focused == SearchDialogField::Query => Action::CursorLineEnd,
+            _ => Action::None,
+        }
+    }
+
     fn map_viewer_key(&self, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Up => Action::MoveUp,
@@ -686,6 +817,9 @@ impl App {
                 KeyCode::Char('k') => Action::EditorDeleteLine,
                 KeyCode::Char('c') => Action::CopySelection,
                 KeyCode::Char('a') => Action::SelectAll,
+                KeyCode::Char('f') => Action::SearchPrompt,
+                KeyCode::Char('n') if shift => Action::FindPrevious,
+                KeyCode::Char('n') => Action::FindNext,
                 KeyCode::Char('g') => Action::GotoLinePrompt,
                 KeyCode::Char('q') => Action::DialogCancel,
                 KeyCode::Home => Action::MoveToTop,
@@ -695,6 +829,8 @@ impl App {
         }
 
         match key.code {
+            KeyCode::F(3) if shift => Action::FindPrevious,
+            KeyCode::F(3) => Action::FindNext,
             KeyCode::Up if shift => Action::SelectUp,
             KeyCode::Down if shift => Action::SelectDown,
             KeyCode::Left if shift => Action::SelectLeft,
@@ -727,6 +863,12 @@ impl App {
         // Go-to-line prompt intercepts all input when active
         if self.goto_line_input.is_some() {
             self.handle_goto_line_action(action);
+            return;
+        }
+
+        // Search dialog overlay intercepts when active
+        if self.search_dialog.is_some() {
+            self.handle_search_dialog_action(action);
             return;
         }
 
@@ -780,7 +922,10 @@ impl App {
             | Action::SelectPageUp
             | Action::SelectPageDown
             | Action::SelectAll
-            | Action::CopySelection => {}
+            | Action::CopySelection
+            | Action::SearchPrompt
+            | Action::FindNext
+            | Action::FindPrevious => {}
 
             // Panel multi-file selection
             Action::ToggleSelect => self.active_panel_mut().toggle_select_current(),
@@ -1170,6 +1315,65 @@ impl App {
                 self.panels[0].reload();
                 self.panels[1].reload();
             }
+
+            // Search
+            Action::SearchPrompt => {
+                let (query, cursor, direction, case_sensitive) =
+                    if let AppMode::Editing(ref e) = self.mode {
+                        if let Some(ref p) = e.last_search {
+                            (
+                                p.query.clone(),
+                                p.query.chars().count(),
+                                p.direction,
+                                p.case_sensitive,
+                            )
+                        } else {
+                            (String::new(), 0, SearchDirection::Forward, false)
+                        }
+                    } else {
+                        (String::new(), 0, SearchDirection::Forward, false)
+                    };
+                self.search_dialog = Some(SearchDialogState {
+                    query,
+                    cursor,
+                    direction,
+                    case_sensitive,
+                    focused: SearchDialogField::Query,
+                });
+            }
+            Action::FindNext => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    if let Some(params) = e.last_search.clone() {
+                        use crate::editor::SearchParams;
+                        let fwd = SearchParams {
+                            direction: SearchDirection::Forward,
+                            ..params
+                        };
+                        if !e.find(&fwd) {
+                            e.status_msg = Some(format!("'{}' not found", fwd.query));
+                        }
+                    } else {
+                        e.status_msg = Some("No previous search".to_string());
+                    }
+                }
+            }
+            Action::FindPrevious => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    if let Some(params) = e.last_search.clone() {
+                        use crate::editor::SearchParams;
+                        let rev = SearchParams {
+                            direction: SearchDirection::Backward,
+                            ..params
+                        };
+                        if !e.find(&rev) {
+                            e.status_msg = Some(format!("'{}' not found", rev.query));
+                        }
+                    } else {
+                        e.status_msg = Some("No previous search".to_string());
+                    }
+                }
+            }
+
             _ => {}
         }
     }
@@ -1311,6 +1515,121 @@ impl App {
         if let Some(entry) = self.active_panel().selected_entry().cloned() {
             if !entry.is_dir {
                 self.status_message = Some(format!("__EDIT__{}", entry.path.to_string_lossy()));
+            }
+        }
+    }
+
+    // --- Search dialog handler ---
+
+    fn handle_search_dialog_action(&mut self, action: Action) {
+        match action {
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
+            Action::Quit => self.should_quit = true,
+            Action::DialogCancel => {
+                self.search_dialog = None;
+            }
+            Action::DialogConfirm => {
+                let is_cancel = self
+                    .search_dialog
+                    .as_ref()
+                    .map(|s| s.focused == SearchDialogField::ButtonCancel)
+                    .unwrap_or(false);
+                if is_cancel {
+                    self.search_dialog = None;
+                } else {
+                    self.confirm_search_dialog();
+                }
+            }
+            Action::MoveUp => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.focused = s.focused.prev();
+                }
+            }
+            Action::MoveDown => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.focused = s.focused.next();
+                }
+            }
+            Action::Toggle => {
+                if let Some(ref mut s) = self.search_dialog {
+                    match s.focused {
+                        SearchDialogField::Direction => {
+                            s.direction = match s.direction {
+                                SearchDirection::Forward => SearchDirection::Backward,
+                                SearchDirection::Backward => SearchDirection::Forward,
+                            };
+                        }
+                        SearchDialogField::CaseSensitive => {
+                            s.case_sensitive = !s.case_sensitive;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Action::DialogInput(c) => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.insert_char(c);
+                }
+            }
+            Action::DialogBackspace => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.delete_char_backward();
+                }
+            }
+            Action::CursorLeft => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.cursor_left();
+                }
+            }
+            Action::CursorRight => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.cursor_right();
+                }
+            }
+            Action::CursorLineStart => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.cursor_home();
+                }
+            }
+            Action::CursorLineEnd => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.cursor_end();
+                }
+            }
+            Action::SwitchPanel => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.focused = match s.focused {
+                        SearchDialogField::ButtonFind => SearchDialogField::ButtonCancel,
+                        SearchDialogField::ButtonCancel => SearchDialogField::ButtonFind,
+                        other => other,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn confirm_search_dialog(&mut self) {
+        let state = match self.search_dialog.take() {
+            Some(s) => s,
+            None => return,
+        };
+
+        if state.query.is_empty() {
+            return;
+        }
+
+        use crate::editor::SearchParams;
+        let params = SearchParams {
+            query: state.query,
+            direction: state.direction,
+            case_sensitive: state.case_sensitive,
+        };
+
+        if let AppMode::Editing(ref mut e) = self.mode {
+            e.last_search = Some(params.clone());
+            if !e.find(&params) {
+                e.status_msg = Some(format!("'{}' not found", params.query));
             }
         }
     }

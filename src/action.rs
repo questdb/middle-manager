@@ -58,6 +58,11 @@ pub enum Action {
     SelectAll,
     CopySelection,
 
+    // Search (editor)
+    SearchPrompt,
+    FindNext,
+    FindPrevious,
+
     // Editor
     EditBuiltin,
     CursorLeft,

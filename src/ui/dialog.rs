@@ -1,88 +1,27 @@
 use ratatui::layout::Rect;
-use ratatui::style::{Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
 use crate::app::{DialogField, DialogState};
 use crate::theme::theme;
 
-const DIALOG_WIDTH: u16 = 56;
-
-const PAD: usize = 2;    // horizontal padding inside border
-const MARGIN: u16 = 2;   // outer margin left/right
-const MARGIN_V: u16 = 1; // outer margin top/bottom
+use super::dialog_helpers::{self as dh};
 
 pub fn render(frame: &mut Frame, dialog: &DialogState) -> Rect {
     let t = theme();
     let dbg = t.dialog_bg;
-
-    // Height depends on whether there's an input field:
-    // With input: padding(1) + message(1) + input(1) + padding(1) + sep(1) + buttons(1) + padding(1) = 7
-    // Without input: padding(1) + message(1) + padding(1) + sep(1) + buttons(1) + padding(1) = 6
     let dialog_h: u16 = if dialog.has_input { 9 } else { 7 };
+    let layout = dh::render_dialog_frame(frame, &format!(" {} ", dialog.title), 56, dialog_h);
+    let (normal, highlight, input_normal) = dh::dialog_styles();
 
-    let outer_w = (DIALOG_WIDTH + MARGIN * 2).min(frame.area().width.saturating_sub(2));
-    let outer_h = (dialog_h + MARGIN_V * 2).min(frame.area().height.saturating_sub(2));
-    let outer = centered_rect(outer_w, outer_h, frame.area());
-
-    // Clear and fill outer margin with dialog background
-    frame.render_widget(Clear, outer);
-    let bg_style = t.dialog_bg_style();
-    let buf = frame.buffer_mut();
-    for y in outer.top()..outer.bottom() {
-        for x in outer.left()..outer.right() {
-            if let Some(cell) = buf.cell_mut((x, y)) {
-                cell.set_symbol(" ");
-                cell.set_style(bg_style);
-            }
-        }
-    }
-
-    // Border box inside the margin
-    let area = Rect::new(
-        outer.x + MARGIN,
-        outer.y + MARGIN_V,
-        outer.width.saturating_sub(MARGIN * 2),
-        outer.height.saturating_sub(MARGIN_V * 2),
-    );
-
-    let block = Block::default()
-        .title(Span::styled(
-            format!(" {} ", dialog.title),
-            t.dialog_title_style(),
-        ))
-        .borders(Borders::ALL)
-        .border_style(t.dialog_border_style())
-        .style(t.dialog_bg_style());
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let normal = Style::default().fg(t.dialog_text_fg).bg(dbg);
-    let highlight = Style::default().fg(t.dialog_input_fg_focused).bg(t.dialog_input_bg);
-    let input_normal = Style::default()
-        .fg(t.dialog_input_fg)
-        .bg(dbg)
-        .add_modifier(Modifier::BOLD);
-
-    // Padded content area
-    let content = Rect::new(
-        inner.x + PAD as u16,
-        inner.y,
-        inner.width.saturating_sub(PAD as u16 * 2),
-        inner.height,
-    );
-    let cw = content.width as usize;
-
-    // y=0: empty padding row
     // y=1: message
-    render_line(
+    dh::render_line(
         frame,
-        content,
+        layout.content,
         1,
         Line::from(Span::styled(
-            format!("{:<width$}", dialog.message, width = cw),
+            format!("{:<width$}", dialog.message, width = layout.cw),
             normal,
         )),
     );
@@ -93,90 +32,47 @@ pub fn render(frame: &mut Frame, dialog: &DialogState) -> Rect {
         // y=2: input field
         let input_focused = dialog.focused == DialogField::Input;
         let input_style = if input_focused { highlight } else { input_normal };
-        let input_text = format!("{:<width$}", dialog.input, width = cw);
-        render_line(
+        let input_text = format!("{:<width$}", dialog.input, width = layout.cw);
+        dh::render_line(
             frame,
-            content,
+            layout.content,
             2,
             Line::from(Span::styled(input_text, input_style)),
         );
 
-        // y=3: empty padding row
         // y=4: separator
-        render_separator(frame, area, inner.y + 4, t.dialog_border_style());
-
+        dh::render_separator(frame, layout.area, layout.inner.y + 4, t.dialog_border_style());
         buttons_y = 5;
 
-        // Blinking cursor in input field
         if input_focused {
-            let cursor_x = content.x + dialog.cursor as u16;
-            let cursor_y = content.y + 2;
-            if cursor_x < content.x + content.width {
+            let cursor_x = layout.content.x + dialog.cursor as u16;
+            let cursor_y = layout.content.y + 2;
+            if cursor_x < layout.content.x + layout.content.width {
                 frame.set_cursor_position((cursor_x, cursor_y));
             }
         }
     } else {
-        // y=2: empty padding row
         // y=3: separator
-        render_separator(frame, area, inner.y + 3, t.dialog_border_style());
-
+        dh::render_separator(frame, layout.area, layout.inner.y + 3, t.dialog_border_style());
         buttons_y = 4;
     }
 
-    // Buttons
-    let ok_label = if dialog.has_input { "{ OK }" } else { "{ Yes }" };
-    let cancel_label = if dialog.has_input {
-        "[ Cancel ]"
+    let (ok_label, cancel_label) = if dialog.has_input {
+        ("{ OK }", "[ Cancel ]")
     } else {
-        "[ No ]"
+        ("{ Yes }", "[ No ]")
     };
-    let ok_focused = dialog.focused == DialogField::ButtonOk;
-    let cancel_focused = dialog.focused == DialogField::ButtonCancel;
-    let buttons_len = ok_label.len() + 4 + cancel_label.len();
-    let left_pad = cw.saturating_sub(buttons_len) / 2;
-    let right_pad = cw.saturating_sub(buttons_len + left_pad);
-    render_line(
+    dh::render_buttons(
         frame,
-        content,
+        layout.content,
         buttons_y,
-        Line::from(vec![
-            Span::styled(" ".repeat(left_pad), normal),
-            Span::styled(
-                ok_label,
-                if ok_focused { highlight } else { normal },
-            ),
-            Span::styled("    ", normal),
-            Span::styled(
-                cancel_label,
-                if cancel_focused { highlight } else { normal },
-            ),
-            Span::styled(" ".repeat(right_pad), normal),
-        ]),
+        &[
+            (ok_label, dialog.focused == DialogField::ButtonOk),
+            (cancel_label, dialog.focused == DialogField::ButtonCancel),
+        ],
+        Style::default().fg(t.dialog_text_fg).bg(dbg),
+        highlight,
     );
 
-    outer
-}
-
-fn render_line(frame: &mut Frame, content: Rect, y_off: u16, line: Line) {
-    let rect = Rect::new(content.x, content.y + y_off, content.width, 1);
-    frame.render_widget(Paragraph::new(line), rect);
-}
-
-fn render_separator(frame: &mut Frame, outer: Rect, y: u16, style: Style) {
-    let mut s = String::with_capacity(outer.width as usize);
-    s.push('\u{251c}'); // ├
-    for _ in 0..outer.width.saturating_sub(2) {
-        s.push('\u{2500}'); // ─
-    }
-    s.push('\u{2524}'); // ┤
-    let rect = Rect::new(outer.x, y, outer.width, 1);
-    frame.render_widget(Paragraph::new(Span::styled(s, style)), rect);
-}
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let w = width.min(area.width);
-    let h = height.min(area.height);
-    let x = area.x + area.width.saturating_sub(w) / 2;
-    let y = area.y + area.height.saturating_sub(h) / 2;
-    Rect::new(x, y, w, h)
+    layout.outer
 }

@@ -1,11 +1,13 @@
 pub mod copy_dialog;
 pub mod dialog;
+pub mod dialog_helpers;
 pub mod editor_view;
 pub mod footer;
 pub mod header;
 pub mod hex_view;
 pub mod mkdir_dialog;
 pub mod panel_view;
+pub mod search_dialog;
 mod shadow;
 pub mod viewer_view;
 
@@ -80,6 +82,10 @@ fn render_hex_viewer(frame: &mut Frame, app: &mut App) {
 fn render_editor(frame: &mut Frame, app: &mut App) {
     if let AppMode::Editing(ref mut editor) = app.mode {
         editor_view::render(frame, frame.area(), editor);
+    }
+    if let Some(ref state) = app.search_dialog {
+        let area = search_dialog::render(frame, state);
+        shadow::render_shadow(frame, area);
     }
 }
 
