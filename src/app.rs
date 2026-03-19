@@ -818,8 +818,6 @@ impl App {
                 KeyCode::Char('c') => Action::CopySelection,
                 KeyCode::Char('a') => Action::SelectAll,
                 KeyCode::Char('f') => Action::SearchPrompt,
-                KeyCode::Char('n') if shift => Action::FindPrevious,
-                KeyCode::Char('n') => Action::FindNext,
                 KeyCode::Char('g') => Action::GotoLinePrompt,
                 KeyCode::Char('q') => Action::DialogCancel,
                 KeyCode::Home => Action::MoveToTop,
@@ -829,8 +827,8 @@ impl App {
         }
 
         match key.code {
-            KeyCode::F(3) if shift => Action::FindPrevious,
-            KeyCode::F(3) => Action::FindNext,
+            KeyCode::F(7) if shift => Action::FindNext,
+            KeyCode::F(7) => Action::SearchPrompt,
             KeyCode::Up if shift => Action::SelectUp,
             KeyCode::Down if shift => Action::SelectDown,
             KeyCode::Left if shift => Action::SelectLeft,
@@ -924,8 +922,7 @@ impl App {
             | Action::SelectAll
             | Action::CopySelection
             | Action::SearchPrompt
-            | Action::FindNext
-            | Action::FindPrevious => {}
+            | Action::FindNext => {}
 
             // Panel multi-file selection
             Action::ToggleSelect => self.active_panel_mut().toggle_select_current(),
@@ -1344,29 +1341,8 @@ impl App {
             Action::FindNext => {
                 if let AppMode::Editing(ref mut e) = self.mode {
                     if let Some(params) = e.last_search.clone() {
-                        use crate::editor::SearchParams;
-                        let fwd = SearchParams {
-                            direction: SearchDirection::Forward,
-                            ..params
-                        };
-                        if !e.find(&fwd) {
-                            e.status_msg = Some(format!("'{}' not found", fwd.query));
-                        }
-                    } else {
-                        e.status_msg = Some("No previous search".to_string());
-                    }
-                }
-            }
-            Action::FindPrevious => {
-                if let AppMode::Editing(ref mut e) = self.mode {
-                    if let Some(params) = e.last_search.clone() {
-                        use crate::editor::SearchParams;
-                        let rev = SearchParams {
-                            direction: SearchDirection::Backward,
-                            ..params
-                        };
-                        if !e.find(&rev) {
-                            e.status_msg = Some(format!("'{}' not found", rev.query));
+                        if !e.find(&params) {
+                            e.status_msg = Some(format!("'{}' not found", params.query));
                         }
                     } else {
                         e.status_msg = Some("No previous search".to_string());

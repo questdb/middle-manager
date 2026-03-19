@@ -468,147 +468,440 @@ impl EditorState {
     }
 
     // --- Search ---
+    //
+    // Streams raw file bytes for Original segments (single open, large-buffer reads).
+    // Buffer segments are searched in-memory. No per-line file I/O.
 
     pub fn find(&mut self, params: &SearchParams) -> bool {
         if params.query.is_empty() {
             return false;
         }
-        self.scan_to_end();
+        // Only scan enough to know where the cursor is (not the whole file).
+        // Segments beyond what we've scanned will trigger lazy scanning.
+        let query_bytes: Vec<u8> = if params.case_sensitive {
+            params.query.as_bytes().to_vec()
+        } else {
+            params.query.to_lowercase().into_bytes()
+        };
         match params.direction {
-            SearchDirection::Forward => self.find_forward(params),
-            SearchDirection::Backward => self.find_backward(params),
+            SearchDirection::Forward => self.find_streaming(&query_bytes, params.case_sensitive, false),
+            SearchDirection::Backward => self.find_streaming(&query_bytes, params.case_sensitive, true),
         }
     }
 
-    fn find_forward(&mut self, params: &SearchParams) -> bool {
-        let query = if params.case_sensitive {
-            params.query.clone()
-        } else {
-            params.query.to_lowercase()
-        };
-        let total = self.total_virtual_lines();
-        let start_line = self.cursor_line;
-        let start_col = self.cursor_col + 1;
+    /// Build a plan of (segment_index, virtual_line_start, line_count) for searching.
+    /// Does NOT scan to end — uses lines_scanned as the count for Original segments.
+    /// The byte-level search uses file_size as the end byte for segments that extend
+    /// past lines_scanned, so the full file is still searched.
+    fn build_search_plan(&mut self) -> Vec<(usize, usize, usize)> {
+        // Only scan enough to cover the cursor (which should already be scanned)
+        if !self.scan_complete && self.cursor_line >= self.lines_scanned {
+            self.scan_to_line(self.cursor_line + 100);
+        }
+        let mut plan = Vec::with_capacity(self.segments.len());
+        let mut vline = 0;
+        for (i, seg) in self.segments.iter().enumerate() {
+            let count = match seg {
+                Segment::Original { start_line, count } => {
+                    let available = self.lines_scanned.saturating_sub(*start_line);
+                    (*count).min(available)
+                }
+                Segment::Buffer { lines } => lines.len(),
+            };
+            if count > 0 {
+                plan.push((i, vline, count));
+            }
+            vline += count;
+        }
+        plan
+    }
 
-        // Search from cursor to end
-        for vline in start_line..total {
-            if let Some(text) = self.get_line_text(vline) {
-                let search_text = if params.case_sensitive {
-                    text.clone()
-                } else {
-                    text.to_lowercase()
-                };
-                let byte_offset = if vline == start_line {
-                    char_to_byte(&search_text, start_col.min(search_text.chars().count()))
+    /// Streaming search across all segments. Opens the file once for all Original segments.
+    /// Uses two passes for correct wrap-around:
+    ///   Forward:  pass 1 = cursor→end, pass 2 = beginning→cursor
+    ///   Backward: pass 1 = cursor→beginning, pass 2 = end→cursor
+    fn find_streaming(
+        &mut self,
+        query: &[u8],
+        case_sensitive: bool,
+        reverse: bool,
+    ) -> bool {
+        let plan = self.build_search_plan();
+        if plan.is_empty() {
+            return false;
+        }
+
+        let cursor_line = self.cursor_line;
+        let cursor_col = self.cursor_col;
+        // For reverse search, the selection anchor marks the START of the current match
+        // and cursor_col marks the END. We need both:
+        //   - Pass 0 (search before cursor): limit_to uses anchor_col (exclude current match)
+        //   - Pass 1 (wrap after cursor): skip_to uses cursor_col (skip past current match)
+        let anchor_col = if reverse {
+            self.selection_anchor
+                .filter(|(l, _)| *l == cursor_line)
+                .map(|(_, c)| c)
+                .unwrap_or(cursor_col)
+        } else {
+            cursor_col
+        };
+
+        let cursor_plan_idx = plan
+            .iter()
+            .position(|(_, vl, count)| cursor_line >= *vl && cursor_line < vl + count)
+            .unwrap_or(0);
+
+        // Two passes: from cursor in search direction, then wrap around
+        for pass in 0..2 {
+            // For reverse: pass 0 limits at anchor_col, pass 1 skips past cursor_col
+            let col_for_pass = if reverse {
+                if pass == 0 { anchor_col } else { cursor_col }
+            } else {
+                cursor_col
+            };
+            let result = self.find_streaming_pass(
+                &plan,
+                cursor_plan_idx,
+                cursor_line,
+                col_for_pass,
+                query,
+                case_sensitive,
+                reverse,
+                pass,
+            );
+            if let Some((line, col, match_len)) = result {
+                self.selection_anchor = Some((line, col));
+                self.cursor_line = line;
+                self.cursor_col = col + match_len;
+                self.desired_col = self.cursor_col;
+                self.scroll_to_cursor();
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Execute one pass of the search.
+    /// Pass 0: from cursor to end (forward) or cursor to beginning (backward).
+    /// Pass 1: wrap — from beginning to cursor (forward) or end to cursor (backward).
+    #[allow(clippy::too_many_arguments)]
+    fn find_streaming_pass(
+        &mut self,
+        plan: &[(usize, usize, usize)],
+        cursor_plan_idx: usize,
+        cursor_line: usize,
+        skip_col: usize,
+        query: &[u8],
+        case_sensitive: bool,
+        reverse: bool,
+        pass: usize,
+    ) -> Option<(usize, usize, usize)> {
+        // Determine which segments to visit and in what order
+        let seg_indices: Vec<usize> = if !reverse {
+            if pass == 0 {
+                // Forward pass 0: cursor_seg through last
+                (cursor_plan_idx..plan.len()).collect()
+            } else {
+                // Forward pass 1 (wrap): first through cursor_seg
+                (0..=cursor_plan_idx).collect()
+            }
+        } else if pass == 0 {
+            // Backward pass 0: cursor_seg down to first
+            (0..=cursor_plan_idx).rev().collect()
+        } else {
+            // Backward pass 1 (wrap): last down to cursor_seg
+            (cursor_plan_idx..plan.len()).rev().collect()
+        };
+
+        for &plan_idx in &seg_indices {
+            let (seg_idx, seg_vline_start, seg_line_count) = plan[plan_idx];
+            let at_cursor_seg = plan_idx == cursor_plan_idx;
+
+            // Determine search bounds within this segment
+            let skip_lines_in_seg = cursor_line - seg_vline_start;
+
+            // skip_to: start searching after this position (forward pass 0, backward wrap)
+            // limit_to: stop searching before this position (forward wrap, backward pass 0)
+            let (use_skip, use_limit) = if at_cursor_seg {
+                match (reverse, pass) {
+                    (false, 0) => (true, false),  // forward from cursor
+                    (false, 1) => (false, true),  // forward wrap: start to cursor
+                    (true, 0)  => (false, true),  // backward: start to cursor (find last)
+                    (true, 1)  => (true, false),  // backward wrap: cursor to end (find last)
+                    _ => (false, false),
+                }
+            } else {
+                (false, false)
+            };
+
+            let (seg_start_line, seg_is_original) = match &self.segments[seg_idx] {
+                Segment::Original { start_line, .. } => (*start_line, true),
+                _ => (0, false),
+            };
+            let result = if seg_is_original {
+                self.search_original_segment(
+                    seg_start_line,
+                    seg_line_count,
+                    seg_vline_start,
+                    query,
+                    case_sensitive,
+                    reverse,
+                    if use_skip { Some((skip_lines_in_seg, skip_col)) } else { None },
+                    if use_limit { Some((skip_lines_in_seg, skip_col)) } else { None },
+                )
+            } else if let Segment::Buffer { lines } = &self.segments[seg_idx] {
+                search_buffer_segment(
+                    lines,
+                    seg_vline_start,
+                    query,
+                    case_sensitive,
+                    reverse,
+                    if use_skip { Some((skip_lines_in_seg, skip_col)) } else { None },
+                    if use_limit { Some((skip_lines_in_seg, skip_col)) } else { None },
+                )
+            } else {
+                None
+            };
+
+            if result.is_some() {
+                return result;
+            }
+        }
+
+        None
+    }
+
+    /// Search an Original segment by streaming raw bytes from disk.
+    /// Opens its own file handle — no shared state across calls.
+    /// `skip_to`: skip ahead to (line_offset, col) — search starts after this position.
+    /// `limit_to`: stop at (line_offset, col) — search only covers content before this position.
+    #[allow(clippy::too_many_arguments)]
+    fn search_original_segment(
+        &mut self,
+        orig_start_line: usize,
+        line_count: usize,
+        vline_start: usize,
+        query: &[u8],
+        case_sensitive: bool,
+        reverse: bool,
+        skip_to: Option<(usize, usize)>,
+        limit_to: Option<(usize, usize)>,
+    ) -> Option<(usize, usize, usize)> {
+        let seg_start_byte = self.get_byte_offset(orig_start_line);
+        let end_line = orig_start_line + line_count;
+        let end_byte = if end_line >= self.lines_scanned {
+            self.file_size
+        } else {
+            self.get_byte_offset(end_line)
+        };
+
+        if seg_start_byte >= end_byte {
+            return None;
+        }
+
+        // Seek directly to the relevant byte range using the sparse line index.
+        // skip_to: start reading from this line (skip everything before).
+        // limit_to: stop reading after this line (skip everything after).
+        let (read_start_byte, start_line_offset) = if let Some((skip_lines, _)) = skip_to {
+            if skip_lines > 0 {
+                let target_orig_line = orig_start_line + skip_lines;
+                let skip_byte = self.get_byte_offset(target_orig_line);
+                (skip_byte.max(seg_start_byte), skip_lines)
+            } else {
+                (seg_start_byte, 0)
+            }
+        } else {
+            (seg_start_byte, 0)
+        };
+
+        // Only read up to the limit line (+1 to include the limit line itself).
+        let effective_end_byte = if let Some((limit_lines, _)) = limit_to {
+            let target_orig_line = orig_start_line + limit_lines + 1;
+            let limit_byte = if target_orig_line >= self.lines_scanned {
+                end_byte
+            } else {
+                self.get_byte_offset(target_orig_line)
+            };
+            limit_byte.min(end_byte)
+        } else {
+            end_byte
+        };
+
+        if read_start_byte >= effective_end_byte {
+            return None;
+        }
+
+        let match_char_len = char_count_in_bytes(query);
+        let search_fn = if case_sensitive {
+            find_bytes_sensitive
+        } else {
+            find_bytes_insensitive
+        };
+
+        if reverse {
+            self.search_original_reverse(
+                read_start_byte, effective_end_byte, start_line_offset, vline_start,
+                orig_start_line, query, search_fn, match_char_len, skip_to, limit_to,
+            )
+        } else {
+            self.search_original_forward(
+                read_start_byte, effective_end_byte, start_line_offset, vline_start,
+                query, search_fn, match_char_len, skip_to, limit_to,
+            )
+        }
+    }
+
+    /// Forward search: read sequentially from start, return first match.
+    #[allow(clippy::too_many_arguments)]
+    fn search_original_forward(
+        &mut self,
+        read_start_byte: u64,
+        effective_end_byte: u64,
+        start_line_offset: usize,
+        vline_start: usize,
+        query: &[u8],
+        search_fn: fn(&[u8], &[u8]) -> Option<usize>,
+        match_char_len: usize,
+        skip_to: Option<(usize, usize)>,
+        limit_to: Option<(usize, usize)>,
+    ) -> Option<(usize, usize, usize)> {
+        let total_bytes = (effective_end_byte - read_start_byte) as usize;
+        const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+        let file = File::open(&self.path).ok()?;
+        let mut reader = BufReader::with_capacity(CHUNK_SIZE.min(total_bytes), &file);
+        reader.seek(SeekFrom::Start(read_start_byte)).ok()?;
+
+        let overlap = query.len().saturating_sub(1);
+        let mut current_line = start_line_offset;
+        let mut carry = Vec::new();
+        let mut bytes_left = total_bytes;
+        let mut buf = vec![0u8; CHUNK_SIZE.min(total_bytes)];
+
+        while bytes_left > 0 {
+            let to_read = buf.len().min(bytes_left);
+            let n = reader.read(&mut buf[..to_read]).ok()?;
+            if n == 0 { break; }
+            bytes_left -= n;
+
+            let chunk = if carry.is_empty() {
+                &buf[..n]
+            } else {
+                carry.extend_from_slice(&buf[..n]);
+                carry.as_slice()
+            };
+
+            let search_start = if let Some((sl, sc)) = skip_to {
+                if current_line <= sl {
+                    line_col_to_byte_pos(chunk, sl - current_line, sc)
+                } else { 0 }
+            } else { 0 };
+
+            let search_end = if let Some((ll, lc)) = limit_to {
+                if current_line <= ll {
+                    line_col_to_byte_pos(chunk, ll - current_line, lc).min(chunk.len())
+                } else { 0 }
+            } else { chunk.len() };
+
+            if search_start < search_end {
+                if let Some(found) = search_fn(&chunk[search_start..search_end], query) {
+                    let abs_pos = search_start + found;
+                    let (line_at, col_at) = byte_pos_to_line_col(chunk, abs_pos, current_line);
+                    return Some((vline_start + line_at, col_at, match_char_len));
+                }
+            }
+
+            let newlines_in_chunk = bytecount_newlines(chunk);
+            current_line += newlines_in_chunk;
+            carry.clear();
+            if bytes_left > 0 && overlap > 0 && n >= overlap {
+                carry.extend_from_slice(&buf[n - overlap..n]);
+                current_line -= bytecount_newlines(&buf[n - overlap..n]);
+            }
+        }
+        None
+    }
+
+    /// Reverse search: read backwards in chunks from end, rfind in each, return first hit.
+    /// O(distance_to_match) instead of O(bytes_before_cursor).
+    #[allow(clippy::too_many_arguments)]
+    /// Reverse search: read backwards in chunks from end, rfind in each, return first hit.
+    /// O(distance_to_match) instead of O(bytes_before_cursor).
+    /// Line numbers computed via sparse line index, then converted to segment-relative
+    /// and combined with vline_start for correct virtual line numbers.
+    #[allow(clippy::too_many_arguments)]
+    fn search_original_reverse(
+        &mut self,
+        read_start_byte: u64,
+        effective_end_byte: u64,
+        _start_line_offset: usize,
+        vline_start: usize,
+        orig_start_line: usize,
+        query: &[u8],
+        search_fn: fn(&[u8], &[u8]) -> Option<usize>,
+        match_char_len: usize,
+        skip_to: Option<(usize, usize)>,
+        limit_to: Option<(usize, usize)>,
+    ) -> Option<(usize, usize, usize)> {
+        let total_bytes = (effective_end_byte - read_start_byte) as usize;
+        if total_bytes == 0 { return None; }
+
+        const CHUNK_SIZE: usize = 4 * 1024 * 1024;
+        let overlap = query.len().saturating_sub(1);
+        let file = File::open(&self.path).ok()?;
+
+        let mut chunk_end_byte = effective_end_byte;
+        let mut buf = vec![0u8; CHUNK_SIZE];
+
+        while chunk_end_byte > read_start_byte {
+            let chunk_size = ((chunk_end_byte - read_start_byte) as usize).min(CHUNK_SIZE);
+            let chunk_start_byte = chunk_end_byte - chunk_size as u64;
+
+            let mut reader = BufReader::new(&file);
+            reader.seek(SeekFrom::Start(chunk_start_byte)).ok()?;
+            let n = reader.read(&mut buf[..chunk_size]).ok()?;
+            if n == 0 { break; }
+            let chunk = &buf[..n];
+
+            // Compute segment-relative line at chunk start via the sparse index.
+            // line_at_byte_offset returns absolute file line; subtract orig_start_line
+            // to get the offset within this segment, matching the forward path.
+            let abs_line = self.line_at_byte_offset(chunk_start_byte);
+            let seg_relative_line = abs_line.saturating_sub(orig_start_line);
+
+            let search_start = if let Some((sl, sc)) = skip_to {
+                if seg_relative_line <= sl {
+                    line_col_to_byte_pos(chunk, sl - seg_relative_line, sc)
                 } else {
                     0
-                };
-                if let Some(byte_pos) = search_text[byte_offset..].find(&query) {
-                    let col = search_text[..byte_offset + byte_pos].chars().count();
-                    let match_len = query.chars().count();
-                    self.selection_anchor = Some((vline, col));
-                    self.cursor_line = vline;
-                    self.cursor_col = col + match_len;
-                    self.desired_col = self.cursor_col;
-                    self.scroll_to_cursor();
-                    return true;
+                }
+            } else { 0 };
+
+            let search_end = if let Some((ll, lc)) = limit_to {
+                if seg_relative_line <= ll {
+                    line_col_to_byte_pos(chunk, ll - seg_relative_line, lc).min(n)
+                } else {
+                    0
+                }
+            } else { n };
+
+            if search_start < search_end {
+                let slice = &chunk[search_start..search_end];
+                if let Some(found) = rfind_with(slice, query, search_fn) {
+                    let abs_pos = search_start + found;
+                    let (line_at, col_at) =
+                        byte_pos_to_line_col(chunk, abs_pos, seg_relative_line);
+                    return Some((vline_start + line_at, col_at, match_char_len));
                 }
             }
-        }
 
-        // Wrap: search from beginning to cursor
-        for vline in 0..=start_line.min(total.saturating_sub(1)) {
-            if let Some(text) = self.get_line_text(vline) {
-                let search_text = if params.case_sensitive {
-                    text.clone()
-                } else {
-                    text.to_lowercase()
-                };
-                let limit = if vline == start_line {
-                    char_to_byte(
-                        &search_text,
-                        self.cursor_col.min(search_text.chars().count()),
-                    )
-                } else {
-                    search_text.len()
-                };
-                if let Some(byte_pos) = search_text[..limit].find(&query) {
-                    let col = search_text[..byte_pos].chars().count();
-                    let match_len = query.chars().count();
-                    self.selection_anchor = Some((vline, col));
-                    self.cursor_line = vline;
-                    self.cursor_col = col + match_len;
-                    self.desired_col = self.cursor_col;
-                    self.scroll_to_cursor();
-                    return true;
-                }
+            if chunk_start_byte <= read_start_byte {
+                break;
             }
+            chunk_end_byte = chunk_start_byte + overlap as u64;
         }
 
-        false
-    }
-
-    fn find_backward(&mut self, params: &SearchParams) -> bool {
-        let query = if params.case_sensitive {
-            params.query.clone()
-        } else {
-            params.query.to_lowercase()
-        };
-        let total = self.total_virtual_lines();
-        let start_line = self.cursor_line;
-        let start_col = self.cursor_col;
-
-        // Search from cursor backward to beginning
-        for vline in (0..=start_line).rev() {
-            if let Some(text) = self.get_line_text(vline) {
-                let search_text = if params.case_sensitive {
-                    text.clone()
-                } else {
-                    text.to_lowercase()
-                };
-                let limit = if vline == start_line {
-                    char_to_byte(
-                        &search_text,
-                        start_col.saturating_sub(1).min(search_text.chars().count()),
-                    )
-                } else {
-                    search_text.len()
-                };
-                if let Some(byte_pos) = search_text[..limit].rfind(&query) {
-                    let col = search_text[..byte_pos].chars().count();
-                    let match_len = query.chars().count();
-                    self.selection_anchor = Some((vline, col));
-                    self.cursor_line = vline;
-                    self.cursor_col = col + match_len;
-                    self.desired_col = self.cursor_col;
-                    self.scroll_to_cursor();
-                    return true;
-                }
-            }
-        }
-
-        // Wrap: search from end backward to cursor
-        for vline in (start_line..total).rev() {
-            if let Some(text) = self.get_line_text(vline) {
-                let search_text = if params.case_sensitive {
-                    text.clone()
-                } else {
-                    text.to_lowercase()
-                };
-                if let Some(byte_pos) = search_text.rfind(&query) {
-                    let col = search_text[..byte_pos].chars().count();
-                    let match_len = query.chars().count();
-                    self.selection_anchor = Some((vline, col));
-                    self.cursor_line = vline;
-                    self.cursor_col = col + match_len;
-                    self.desired_col = self.cursor_col;
-                    self.scroll_to_cursor();
-                    return true;
-                }
-            }
-        }
-
-        false
+        None
     }
 
     // --- Selection ---
@@ -874,6 +1167,50 @@ impl EditorState {
         None
     }
 
+    /// Compute the line number (relative to file start) at a given byte offset
+    /// using the sparse line index. Reads at most INDEX_INTERVAL lines from disk.
+    fn line_at_byte_offset(&self, byte_offset: u64) -> usize {
+        if byte_offset == 0 {
+            return 0;
+        }
+        // Binary search: find the largest index entry with byte offset <= target
+        let idx = self
+            .line_index
+            .partition_point(|&b| b <= byte_offset)
+            .saturating_sub(1);
+        let base_line = idx * INDEX_INTERVAL;
+        let base_byte = self.line_index[idx];
+
+        if base_byte >= byte_offset {
+            return base_line;
+        }
+
+        // Count newlines from base_byte to byte_offset
+        let file = match File::open(&self.path) {
+            Ok(f) => f,
+            Err(_) => return base_line,
+        };
+        let mut reader = BufReader::new(file);
+        if reader.seek(SeekFrom::Start(base_byte)).is_err() {
+            return base_line;
+        }
+
+        let mut count = 0;
+        let mut remaining = (byte_offset - base_byte) as usize;
+        let mut buf = [0u8; 64 * 1024];
+        while remaining > 0 {
+            let to_read = remaining.min(buf.len());
+            let n = match reader.read(&mut buf[..to_read]) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(_) => break,
+            };
+            count += buf[..n].iter().filter(|&&b| b == b'\n').count();
+            remaining -= n;
+        }
+        base_line + count
+    }
+
     pub fn scan_to_line(&mut self, target: usize) {
         if self.scan_complete || self.lines_scanned >= target {
             return;
@@ -916,6 +1253,220 @@ impl EditorState {
         // Scan in large batches
         self.scan_to_line(usize::MAX);
     }
+}
+
+/// Search a Buffer segment's in-memory lines.
+/// `skip_to`: skip ahead to (line_offset, col) — search starts after this position.
+/// `limit_to`: stop at (line_offset, col) — only search before this position.
+#[allow(clippy::too_many_arguments)]
+fn search_buffer_segment(
+    lines: &[String],
+    vline_start: usize,
+    query: &[u8],
+    case_sensitive: bool,
+    reverse: bool,
+    skip_to: Option<(usize, usize)>,
+    limit_to: Option<(usize, usize)>,
+) -> Option<(usize, usize, usize)> {
+    let query_str = std::str::from_utf8(query).unwrap_or("");
+    let match_char_len = query_str.chars().count();
+
+    let iter: Box<dyn Iterator<Item = (usize, &String)>> = if reverse {
+        Box::new(lines.iter().enumerate().rev())
+    } else {
+        Box::new(lines.iter().enumerate())
+    };
+
+    let mut best_reverse: Option<(usize, usize, usize)> = None;
+
+    for (offset, line) in iter {
+        let vline = vline_start + offset;
+        let search_text = if case_sensitive {
+            line.clone()
+        } else {
+            line.to_lowercase()
+        };
+
+        // Determine byte bounds on this line
+        let start_byte = if let Some((sl, sc)) = skip_to {
+            if offset < sl {
+                if !reverse { continue } else { 0 }
+            } else if offset == sl {
+                char_to_byte(&search_text, sc)
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+
+        let end_byte = if let Some((ll, lc)) = limit_to {
+            if offset > ll {
+                if reverse { continue } else { break }
+            } else if offset == ll {
+                char_to_byte(&search_text, lc)
+            } else {
+                search_text.len()
+            }
+        } else {
+            search_text.len()
+        };
+
+        if start_byte >= end_byte {
+            continue;
+        }
+
+        let slice = &search_text[start_byte..end_byte];
+
+        if reverse {
+            // Collect last match in valid range
+            if let Some(byte_pos) = slice.rfind(query_str) {
+                let col = search_text[..start_byte + byte_pos].chars().count();
+                best_reverse = Some((vline, col, match_char_len));
+                return best_reverse; // reverse iteration, first rfind is the best
+            }
+        } else if let Some(byte_pos) = slice.find(query_str) {
+            let col = search_text[..start_byte + byte_pos].chars().count();
+            return Some((vline, col, match_char_len));
+        }
+    }
+
+    best_reverse
+}
+
+/// Case-sensitive byte search (forward). Uses first-byte scan to skip non-matching
+/// positions, then verifies the full needle. Much faster than sliding window for
+/// large haystacks with infrequent first-byte matches.
+fn find_bytes_sensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    let first = needle[0];
+    let mut i = 0;
+    while i + needle.len() <= haystack.len() {
+        match haystack[i..].iter().position(|&b| b == first) {
+            Some(pos) => {
+                let start = i + pos;
+                if start + needle.len() > haystack.len() {
+                    return None;
+                }
+                if haystack[start..start + needle.len()] == *needle {
+                    return Some(start);
+                }
+                i = start + 1;
+            }
+            None => return None,
+        }
+    }
+    None
+}
+
+/// Case-insensitive byte search (forward, ASCII). Pre-lowercased needle expected.
+fn find_bytes_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return None;
+    }
+    let first_lower = needle[0];
+    let mut i = 0;
+    while i + needle.len() <= haystack.len() {
+        match haystack[i..].iter().position(|b| b.to_ascii_lowercase() == first_lower) {
+            Some(pos) => {
+                let start = i + pos;
+                if start + needle.len() > haystack.len() {
+                    return None;
+                }
+                if haystack[start..start + needle.len()]
+                    .iter()
+                    .zip(needle)
+                    .all(|(a, b)| a.to_ascii_lowercase() == *b)
+                {
+                    return Some(start);
+                }
+                i = start + 1;
+            }
+            None => return None,
+        }
+    }
+    None
+}
+
+/// Find the LAST match in a slice using the given forward search function.
+fn rfind_with(
+    haystack: &[u8],
+    needle: &[u8],
+    search_fn: fn(&[u8], &[u8]) -> Option<usize>,
+) -> Option<usize> {
+    let mut last = None;
+    let mut pos = 0;
+    while pos + needle.len() <= haystack.len() {
+        if let Some(found) = search_fn(&haystack[pos..], needle) {
+            last = Some(pos + found);
+            pos += found + 1;
+        } else {
+            break;
+        }
+    }
+    last
+}
+
+/// Convert a byte position in a chunk to (line_offset, char_column).
+/// `base_line` is the line number at the start of the chunk.
+fn byte_pos_to_line_col(chunk: &[u8], byte_pos: usize, base_line: usize) -> (usize, usize) {
+    let mut line = base_line;
+    let mut last_newline_pos: Option<usize> = None;
+    for (i, &b) in chunk[..byte_pos].iter().enumerate() {
+        if b == b'\n' {
+            line += 1;
+            last_newline_pos = Some(i);
+        }
+    }
+    let line_start = match last_newline_pos {
+        Some(pos) => pos + 1,
+        None => 0,
+    };
+    // Column in chars (not bytes) from line start to match position
+    let line_bytes = &chunk[line_start..byte_pos];
+    let col = std::str::from_utf8(line_bytes)
+        .map(|s| s.chars().count())
+        .unwrap_or(byte_pos - line_start);
+    (line, col)
+}
+
+/// Convert (line_offset_within_chunk, char_col) to a byte position in the chunk.
+fn line_col_to_byte_pos(chunk: &[u8], line_offset: usize, char_col: usize) -> usize {
+    let mut lines_seen = 0;
+    let mut pos = 0;
+    // Skip to the right line
+    while lines_seen < line_offset && pos < chunk.len() {
+        if chunk[pos] == b'\n' {
+            lines_seen += 1;
+        }
+        pos += 1;
+    }
+    // Now skip char_col characters on this line
+    let line_start = pos;
+    if let Ok(text) = std::str::from_utf8(&chunk[line_start..]) {
+        let byte_offset = text
+            .char_indices()
+            .nth(char_col)
+            .map(|(i, _)| i)
+            .unwrap_or(text.find('\n').unwrap_or(text.len()));
+        line_start + byte_offset
+    } else {
+        (line_start + char_col).min(chunk.len())
+    }
+}
+
+/// Count newlines in a byte slice.
+fn bytecount_newlines(data: &[u8]) -> usize {
+    data.iter().filter(|&&b| b == b'\n').count()
+}
+
+/// Count chars in a byte slice (UTF-8 aware).
+fn char_count_in_bytes(data: &[u8]) -> usize {
+    std::str::from_utf8(data)
+        .map(|s| s.chars().count())
+        .unwrap_or(data.len())
 }
 
 fn char_to_byte(s: &str, char_pos: usize) -> usize {
@@ -1091,6 +1642,388 @@ mod tests {
         assert_eq!(editor.selection_anchor, Some((0, 0)));
         // Cursor should be at end of last non-empty line
         assert!(editor.cursor_line >= 2);
+    }
+
+    // --- Search tests ---
+
+    fn make_search(query: &str, direction: SearchDirection, case_sensitive: bool) -> SearchParams {
+        SearchParams {
+            query: query.to_string(),
+            direction,
+            case_sensitive,
+        }
+    }
+
+    #[test]
+    fn search_forward_basic() {
+        let mut editor = create_test_editor("hello world\nfoo bar\nhello again\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+        let params = make_search("hello", SearchDirection::Forward, true);
+        assert!(editor.find(&params));
+        // Should find first "hello" at line 0, col 0; cursor at end of match
+        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        assert_eq!(editor.cursor_line, 0);
+        assert_eq!(editor.cursor_col, 5);
+    }
+
+    #[test]
+    fn search_forward_skips_cursor_position() {
+        let mut editor = create_test_editor("hello world\nfoo bar\nhello again\n");
+        // Cursor at end of first "hello"
+        editor.cursor_line = 0;
+        editor.cursor_col = 5;
+        editor.selection_anchor = Some((0, 0));
+        let params = make_search("hello", SearchDirection::Forward, true);
+        assert!(editor.find(&params));
+        // Should find second "hello" at line 2, col 0
+        assert_eq!(editor.selection_anchor, Some((2, 0)));
+        assert_eq!(editor.cursor_line, 2);
+        assert_eq!(editor.cursor_col, 5);
+    }
+
+    #[test]
+    fn search_forward_wraps_around() {
+        let mut editor = create_test_editor("hello world\nfoo bar\nhello again\n");
+        // Cursor past the last "hello"
+        editor.cursor_line = 2;
+        editor.cursor_col = 5;
+        editor.selection_anchor = Some((2, 0));
+        let params = make_search("hello", SearchDirection::Forward, true);
+        assert!(editor.find(&params));
+        // Should wrap and find first "hello" at line 0
+        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        assert_eq!(editor.cursor_line, 0);
+        assert_eq!(editor.cursor_col, 5);
+    }
+
+    #[test]
+    fn search_backward_basic() {
+        let mut editor = create_test_editor("hello world\nfoo bar\nhello again\n");
+        // Cursor at end of file
+        editor.cursor_line = 2;
+        editor.cursor_col = 11;
+        let params = make_search("hello", SearchDirection::Backward, true);
+        assert!(editor.find(&params));
+        // Should find "hello" on line 2
+        assert_eq!(editor.selection_anchor, Some((2, 0)));
+        assert_eq!(editor.cursor_line, 2);
+        assert_eq!(editor.cursor_col, 5);
+    }
+
+    #[test]
+    fn search_backward_does_not_refind_same_match() {
+        let mut editor = create_test_editor("hello world\nfoo bar\nhello again\n");
+        // Simulate: just found "hello" on line 2 (cursor at end, anchor at start)
+        editor.cursor_line = 2;
+        editor.cursor_col = 5;
+        editor.selection_anchor = Some((2, 0));
+        let params = make_search("hello", SearchDirection::Backward, true);
+        assert!(editor.find(&params));
+        // Should find "hello" on line 0, NOT line 2 again
+        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        assert_eq!(editor.cursor_line, 0);
+        assert_eq!(editor.cursor_col, 5);
+    }
+
+    #[test]
+    fn search_backward_wraps_around() {
+        let mut editor = create_test_editor("hello world\nfoo bar\nhello again\n");
+        // Cursor at beginning — nothing before it
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+        let params = make_search("hello", SearchDirection::Backward, true);
+        assert!(editor.find(&params));
+        // Should wrap and find "hello" on line 2
+        assert_eq!(editor.selection_anchor, Some((2, 0)));
+        assert_eq!(editor.cursor_line, 2);
+        assert_eq!(editor.cursor_col, 5);
+    }
+
+    #[test]
+    fn search_case_insensitive() {
+        let mut editor = create_test_editor("Hello World\nFOO BAR\nhello again\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+        let params = make_search("hello", SearchDirection::Forward, false);
+        assert!(editor.find(&params));
+        // Should find "Hello" at line 0 (case insensitive)
+        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        assert_eq!(editor.cursor_col, 5);
+    }
+
+    #[test]
+    fn search_case_sensitive_misses() {
+        let mut editor = create_test_editor("Hello World\nFOO BAR\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+        let params = make_search("hello", SearchDirection::Forward, true);
+        assert!(!editor.find(&params));
+    }
+
+    #[test]
+    fn search_not_found() {
+        let mut editor = create_test_editor("hello world\nfoo bar\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+        let params = make_search("zzz", SearchDirection::Forward, true);
+        assert!(!editor.find(&params));
+    }
+
+    #[test]
+    fn search_empty_query() {
+        let mut editor = create_test_editor("hello\n");
+        let params = make_search("", SearchDirection::Forward, true);
+        assert!(!editor.find(&params));
+    }
+
+    #[test]
+    fn search_mid_line_match() {
+        let mut editor = create_test_editor("the quick brown fox\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+        let params = make_search("brown", SearchDirection::Forward, true);
+        assert!(editor.find(&params));
+        assert_eq!(editor.selection_anchor, Some((0, 10)));
+        assert_eq!(editor.cursor_col, 15);
+    }
+
+    #[test]
+    fn search_forward_then_backward_cycles() {
+        let mut editor = create_test_editor("aaa\nbbb\naaa\nbbb\naaa\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+
+        let fwd = make_search("aaa", SearchDirection::Forward, true);
+
+        // First forward: line 0
+        assert!(editor.find(&fwd));
+        assert_eq!(editor.selection_anchor, Some((0, 0)));
+
+        // Second forward: line 2
+        assert!(editor.find(&fwd));
+        assert_eq!(editor.selection_anchor, Some((2, 0)));
+
+        // Third forward: line 4
+        assert!(editor.find(&fwd));
+        assert_eq!(editor.selection_anchor, Some((4, 0)));
+
+        // Fourth forward: wraps to line 0
+        assert!(editor.find(&fwd));
+        assert_eq!(editor.selection_anchor, Some((0, 0)));
+
+        // Now backward from line 0: should wrap to line 4
+        let bwd = make_search("aaa", SearchDirection::Backward, true);
+        assert!(editor.find(&bwd));
+        assert_eq!(editor.selection_anchor, Some((4, 0)));
+
+        // Backward again: line 2
+        assert!(editor.find(&bwd));
+        assert_eq!(editor.selection_anchor, Some((2, 0)));
+    }
+
+    #[test]
+    fn search_multiple_matches_same_line() {
+        let mut editor = create_test_editor("ab ab ab\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+
+        let fwd = make_search("ab", SearchDirection::Forward, true);
+
+        // First: col 0
+        assert!(editor.find(&fwd));
+        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        assert_eq!(editor.cursor_col, 2);
+
+        // Second: col 3
+        assert!(editor.find(&fwd));
+        assert_eq!(editor.selection_anchor, Some((0, 3)));
+        assert_eq!(editor.cursor_col, 5);
+
+        // Third: col 6
+        assert!(editor.find(&fwd));
+        assert_eq!(editor.selection_anchor, Some((0, 6)));
+        assert_eq!(editor.cursor_col, 8);
+
+        // Wraps back to col 0
+        assert!(editor.find(&fwd));
+        assert_eq!(editor.selection_anchor, Some((0, 0)));
+    }
+
+    #[test]
+    fn search_backward_multiple_same_line() {
+        let mut editor = create_test_editor("ab ab ab\n");
+        // Cursor at end of line
+        editor.cursor_line = 0;
+        editor.cursor_col = 8;
+
+        let bwd = make_search("ab", SearchDirection::Backward, true);
+
+        // First backward: col 6
+        assert!(editor.find(&bwd));
+        assert_eq!(editor.selection_anchor, Some((0, 6)));
+
+        // Second backward: col 3
+        assert!(editor.find(&bwd));
+        assert_eq!(editor.selection_anchor, Some((0, 3)));
+
+        // Third backward: col 0
+        assert!(editor.find(&bwd));
+        assert_eq!(editor.selection_anchor, Some((0, 0)));
+
+        // Wraps to col 6
+        assert!(editor.find(&bwd));
+        assert_eq!(editor.selection_anchor, Some((0, 6)));
+    }
+
+    // --- Large file / multi-chunk search tests ---
+
+    /// Create a test file large enough to force multi-chunk reads (>4MB).
+    /// Returns (editor, line_number_of_needle) with a known "NEEDLE" on one line.
+    fn create_large_test_editor(needle_line: usize, total_lines: usize) -> (EditorState, usize) {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "mm_large_test_{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut f = std::fs::File::create(&path).unwrap();
+        for i in 0..total_lines {
+            if i == needle_line {
+                writeln!(f, "line {:06} NEEDLE_PATTERN_HERE", i).unwrap();
+            } else {
+                // ~80 chars per line to make the file large
+                writeln!(
+                    f,
+                    "line {:06} padding text to make this line reasonably long for chunk testing",
+                    i
+                )
+                .unwrap();
+            }
+        }
+        drop(f);
+        let editor = EditorState::open(path);
+        (editor, needle_line)
+    }
+
+    #[test]
+    fn search_forward_large_file() {
+        // ~6MB file, needle near the end → forces multi-chunk forward search
+        let (mut editor, needle_line) = create_large_test_editor(70_000, 80_000);
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+        let params = make_search("NEEDLE_PATTERN_HERE", SearchDirection::Forward, true);
+        assert!(editor.find(&params));
+        assert_eq!(
+            editor.selection_anchor.unwrap().0,
+            needle_line,
+            "Forward search should find needle at line {}",
+            needle_line
+        );
+    }
+
+    #[test]
+    fn search_backward_large_file() {
+        // Cursor past the needle → backward search reads backwards in chunks
+        let (mut editor, needle_line) = create_large_test_editor(10_000, 80_000);
+        editor.cursor_line = 79_999;
+        editor.cursor_col = 0;
+        let params = make_search("NEEDLE_PATTERN_HERE", SearchDirection::Backward, true);
+        assert!(editor.find(&params));
+        assert_eq!(
+            editor.selection_anchor.unwrap().0,
+            needle_line,
+            "Backward search should find needle at line {}",
+            needle_line
+        );
+    }
+
+    #[test]
+    fn search_forward_wrap_large_file() {
+        // Cursor AFTER the needle → forward search wraps from beginning
+        let (mut editor, needle_line) = create_large_test_editor(5_000, 80_000);
+        editor.cursor_line = 60_000;
+        editor.cursor_col = 0;
+        let params = make_search("NEEDLE_PATTERN_HERE", SearchDirection::Forward, true);
+        assert!(editor.find(&params));
+        assert_eq!(
+            editor.selection_anchor.unwrap().0,
+            needle_line,
+            "Forward wrap should find needle at line {}",
+            needle_line
+        );
+    }
+
+    #[test]
+    fn search_backward_wrap_large_file() {
+        // Cursor BEFORE the needle → backward search wraps from end
+        let (mut editor, needle_line) = create_large_test_editor(70_000, 80_000);
+        editor.cursor_line = 5_000;
+        editor.cursor_col = 0;
+        let params = make_search("NEEDLE_PATTERN_HERE", SearchDirection::Backward, true);
+        assert!(editor.find(&params));
+        assert_eq!(
+            editor.selection_anchor.unwrap().0,
+            needle_line,
+            "Backward wrap should find needle at line {}",
+            needle_line
+        );
+    }
+
+    #[test]
+    fn search_backward_findnext_large_file() {
+        // Two needles: cursor past both. Backward find should hit the later one first,
+        // then the earlier one on repeat.
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "mm_large2_{}.txt",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let mut f = std::fs::File::create(&path).unwrap();
+        let total = 80_000;
+        let needle1 = 20_000;
+        let needle2 = 60_000;
+        for i in 0..total {
+            if i == needle1 || i == needle2 {
+                writeln!(f, "line {:06} NEEDLE_PATTERN_HERE", i).unwrap();
+            } else {
+                writeln!(
+                    f,
+                    "line {:06} padding text to make this line reasonably long for chunk testing",
+                    i
+                )
+                .unwrap();
+            }
+        }
+        drop(f);
+        let mut editor = EditorState::open(path);
+        editor.cursor_line = 79_999;
+        editor.cursor_col = 0;
+
+        let bwd = make_search("NEEDLE_PATTERN_HERE", SearchDirection::Backward, true);
+
+        // First backward: should find needle2 (line 60000)
+        assert!(editor.find(&bwd));
+        assert_eq!(
+            editor.selection_anchor.unwrap().0,
+            needle2,
+            "First backward should find needle at line {}",
+            needle2
+        );
+
+        // Second backward: should find needle1 (line 20000)
+        assert!(editor.find(&bwd));
+        assert_eq!(
+            editor.selection_anchor.unwrap().0,
+            needle1,
+            "Second backward should find needle at line {}",
+            needle1
+        );
     }
 
     #[test]

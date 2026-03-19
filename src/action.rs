@@ -61,7 +61,6 @@ pub enum Action {
     // Search (editor)
     SearchPrompt,
     FindNext,
-    FindPrevious,
 
     // Editor
     EditBuiltin,
