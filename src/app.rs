@@ -810,7 +810,6 @@ impl App {
     fn map_editor_key(key: KeyEvent) -> Action {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-
         if ctrl {
             return match key.code {
                 KeyCode::Char('s') => Action::EditorSave,
@@ -820,15 +819,20 @@ impl App {
                 KeyCode::Char('f') => Action::SearchPrompt,
                 KeyCode::Char('g') => Action::GotoLinePrompt,
                 KeyCode::Char('q') => Action::DialogCancel,
-                KeyCode::Home => Action::MoveToTop,
-                KeyCode::End => Action::MoveToBottom,
+                KeyCode::Home | KeyCode::Up => Action::MoveToTop,
+                KeyCode::End | KeyCode::Down => Action::MoveToBottom,
                 _ => Action::None,
             };
         }
 
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+
         match key.code {
             KeyCode::F(7) if shift => Action::FindNext,
             KeyCode::F(7) => Action::SearchPrompt,
+            // Fn+Opt+Up/Down on Mac → Alt+PageUp/PageDown → top/bottom of file
+            KeyCode::PageUp if alt => Action::MoveToTop,
+            KeyCode::PageDown if alt => Action::MoveToBottom,
             KeyCode::Up if shift => Action::SelectUp,
             KeyCode::Down if shift => Action::SelectDown,
             KeyCode::Left if shift => Action::SelectLeft,
