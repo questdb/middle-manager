@@ -32,7 +32,11 @@ pub struct Theme {
     pub dialog_input_fg: Color,
     pub dialog_prompt_fg: Color,
     pub dialog_cursor_fg: Color,
+    pub dialog_input_fg_focused: Color,
+    pub dialog_input_bg: Color,
+    #[allow(dead_code)]
     pub dialog_hint_fg: Color,
+    pub selected_fg: Color,
     pub viewer_line_num_fg: Color,
     pub viewer_text_fg: Color,
     pub viewer_hint_fg: Color,
@@ -74,7 +78,10 @@ impl Theme {
             dialog_input_fg: Color::Black,
             dialog_prompt_fg: Color::Yellow,
             dialog_cursor_fg: Color::Black,
+            dialog_input_fg_focused: Color::White,
+            dialog_input_bg: Color::Rgb(0, 128, 128),
             dialog_hint_fg: Color::DarkGray,
+            selected_fg: Color::Yellow,
             viewer_line_num_fg: Color::Yellow,
             viewer_text_fg: Color::LightCyan,
             viewer_hint_fg: Color::Black,
@@ -135,6 +142,13 @@ impl Theme {
         Style::default().fg(self.exec_fg).bg(self.bg)
     }
 
+    pub fn selected_style(&self) -> Style {
+        Style::default()
+            .fg(self.selected_fg)
+            .bg(self.bg)
+            .add_modifier(Modifier::BOLD)
+    }
+
     pub fn dialog_bg_style(&self) -> Style {
         Style::default().bg(self.dialog_bg)
     }
@@ -152,6 +166,7 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
+    #[allow(dead_code)]
     pub fn dialog_text_style(&self) -> Style {
         Style::default().fg(self.dialog_text_fg).bg(self.dialog_bg)
     }

@@ -32,6 +32,7 @@ pub enum AppMode {
     Normal,
     QuickSearch,
     Dialog(DialogState),
+    MkdirDialog(MkdirDialogState),
     CopyDialog(CopyDialogState),
     Viewing(ViewerState),
     HexViewing(HexViewerState),
@@ -46,14 +47,183 @@ pub struct DialogState {
     pub title: String,
     pub message: String,
     pub input: String,
+    pub cursor: usize,
     pub has_input: bool,
+    pub focused: DialogField,
+}
+
+impl DialogState {
+    pub fn insert_char(&mut self, c: char) {
+        let byte_pos = self.byte_offset(self.cursor);
+        self.input.insert(byte_pos, c);
+        self.cursor += 1;
+    }
+
+    pub fn delete_char_backward(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            let byte_pos = self.byte_offset(self.cursor);
+            self.input.remove(byte_pos);
+        }
+    }
+
+    pub fn cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn cursor_right(&mut self) {
+        let len = self.input.chars().count();
+        if self.cursor < len {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.input.chars().count();
+    }
+
+    fn byte_offset(&self, char_pos: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(char_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(self.input.len())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum DialogField {
+    Input,
+    ButtonOk,
+    ButtonCancel,
+}
+
+impl DialogField {
+    pub fn next(self, has_input: bool) -> Self {
+        match self {
+            Self::Input => Self::ButtonOk,
+            Self::ButtonOk => Self::ButtonCancel,
+            Self::ButtonCancel => {
+                if has_input {
+                    Self::Input
+                } else {
+                    Self::ButtonOk
+                }
+            }
+        }
+    }
+    pub fn prev(self, has_input: bool) -> Self {
+        match self {
+            Self::Input => Self::ButtonCancel,
+            Self::ButtonOk => {
+                if has_input {
+                    Self::Input
+                } else {
+                    Self::ButtonCancel
+                }
+            }
+            Self::ButtonCancel => Self::ButtonOk,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
 pub enum DialogKind {
     ConfirmDelete,
-    InputMkdir,
     InputRename,
+}
+
+// --- Make folder dialog ---
+
+#[derive(Clone)]
+pub struct MkdirDialogState {
+    pub input: String,
+    pub cursor: usize,
+    pub process_multiple: bool,
+    pub focused: MkdirDialogField,
+}
+
+impl MkdirDialogState {
+    pub fn new() -> Self {
+        Self {
+            input: String::new(),
+            cursor: 0,
+            process_multiple: false,
+            focused: MkdirDialogField::Input,
+        }
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        let byte_pos = self.byte_offset(self.cursor);
+        self.input.insert(byte_pos, c);
+        self.cursor += 1;
+    }
+
+    pub fn delete_char_backward(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            let byte_pos = self.byte_offset(self.cursor);
+            self.input.remove(byte_pos);
+        }
+    }
+
+    pub fn cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn cursor_right(&mut self) {
+        let len = self.input.chars().count();
+        if self.cursor < len {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.input.chars().count();
+    }
+
+    fn byte_offset(&self, char_pos: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(char_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(self.input.len())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum MkdirDialogField {
+    Input,
+    ProcessMultiple,
+    ButtonOk,
+    ButtonCancel,
+}
+
+impl MkdirDialogField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Input => Self::ProcessMultiple,
+            Self::ProcessMultiple => Self::ButtonOk,
+            Self::ButtonOk => Self::ButtonCancel,
+            Self::ButtonCancel => Self::Input,
+        }
+    }
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Input => Self::ButtonCancel,
+            Self::ProcessMultiple => Self::Input,
+            Self::ButtonOk => Self::ProcessMultiple,
+            Self::ButtonCancel => Self::ButtonOk,
+        }
+    }
 }
 
 // --- Copy/Move dialog ---
@@ -61,7 +231,9 @@ pub enum DialogKind {
 #[derive(Clone)]
 pub struct CopyDialogState {
     pub source_name: String,
+    pub source_paths: Vec<PathBuf>,
     pub destination: String,
+    pub cursor: usize,
     pub is_move: bool,
     pub overwrite_mode: OverwriteMode,
     pub process_multiple: bool,
@@ -76,9 +248,17 @@ pub struct CopyDialogState {
 }
 
 impl CopyDialogState {
-    pub fn new(source_name: String, destination: String, is_move: bool) -> Self {
+    pub fn new(
+        source_name: String,
+        source_paths: Vec<PathBuf>,
+        destination: String,
+        is_move: bool,
+    ) -> Self {
+        let cursor = destination.chars().count();
         Self {
             source_name,
+            source_paths,
+            cursor,
             destination,
             is_move,
             overwrite_mode: OverwriteMode::Ask,
@@ -92,6 +272,47 @@ impl CopyDialogState {
             use_filter: false,
             focused: CopyDialogField::Destination,
         }
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        let byte_pos = self.byte_offset(self.cursor);
+        self.destination.insert(byte_pos, c);
+        self.cursor += 1;
+    }
+
+    pub fn delete_char_backward(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            let byte_pos = self.byte_offset(self.cursor);
+            self.destination.remove(byte_pos);
+        }
+    }
+
+    pub fn cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn cursor_right(&mut self) {
+        let len = self.destination.chars().count();
+        if self.cursor < len {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.destination.chars().count();
+    }
+
+    fn byte_offset(&self, char_pos: usize) -> usize {
+        self.destination
+            .char_indices()
+            .nth(char_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(self.destination.len())
     }
 
     pub fn toggle_focused(&mut self) {
@@ -303,7 +524,8 @@ impl App {
         match &self.mode {
             AppMode::Normal => self.map_normal_key(key),
             AppMode::QuickSearch => self.map_quick_search_key(key),
-            AppMode::Dialog(_) => self.map_dialog_key(key),
+            AppMode::Dialog(state) => Self::map_dialog_key(key, state.focused, state.has_input),
+            AppMode::MkdirDialog(state) => Self::map_mkdir_dialog_key(key, state.focused),
             AppMode::CopyDialog(state) => Self::map_copy_dialog_key(key, state.focused),
             AppMode::Viewing(_) | AppMode::HexViewing(_) => self.map_viewer_key(key),
             AppMode::Editing(_) => Self::map_editor_key(key),
@@ -312,6 +534,9 @@ impl App {
 
     fn map_normal_key(&self, key: KeyEvent) -> Action {
         match key.code {
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => Action::SelectMoveUp,
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => Action::SelectMoveDown,
+            KeyCode::Insert => Action::ToggleSelect,
             KeyCode::Up => Action::MoveUp,
             KeyCode::Down => Action::MoveDown,
             KeyCode::Home | KeyCode::Left => Action::MoveToTop,
@@ -360,29 +585,78 @@ impl App {
         }
     }
 
-    fn map_dialog_key(&self, key: KeyEvent) -> Action {
+    fn map_dialog_key(key: KeyEvent, focused: DialogField, has_input: bool) -> Action {
+        let on_buttons = matches!(focused, DialogField::ButtonOk | DialogField::ButtonCancel);
         match key.code {
-            KeyCode::Enter => Action::DialogConfirm,
             KeyCode::Esc => Action::DialogCancel,
-            KeyCode::Backspace => Action::DialogBackspace,
-            KeyCode::Char(c) => Action::DialogInput(c),
+            KeyCode::Enter => Action::DialogConfirm,
+            KeyCode::Tab => Action::MoveDown,
+            KeyCode::BackTab => Action::MoveUp,
+            KeyCode::Up if !has_input || on_buttons => Action::MoveUp,
+            KeyCode::Down if on_buttons => Action::None,
+            KeyCode::Down if !has_input || focused == DialogField::Input => Action::MoveDown,
+            KeyCode::Left if on_buttons => Action::SwitchPanel,
+            KeyCode::Right if on_buttons => Action::SwitchPanel,
+            KeyCode::Char(c) if focused == DialogField::Input => Action::DialogInput(c),
+            KeyCode::Backspace if focused == DialogField::Input => Action::DialogBackspace,
+            KeyCode::Left if focused == DialogField::Input => Action::CursorLeft,
+            KeyCode::Right if focused == DialogField::Input => Action::CursorRight,
+            KeyCode::Home if focused == DialogField::Input => Action::CursorLineStart,
+            KeyCode::End if focused == DialogField::Input => Action::CursorLineEnd,
             _ => Action::None,
         }
     }
 
-    fn map_copy_dialog_key(key: KeyEvent, focused: CopyDialogField) -> Action {
+    fn map_mkdir_dialog_key(key: KeyEvent, focused: MkdirDialogField) -> Action {
+        let on_buttons = matches!(
+            focused,
+            MkdirDialogField::ButtonOk | MkdirDialogField::ButtonCancel
+        );
         match key.code {
             KeyCode::Esc => Action::DialogCancel,
             KeyCode::Enter => Action::DialogConfirm,
             KeyCode::Tab => Action::MoveDown,
             KeyCode::BackTab => Action::MoveUp,
             KeyCode::Up => Action::MoveUp,
+            KeyCode::Down if on_buttons => Action::None, // stay on button row
             KeyCode::Down => Action::MoveDown,
+            KeyCode::Left if on_buttons => Action::SwitchPanel, // swap between buttons
+            KeyCode::Right if on_buttons => Action::SwitchPanel,
+            KeyCode::Char(' ') if focused == MkdirDialogField::ProcessMultiple => Action::Toggle,
+            KeyCode::Char(c) if focused == MkdirDialogField::Input => Action::DialogInput(c),
+            KeyCode::Backspace if focused == MkdirDialogField::Input => Action::DialogBackspace,
+            KeyCode::Left if focused == MkdirDialogField::Input => Action::CursorLeft,
+            KeyCode::Right if focused == MkdirDialogField::Input => Action::CursorRight,
+            KeyCode::Home if focused == MkdirDialogField::Input => Action::CursorLineStart,
+            KeyCode::End if focused == MkdirDialogField::Input => Action::CursorLineEnd,
+            _ => Action::None,
+        }
+    }
+
+    fn map_copy_dialog_key(key: KeyEvent, focused: CopyDialogField) -> Action {
+        let on_buttons = matches!(
+            focused,
+            CopyDialogField::ButtonCopy | CopyDialogField::ButtonCancel
+        );
+        match key.code {
+            KeyCode::Esc => Action::DialogCancel,
+            KeyCode::Enter => Action::DialogConfirm,
+            KeyCode::Tab => Action::MoveDown,
+            KeyCode::BackTab => Action::MoveUp,
+            KeyCode::Up => Action::MoveUp,
+            KeyCode::Down if on_buttons => Action::None,
+            KeyCode::Down => Action::MoveDown,
+            KeyCode::Left if on_buttons => Action::SwitchPanel,
+            KeyCode::Right if on_buttons => Action::SwitchPanel,
             KeyCode::Char(' ') if focused != CopyDialogField::Destination => Action::Toggle,
             KeyCode::Char(c) if focused == CopyDialogField::Destination => Action::DialogInput(c),
             KeyCode::Backspace if focused == CopyDialogField::Destination => {
                 Action::DialogBackspace
             }
+            KeyCode::Left if focused == CopyDialogField::Destination => Action::CursorLeft,
+            KeyCode::Right if focused == CopyDialogField::Destination => Action::CursorRight,
+            KeyCode::Home if focused == CopyDialogField::Destination => Action::CursorLineStart,
+            KeyCode::End if focused == CopyDialogField::Destination => Action::CursorLineEnd,
             _ => Action::None,
         }
     }
@@ -456,7 +730,15 @@ impl App {
             return;
         }
 
-        // Copy dialog and editor have their own dispatch
+        // Dialog, mkdir dialog, copy dialog, and editor have their own dispatch
+        if matches!(self.mode, AppMode::Dialog(_)) {
+            self.handle_dialog_action(action);
+            return;
+        }
+        if matches!(self.mode, AppMode::MkdirDialog(_)) {
+            self.handle_mkdir_dialog_action(action);
+            return;
+        }
         if matches!(self.mode, AppMode::CopyDialog(_)) {
             self.handle_copy_dialog_action(action);
             return;
@@ -500,6 +782,11 @@ impl App {
             | Action::SelectAll
             | Action::CopySelection => {}
 
+            // Panel multi-file selection
+            Action::ToggleSelect => self.active_panel_mut().toggle_select_current(),
+            Action::SelectMoveUp => self.active_panel_mut().select_move_up(),
+            Action::SelectMoveDown => self.active_panel_mut().select_move_down(),
+
             // Navigation
             Action::MoveUp => self.handle_move_up(),
             Action::MoveDown => self.handle_move_down(),
@@ -535,11 +822,10 @@ impl App {
             Action::QuickSearch(c) => self.handle_quick_search(c),
             Action::QuickSearchClear => self.handle_quick_search_clear(),
 
-            // Dialog
-            Action::DialogConfirm => self.handle_dialog_confirm(),
+            // These can still fire from non-dialog modes (viewer cancel, quick search backspace)
             Action::DialogCancel => self.handle_dialog_cancel(),
-            Action::DialogInput(c) => self.handle_dialog_input(c),
             Action::DialogBackspace => self.handle_dialog_backspace(),
+            Action::DialogConfirm | Action::DialogInput(_) => {}
         }
     }
 
@@ -913,39 +1199,51 @@ impl App {
     // --- File operation handlers ---
 
     fn handle_copy(&mut self) {
-        if let Some(entry) = self.active_panel().selected_entry() {
-            if entry.name == ".." {
-                return;
-            }
-            let mut dest = self
-                .inactive_panel()
-                .current_dir
-                .to_string_lossy()
-                .to_string();
-            if !dest.ends_with('/') {
-                dest.push('/');
-            }
-            let name = entry.name.clone();
-            self.mode = AppMode::CopyDialog(CopyDialogState::new(name, dest, false));
+        let paths = self.active_panel().effective_selection_paths();
+        if paths.is_empty() {
+            return;
         }
+        let mut dest = self
+            .inactive_panel()
+            .current_dir
+            .to_string_lossy()
+            .to_string();
+        if !dest.ends_with('/') {
+            dest.push('/');
+        }
+        let display_name = if paths.len() == 1 {
+            paths[0]
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            format!("{} items", paths.len())
+        };
+        self.mode = AppMode::CopyDialog(CopyDialogState::new(display_name, paths, dest, false));
     }
 
     fn handle_move(&mut self) {
-        if let Some(entry) = self.active_panel().selected_entry() {
-            if entry.name == ".." {
-                return;
-            }
-            let mut dest = self
-                .inactive_panel()
-                .current_dir
-                .to_string_lossy()
-                .to_string();
-            if !dest.ends_with('/') {
-                dest.push('/');
-            }
-            let name = entry.name.clone();
-            self.mode = AppMode::CopyDialog(CopyDialogState::new(name, dest, true));
+        let paths = self.active_panel().effective_selection_paths();
+        if paths.is_empty() {
+            return;
         }
+        let mut dest = self
+            .inactive_panel()
+            .current_dir
+            .to_string_lossy()
+            .to_string();
+        if !dest.ends_with('/') {
+            dest.push('/');
+        }
+        let display_name = if paths.len() == 1 {
+            paths[0]
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            format!("{} items", paths.len())
+        };
+        self.mode = AppMode::CopyDialog(CopyDialogState::new(display_name, paths, dest, true));
     }
 
     fn handle_rename(&mut self) {
@@ -954,41 +1252,51 @@ impl App {
                 return;
             }
             let name = entry.name.clone();
+            let cursor = name.chars().count();
             self.mode = AppMode::Dialog(DialogState {
                 kind: DialogKind::InputRename,
                 title: "Rename".to_string(),
                 message: format!("Rename '{}':", name),
                 input: name,
+                cursor,
                 has_input: true,
+                focused: DialogField::Input,
             });
         }
     }
 
     fn handle_create_dir(&mut self) {
-        self.mode = AppMode::Dialog(DialogState {
-            kind: DialogKind::InputMkdir,
-            title: "Create Directory".to_string(),
-            message: "Enter directory name:".to_string(),
-            input: String::new(),
-            has_input: true,
-        });
+        self.mode = AppMode::MkdirDialog(MkdirDialogState::new());
     }
 
     fn handle_delete(&mut self) {
-        if let Some(entry) = self.active_panel().selected_entry() {
-            if entry.name == ".." {
-                return;
-            }
-            let name = entry.name.clone();
-            let kind = if entry.is_dir { "directory" } else { "file" };
-            self.mode = AppMode::Dialog(DialogState {
-                kind: DialogKind::ConfirmDelete,
-                title: "Delete".to_string(),
-                message: format!("Delete {} '{}'?", kind, name),
-                input: String::new(),
-                has_input: false,
-            });
+        let paths = self.active_panel().effective_selection_paths();
+        if paths.is_empty() {
+            return;
         }
+        let message = if paths.len() == 1 {
+            let name = paths[0]
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let kind = if paths[0].is_dir() {
+                "directory"
+            } else {
+                "file"
+            };
+            format!("Delete {} '{}'?", kind, name)
+        } else {
+            format!("Delete {} items?", paths.len())
+        };
+        self.mode = AppMode::Dialog(DialogState {
+            kind: DialogKind::ConfirmDelete,
+            title: "Delete".to_string(),
+            message,
+            input: String::new(),
+            cursor: 0,
+            has_input: false,
+            focused: DialogField::ButtonOk,
+        });
     }
 
     fn handle_view_file(&mut self) {
@@ -1005,6 +1313,128 @@ impl App {
                 self.status_message = Some(format!("__EDIT__{}", entry.path.to_string_lossy()));
             }
         }
+    }
+
+    // --- Mkdir dialog handler ---
+
+    fn handle_mkdir_dialog_action(&mut self, action: Action) {
+        match action {
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
+            Action::Quit => self.should_quit = true,
+            Action::DialogCancel => {
+                self.mode = AppMode::Normal;
+            }
+            Action::DialogConfirm => {
+                let is_cancel = matches!(
+                    self.mode,
+                    AppMode::MkdirDialog(MkdirDialogState {
+                        focused: MkdirDialogField::ButtonCancel,
+                        ..
+                    })
+                );
+                if is_cancel {
+                    self.mode = AppMode::Normal;
+                } else {
+                    self.confirm_mkdir_dialog();
+                }
+            }
+            Action::MoveUp => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.focused = state.focused.prev();
+                }
+            }
+            Action::MoveDown => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.focused = state.focused.next();
+                }
+            }
+            Action::Toggle => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.process_multiple = !state.process_multiple;
+                }
+            }
+            Action::DialogInput(c) => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    if state.focused == MkdirDialogField::Input {
+                        state.insert_char(c);
+                    }
+                }
+            }
+            Action::DialogBackspace => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    if state.focused == MkdirDialogField::Input {
+                        state.delete_char_backward();
+                    }
+                }
+            }
+            Action::CursorLeft => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.cursor_left();
+                }
+            }
+            Action::CursorRight => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.cursor_right();
+                }
+            }
+            Action::CursorLineStart => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.cursor_home();
+                }
+            }
+            Action::CursorLineEnd => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.cursor_end();
+                }
+            }
+            Action::SwitchPanel => {
+                // Swap between OK and Cancel buttons
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.focused = match state.focused {
+                        MkdirDialogField::ButtonOk => MkdirDialogField::ButtonCancel,
+                        MkdirDialogField::ButtonCancel => MkdirDialogField::ButtonOk,
+                        other => other,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn confirm_mkdir_dialog(&mut self) {
+        let (input, process_multiple) = match &self.mode {
+            AppMode::MkdirDialog(s) => (s.input.clone(), s.process_multiple),
+            _ => return,
+        };
+
+        if input.is_empty() {
+            self.mode = AppMode::Normal;
+            return;
+        }
+
+        let dir = self.active_panel().current_dir.clone();
+        let names: Vec<&str> = if process_multiple {
+            input.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+        } else {
+            vec![input.trim()]
+        };
+
+        let mut first_err: Option<anyhow::Error> = None;
+        for name in names {
+            if let Err(e) = fs_ops::create_directory(&dir, name) {
+                first_err = Some(e);
+                break;
+            }
+        }
+
+        match first_err {
+            None => self.status_message = None,
+            Some(e) => self.status_message = Some(format!("Error: {}", e)),
+        }
+
+        self.mode = AppMode::Normal;
+        self.panels[0].reload();
+        self.panels[1].reload();
     }
 
     // --- Copy dialog handler ---
@@ -1048,15 +1478,44 @@ impl App {
             Action::DialogInput(c) => {
                 if let AppMode::CopyDialog(ref mut state) = self.mode {
                     if state.focused == CopyDialogField::Destination {
-                        state.destination.push(c);
+                        state.insert_char(c);
                     }
                 }
             }
             Action::DialogBackspace => {
                 if let AppMode::CopyDialog(ref mut state) = self.mode {
                     if state.focused == CopyDialogField::Destination {
-                        state.destination.pop();
+                        state.delete_char_backward();
                     }
+                }
+            }
+            Action::CursorLeft => {
+                if let AppMode::CopyDialog(ref mut state) = self.mode {
+                    state.cursor_left();
+                }
+            }
+            Action::CursorRight => {
+                if let AppMode::CopyDialog(ref mut state) = self.mode {
+                    state.cursor_right();
+                }
+            }
+            Action::CursorLineStart => {
+                if let AppMode::CopyDialog(ref mut state) = self.mode {
+                    state.cursor_home();
+                }
+            }
+            Action::CursorLineEnd => {
+                if let AppMode::CopyDialog(ref mut state) = self.mode {
+                    state.cursor_end();
+                }
+            }
+            Action::SwitchPanel => {
+                if let AppMode::CopyDialog(ref mut state) = self.mode {
+                    state.focused = match state.focused {
+                        CopyDialogField::ButtonCopy => CopyDialogField::ButtonCancel,
+                        CopyDialogField::ButtonCancel => CopyDialogField::ButtonCopy,
+                        other => other,
+                    };
                 }
             }
             _ => {}
@@ -1064,32 +1523,38 @@ impl App {
     }
 
     fn confirm_copy_dialog(&mut self) {
-        let (source_path, dest, is_move) = {
+        let (source_paths, dest, is_move) = {
             let state = match &self.mode {
                 AppMode::CopyDialog(s) => s,
                 _ => return,
             };
-            let source = self.active_panel().selected_entry().map(|e| e.path.clone());
-            if source.is_none() {
+            if state.source_paths.is_empty() {
                 self.mode = AppMode::Normal;
                 return;
             }
             (
-                source.unwrap(),
+                state.source_paths.clone(),
                 PathBuf::from(&state.destination),
                 state.is_move,
             )
         };
 
-        let result = if is_move {
-            fs_ops::move_entry(&source_path, &dest)
-        } else {
-            fs_ops::copy_entry(&source_path, &dest)
-        };
+        let mut first_err: Option<anyhow::Error> = None;
+        for source_path in &source_paths {
+            let result = if is_move {
+                fs_ops::move_entry(source_path, &dest)
+            } else {
+                fs_ops::copy_entry(source_path, &dest)
+            };
+            if let Err(e) = result {
+                first_err = Some(e);
+                break;
+            }
+        }
 
-        match result {
-            Ok(()) => self.status_message = None,
-            Err(e) => self.status_message = Some(format!("Error: {}", e)),
+        match first_err {
+            None => self.status_message = None,
+            Some(e) => self.status_message = Some(format!("Error: {}", e)),
         }
 
         self.mode = AppMode::Normal;
@@ -1133,7 +1598,10 @@ impl App {
         ) {
             return;
         }
-        if matches!(self.mode, AppMode::Dialog(_) | AppMode::CopyDialog(_)) {
+        if matches!(
+            self.mode,
+            AppMode::Dialog(_) | AppMode::MkdirDialog(_) | AppMode::CopyDialog(_)
+        ) {
             return;
         }
 
@@ -1168,7 +1636,7 @@ impl App {
                 }
                 return;
             }
-            AppMode::Dialog(_) | AppMode::CopyDialog(_) => return,
+            AppMode::Dialog(_) | AppMode::MkdirDialog(_) | AppMode::CopyDialog(_) => return,
             _ => {}
         }
 
@@ -1204,9 +1672,87 @@ impl App {
         self.mode = AppMode::Normal;
     }
 
-    // --- Simple dialog handlers ---
+    // --- Dialog handler (delete, rename) ---
 
-    fn handle_dialog_confirm(&mut self) {
+    fn handle_dialog_action(&mut self, action: Action) {
+        match action {
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
+            Action::Quit => self.should_quit = true,
+            Action::DialogCancel => {
+                self.mode = AppMode::Normal;
+            }
+            Action::DialogConfirm => {
+                let is_cancel = matches!(
+                    self.mode,
+                    AppMode::Dialog(DialogState {
+                        focused: DialogField::ButtonCancel,
+                        ..
+                    })
+                );
+                if is_cancel {
+                    self.mode = AppMode::Normal;
+                } else {
+                    self.confirm_dialog();
+                }
+            }
+            Action::MoveUp => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.focused = state.focused.prev(state.has_input);
+                }
+            }
+            Action::MoveDown => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.focused = state.focused.next(state.has_input);
+                }
+            }
+            Action::DialogInput(c) => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    if state.focused == DialogField::Input {
+                        state.insert_char(c);
+                    }
+                }
+            }
+            Action::DialogBackspace => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    if state.focused == DialogField::Input {
+                        state.delete_char_backward();
+                    }
+                }
+            }
+            Action::CursorLeft => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.cursor_left();
+                }
+            }
+            Action::CursorRight => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.cursor_right();
+                }
+            }
+            Action::CursorLineStart => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.cursor_home();
+                }
+            }
+            Action::CursorLineEnd => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.cursor_end();
+                }
+            }
+            Action::SwitchPanel => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.focused = match state.focused {
+                        DialogField::ButtonOk => DialogField::ButtonCancel,
+                        DialogField::ButtonCancel => DialogField::ButtonOk,
+                        other => other,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn confirm_dialog(&mut self) {
         let dialog = match &self.mode {
             AppMode::Dialog(d) => d.clone(),
             _ => return,
@@ -1214,18 +1760,17 @@ impl App {
 
         let result = match dialog.kind {
             DialogKind::ConfirmDelete => {
-                if let Some(entry) = self.active_panel().selected_entry() {
-                    fs_ops::delete_entry(&entry.path)
-                } else {
-                    Ok(())
+                let paths = self.active_panel().effective_selection_paths();
+                let mut first_err: Option<anyhow::Error> = None;
+                for path in &paths {
+                    if let Err(e) = fs_ops::delete_entry(path) {
+                        first_err = Some(e);
+                        break;
+                    }
                 }
-            }
-            DialogKind::InputMkdir => {
-                if dialog.input.is_empty() {
-                    Ok(())
-                } else {
-                    let dir = self.active_panel().current_dir.clone();
-                    fs_ops::create_directory(&dir, &dialog.input)
+                match first_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
                 }
             }
             DialogKind::InputRename => {
@@ -1255,42 +1800,23 @@ impl App {
                 self.mode = AppMode::Normal;
                 self.needs_clear = true;
             }
-            AppMode::Dialog(_) => {
-                self.mode = AppMode::Normal;
-            }
             _ => {}
-        }
-    }
-
-    fn handle_dialog_input(&mut self, c: char) {
-        if let AppMode::Dialog(ref mut dialog) = self.mode {
-            if dialog.has_input {
-                dialog.input.push(c);
-            }
         }
     }
 
     fn handle_dialog_backspace(&mut self) {
-        match &mut self.mode {
-            AppMode::Dialog(ref mut dialog) => {
-                if dialog.has_input {
-                    dialog.input.pop();
+        if let AppMode::QuickSearch = &self.mode {
+            let panel = &mut self.panels[self.active_panel];
+            if let Some(ref mut query) = panel.quick_search {
+                query.pop();
+                if query.is_empty() {
+                    panel.quick_search = None;
+                    self.mode = AppMode::Normal;
+                } else {
+                    let q = query.clone();
+                    panel.jump_to_match(&q);
                 }
             }
-            AppMode::QuickSearch => {
-                let panel = &mut self.panels[self.active_panel];
-                if let Some(ref mut query) = panel.quick_search {
-                    query.pop();
-                    if query.is_empty() {
-                        panel.quick_search = None;
-                        self.mode = AppMode::Normal;
-                    } else {
-                        let q = query.clone();
-                        panel.jump_to_match(&q);
-                    }
-                }
-            }
-            _ => {}
         }
     }
 }

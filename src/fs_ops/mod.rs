@@ -61,7 +61,8 @@ pub fn delete_entry(path: &Path) -> Result<()> {
 
 pub fn create_directory(parent: &Path, name: &str) -> Result<()> {
     let path = parent.join(name);
-    fs::create_dir(&path).with_context(|| format!("Failed to create directory {:?}", path))?;
+    fs::create_dir_all(&path)
+        .with_context(|| format!("Failed to create directory {:?}", path))?;
     Ok(())
 }
 

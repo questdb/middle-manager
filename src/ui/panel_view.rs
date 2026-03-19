@@ -46,8 +46,13 @@ pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool)
     let rows: Vec<Row> = panel
         .entries
         .iter()
-        .map(|entry| {
-            let name_style = if entry.is_dir {
+        .enumerate()
+        .map(|(idx, entry)| {
+            let is_selected = panel.selected_indices.contains(&idx);
+
+            let name_style = if is_selected {
+                t.selected_style()
+            } else if entry.is_dir {
                 t.dir_style()
             } else if entry.is_symlink {
                 t.symlink_style()
@@ -55,6 +60,12 @@ pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool)
                 t.exec_style()
             } else {
                 t.file_style()
+            };
+
+            let meta_style = if is_selected {
+                t.selected_style()
+            } else {
+                Style::default().fg(t.size_fg).bg(t.bg)
             };
 
             let name_display = if entry.is_dir && entry.name != ".." {
@@ -67,10 +78,17 @@ pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool)
 
             Row::new(vec![
                 Cell::from(name_display).style(name_style),
-                Cell::from(entry.formatted_size()).style(Style::default().fg(t.size_fg).bg(t.bg)),
-                Cell::from(entry.formatted_date()).style(Style::default().fg(t.date_fg).bg(t.bg)),
-                Cell::from(entry.formatted_permissions())
-                    .style(Style::default().fg(t.perm_fg).bg(t.bg)),
+                Cell::from(entry.formatted_size()).style(meta_style),
+                Cell::from(entry.formatted_date()).style(if is_selected {
+                    t.selected_style()
+                } else {
+                    Style::default().fg(t.date_fg).bg(t.bg)
+                }),
+                Cell::from(entry.formatted_permissions()).style(if is_selected {
+                    t.selected_style()
+                } else {
+                    Style::default().fg(t.perm_fg).bg(t.bg)
+                }),
             ])
         })
         .collect();

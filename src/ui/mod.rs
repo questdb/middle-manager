@@ -4,6 +4,7 @@ pub mod editor_view;
 pub mod footer;
 pub mod header;
 pub mod hex_view;
+pub mod mkdir_dialog;
 pub mod panel_view;
 mod shadow;
 pub mod viewer_view;
@@ -55,6 +56,7 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
 
     let dialog_area = match &app.mode {
         AppMode::Dialog(ref d) => Some(dialog::render(frame, d)),
+        AppMode::MkdirDialog(ref s) => Some(mkdir_dialog::render(frame, s)),
         AppMode::CopyDialog(ref s) => Some(copy_dialog::render(frame, s)),
         _ => None,
     };

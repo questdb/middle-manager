@@ -4,30 +4,28 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
-use crate::app::{DialogField, DialogState};
+use crate::app::{MkdirDialogField, MkdirDialogState};
 use crate::theme::theme;
 
-const DIALOG_WIDTH: u16 = 56;
+const DIALOG_WIDTH: u16 = 66;
+const DIALOG_HEIGHT: u16 = 11;
 
 const PAD: usize = 2;    // horizontal padding inside border
-const MARGIN: u16 = 2;   // outer margin left/right
+const MARGIN: u16 = 2;   // outer margin around the border (left/right)
 const MARGIN_V: u16 = 1; // outer margin top/bottom
 
-pub fn render(frame: &mut Frame, dialog: &DialogState) -> Rect {
+pub fn render(frame: &mut Frame, state: &MkdirDialogState) -> Rect {
     let t = theme();
     let dbg = t.dialog_bg;
 
-    // Height depends on whether there's an input field:
-    // With input: padding(1) + message(1) + input(1) + padding(1) + sep(1) + buttons(1) + padding(1) = 7
-    // Without input: padding(1) + message(1) + padding(1) + sep(1) + buttons(1) + padding(1) = 6
-    let dialog_h: u16 = if dialog.has_input { 9 } else { 7 };
-
+    // Outer area includes margin; the border box sits inside it
     let outer_w = (DIALOG_WIDTH + MARGIN * 2).min(frame.area().width.saturating_sub(2));
-    let outer_h = (dialog_h + MARGIN_V * 2).min(frame.area().height.saturating_sub(2));
+    let outer_h = (DIALOG_HEIGHT + MARGIN_V * 2).min(frame.area().height.saturating_sub(2));
     let outer = centered_rect(outer_w, outer_h, frame.area());
 
-    // Clear and fill outer margin with dialog background
+    // Clear the full outer area (creates the gap around the border)
     frame.render_widget(Clear, outer);
+    // Fill outer margin with dialog background
     let bg_style = t.dialog_bg_style();
     let buf = frame.buffer_mut();
     for y in outer.top()..outer.bottom() {
@@ -48,10 +46,7 @@ pub fn render(frame: &mut Frame, dialog: &DialogState) -> Rect {
     );
 
     let block = Block::default()
-        .title(Span::styled(
-            format!(" {} ", dialog.title),
-            t.dialog_title_style(),
-        ))
+        .title(Span::styled(" Make folder ", t.dialog_title_style()))
         .borders(Borders::ALL)
         .border_style(t.dialog_border_style())
         .style(t.dialog_bg_style());
@@ -61,6 +56,7 @@ pub fn render(frame: &mut Frame, dialog: &DialogState) -> Rect {
 
     let normal = Style::default().fg(t.dialog_text_fg).bg(dbg);
     let highlight = Style::default().fg(t.dialog_input_fg_focused).bg(t.dialog_input_bg);
+    let input_highlight = highlight;
     let input_normal = Style::default()
         .fg(t.dialog_input_fg)
         .bg(dbg)
@@ -76,83 +72,86 @@ pub fn render(frame: &mut Frame, dialog: &DialogState) -> Rect {
     let cw = content.width as usize;
 
     // y=0: empty padding row
-    // y=1: message
+    // y=1: "Create the folder"
     render_line(
         frame,
         content,
         1,
         Line::from(Span::styled(
-            format!("{:<width$}", dialog.message, width = cw),
+            format!("{:<width$}", "Create the folder", width = cw),
             normal,
         )),
     );
 
-    let buttons_y;
+    // y=2: input field
+    let input_focused = state.focused == MkdirDialogField::Input;
+    let input_style = if input_focused { input_highlight } else { input_normal };
+    let input_text = format!("{:<width$}", state.input, width = cw);
+    render_line(
+        frame,
+        content,
+        2,
+        Line::from(Span::styled(input_text, input_style)),
+    );
 
-    if dialog.has_input {
-        // y=2: input field
-        let input_focused = dialog.focused == DialogField::Input;
-        let input_style = if input_focused { highlight } else { input_normal };
-        let input_text = format!("{:<width$}", dialog.input, width = cw);
-        render_line(
-            frame,
-            content,
-            2,
-            Line::from(Span::styled(input_text, input_style)),
-        );
+    // y=3: empty padding row
+    // y=4: separator (full width, uses outer area)
+    render_separator(frame, area, inner.y + 4, t.dialog_border_style());
 
-        // y=3: empty padding row
-        // y=4: separator
-        render_separator(frame, area, inner.y + 4, t.dialog_border_style());
+    // y=5: "Process multiple names" checkbox
+    let pm_focused = state.focused == MkdirDialogField::ProcessMultiple;
+    let check = if state.process_multiple { "x" } else { " " };
+    let pm_style = if pm_focused { highlight } else { normal };
+    let pm_text = format!(
+        "[{}] Process multiple names{:<width$}",
+        check,
+        "",
+        width = cw.saturating_sub(28)
+    );
+    render_line(
+        frame,
+        content,
+        5,
+        Line::from(Span::styled(pm_text, pm_style)),
+    );
 
-        buttons_y = 5;
+    // y=6: separator
+    render_separator(frame, area, inner.y + 6, t.dialog_border_style());
 
-        // Blinking cursor in input field
-        if input_focused {
-            let cursor_x = content.x + dialog.cursor as u16;
-            let cursor_y = content.y + 2;
-            if cursor_x < content.x + content.width {
-                frame.set_cursor_position((cursor_x, cursor_y));
-            }
-        }
-    } else {
-        // y=2: empty padding row
-        // y=3: separator
-        render_separator(frame, area, inner.y + 3, t.dialog_border_style());
-
-        buttons_y = 4;
-    }
-
-    // Buttons
-    let ok_label = if dialog.has_input { "{ OK }" } else { "{ Yes }" };
-    let cancel_label = if dialog.has_input {
-        "[ Cancel ]"
-    } else {
-        "[ No ]"
-    };
-    let ok_focused = dialog.focused == DialogField::ButtonOk;
-    let cancel_focused = dialog.focused == DialogField::ButtonCancel;
-    let buttons_len = ok_label.len() + 4 + cancel_label.len();
+    // y=7: buttons — centered
+    let ok_focused = state.focused == MkdirDialogField::ButtonOk;
+    let cancel_focused = state.focused == MkdirDialogField::ButtonCancel;
+    let buttons_len = 6 + 4 + 10; // "{ OK }" + gap + "[ Cancel ]"
     let left_pad = cw.saturating_sub(buttons_len) / 2;
     let right_pad = cw.saturating_sub(buttons_len + left_pad);
     render_line(
         frame,
         content,
-        buttons_y,
+        7,
         Line::from(vec![
             Span::styled(" ".repeat(left_pad), normal),
             Span::styled(
-                ok_label,
+                "{ OK }",
                 if ok_focused { highlight } else { normal },
             ),
             Span::styled("    ", normal),
             Span::styled(
-                cancel_label,
+                "[ Cancel ]",
                 if cancel_focused { highlight } else { normal },
             ),
             Span::styled(" ".repeat(right_pad), normal),
         ]),
     );
+    // y=8: empty padding row
+
+    // Blinking cursor in input field
+    if input_focused {
+        let cursor_x = content.x + state.cursor as u16;
+        let cursor_y = content.y + 2;
+        if cursor_x < content.x + content.width {
+            frame.set_cursor_position((cursor_x, cursor_y));
+        }
+    }
 
     outer
 }

@@ -1,6 +1,7 @@
 pub mod entry;
 pub mod sort;
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 use ratatui::widgets::TableState;
@@ -16,6 +17,7 @@ pub struct Panel {
     pub sort_ascending: bool,
     pub quick_search: Option<String>,
     pub error: Option<String>,
+    pub selected_indices: BTreeSet<usize>,
 }
 
 impl Panel {
@@ -28,6 +30,7 @@ impl Panel {
             sort_ascending: true,
             quick_search: None,
             error: None,
+            selected_indices: BTreeSet::new(),
         };
         panel.reload();
         if !panel.entries.is_empty() {
@@ -38,6 +41,7 @@ impl Panel {
 
     pub fn reload(&mut self) {
         self.entries.clear();
+        self.selected_indices.clear();
         self.error = None;
 
         // Add parent directory entry
@@ -65,6 +69,13 @@ impl Panel {
     }
 
     pub fn apply_sort(&mut self) {
+        // Preserve selection across sort by converting to paths
+        let selected_paths: std::collections::HashSet<PathBuf> = self
+            .selected_indices
+            .iter()
+            .filter_map(|&i| self.entries.get(i).map(|e| e.path.clone()))
+            .collect();
+
         // Keep ".." at the top, sort the rest
         let has_parent = self
             .entries
@@ -76,6 +87,16 @@ impl Panel {
             sort_entries(&mut self.entries[1..], self.sort_field, self.sort_ascending);
         } else {
             sort_entries(&mut self.entries, self.sort_field, self.sort_ascending);
+        }
+
+        // Rebuild selected indices from paths
+        if !selected_paths.is_empty() {
+            self.selected_indices.clear();
+            for (i, entry) in self.entries.iter().enumerate() {
+                if selected_paths.contains(&entry.path) {
+                    self.selected_indices.insert(i);
+                }
+            }
         }
     }
 
@@ -160,6 +181,63 @@ impl Panel {
             .position(|e| e.name.to_lowercase().starts_with(&query_lower))
         {
             self.table_state.select(Some(idx));
+        }
+    }
+
+    /// Toggle selection on the current entry and move cursor down.
+    pub fn toggle_select_current(&mut self) {
+        let idx = self.selected_index();
+        if idx < self.entries.len() && self.entries[idx].name != ".." {
+            if !self.selected_indices.remove(&idx) {
+                self.selected_indices.insert(idx);
+            }
+        }
+        self.move_selection(1);
+    }
+
+    /// Extend selection upward: select current, move up, select new position.
+    pub fn select_move_up(&mut self) {
+        let idx = self.selected_index();
+        if idx < self.entries.len() && self.entries[idx].name != ".." {
+            self.selected_indices.insert(idx);
+        }
+        self.move_selection(-1);
+        let new_idx = self.selected_index();
+        if new_idx < self.entries.len() && self.entries[new_idx].name != ".." {
+            self.selected_indices.insert(new_idx);
+        }
+    }
+
+    /// Extend selection downward: select current, move down, select new position.
+    pub fn select_move_down(&mut self) {
+        let idx = self.selected_index();
+        if idx < self.entries.len() && self.entries[idx].name != ".." {
+            self.selected_indices.insert(idx);
+        }
+        self.move_selection(1);
+        let new_idx = self.selected_index();
+        if new_idx < self.entries.len() && self.entries[new_idx].name != ".." {
+            self.selected_indices.insert(new_idx);
+        }
+    }
+
+    /// Returns paths of all selected entries, or the single cursor entry if none selected.
+    pub fn effective_selection_paths(&self) -> Vec<PathBuf> {
+        if !self.selected_indices.is_empty() {
+            self.selected_indices
+                .iter()
+                .filter_map(|&i| self.entries.get(i))
+                .filter(|e| e.name != "..")
+                .map(|e| e.path.clone())
+                .collect()
+        } else if let Some(entry) = self.selected_entry() {
+            if entry.name == ".." {
+                Vec::new()
+            } else {
+                vec![entry.path.clone()]
+            }
+        } else {
+            Vec::new()
         }
     }
 }

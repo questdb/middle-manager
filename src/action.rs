@@ -13,6 +13,11 @@ pub enum Action {
     GoUp,
     SwitchPanel,
 
+    // Panel multi-file selection
+    ToggleSelect,
+    SelectMoveUp,
+    SelectMoveDown,
+
     // File operations
     Copy,
     Move,
