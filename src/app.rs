@@ -11,7 +11,25 @@ use crate::editor::EditorState;
 use crate::fs_ops;
 use crate::hex_viewer::HexViewerState;
 use crate::panel::git::GitCache;
+use crate::panel::sort::SortField;
 use crate::panel::Panel;
+use crate::state::AppState;
+
+fn sort_field_from_u8(v: u8) -> SortField {
+    match v {
+        1 => SortField::Size,
+        2 => SortField::Date,
+        _ => SortField::Name,
+    }
+}
+
+fn sort_field_to_u8(f: SortField) -> u8 {
+    match f {
+        SortField::Name => 0,
+        SortField::Size => 1,
+        SortField::Date => 2,
+    }
+}
 use crate::viewer::ViewerState;
 
 pub struct App {
@@ -32,6 +50,8 @@ pub struct App {
     pub unsaved_dialog: Option<UnsavedDialogField>,
     /// Shared git status cache across panels.
     git_cache: GitCache,
+    /// Persistent state (search, paths, sort, etc.)
+    pub persisted: AppState,
 }
 
 pub enum AppMode {
@@ -568,11 +588,37 @@ impl CopyDialogField {
 
 impl App {
     pub fn new() -> Self {
+        let persisted = AppState::load();
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+
+        // Restore panel paths from saved state, fall back to cwd
+        let left_path = persisted
+            .left_panel_path
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| cwd.clone());
+        let right_path = persisted
+            .right_panel_path
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| cwd.clone());
+
+        let mut panels = [Panel::new(left_path), Panel::new(right_path)];
+
+        // Restore sort preferences
+        panels[0].sort_field = sort_field_from_u8(persisted.left_sort_field);
+        panels[0].sort_ascending = persisted.left_sort_ascending;
+        panels[0].apply_sort();
+        panels[1].sort_field = sort_field_from_u8(persisted.right_sort_field);
+        panels[1].sort_ascending = persisted.right_sort_ascending;
+        panels[1].apply_sort();
+
         let mut git_cache = GitCache::new();
-        let mut panels = [Panel::new(cwd.clone()), Panel::new(cwd)];
         panels[0].refresh_git(&mut git_cache);
         panels[1].refresh_git(&mut git_cache);
+
         Self {
             panels,
             active_panel: 0,
@@ -586,7 +632,21 @@ impl App {
             search_dialog: None,
             unsaved_dialog: None,
             git_cache,
+            persisted,
         }
+    }
+
+    /// Save current state to disk.
+    pub fn save_state(&mut self) {
+        self.persisted.left_panel_path =
+            Some(self.panels[0].current_dir.to_string_lossy().to_string());
+        self.persisted.right_panel_path =
+            Some(self.panels[1].current_dir.to_string_lossy().to_string());
+        self.persisted.left_sort_field = sort_field_to_u8(self.panels[0].sort_field);
+        self.persisted.left_sort_ascending = self.panels[0].sort_ascending;
+        self.persisted.right_sort_field = sort_field_to_u8(self.panels[1].sort_field);
+        self.persisted.right_sort_ascending = self.panels[1].sort_ascending;
+        self.persisted.save();
     }
 
     /// Reload both panels and refresh git status.
@@ -1461,6 +1521,19 @@ impl App {
                                 p.direction,
                                 p.case_sensitive,
                             )
+                        } else if !self.persisted.search_query.is_empty() {
+                            // Restore from persisted state
+                            let dir = if self.persisted.search_direction_forward {
+                                SearchDirection::Forward
+                            } else {
+                                SearchDirection::Backward
+                            };
+                            (
+                                self.persisted.search_query.clone(),
+                                self.persisted.search_query.chars().count(),
+                                dir,
+                                self.persisted.search_case_sensitive,
+                            )
                         } else {
                             (String::new(), 0, SearchDirection::Forward, false)
                         }
@@ -1759,6 +1832,12 @@ impl App {
             direction: state.direction,
             case_sensitive: state.case_sensitive,
         };
+
+        // Persist search parameters
+        self.persisted.search_query = params.query.clone();
+        self.persisted.search_direction_forward =
+            matches!(params.direction, SearchDirection::Forward);
+        self.persisted.search_case_sensitive = params.case_sensitive;
 
         if let AppMode::Editing(ref mut e) = self.mode {
             e.last_search = Some(params.clone());

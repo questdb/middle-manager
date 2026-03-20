@@ -5,6 +5,7 @@ mod event;
 mod fs_ops;
 mod hex_viewer;
 mod panel;
+mod state;
 mod syntax;
 mod theme;
 mod ui;
@@ -125,7 +126,8 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
         }
     }
 
-    // Stop event thread before returning (terminal cleanup happens in main)
+    // Save state and stop event thread before returning
+    app.save_state();
     events.stop();
 
     Ok(())
