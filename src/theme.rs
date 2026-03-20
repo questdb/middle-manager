@@ -1,3 +1,4 @@
+use crossterm::cursor::SetCursorStyle;
 use ratatui::style::{Color, Modifier, Style};
 
 pub struct Theme {
@@ -57,6 +58,8 @@ pub struct Theme {
     pub syn_property: Color,
     pub syn_escape: Color,
     pub syn_constructor: Color,
+    // Cursor
+    pub editor_cursor: SetCursorStyle,
 }
 
 impl Theme {
@@ -117,6 +120,7 @@ impl Theme {
             syn_property: Color::LightCyan,
             syn_escape: Color::LightRed,
             syn_constructor: Color::Yellow,
+            editor_cursor: SetCursorStyle::BlinkingBar,
         }
     }
 }
