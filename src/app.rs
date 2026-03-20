@@ -27,6 +27,8 @@ pub struct App {
     pub needs_clear: bool,
     /// Search dialog overlay (shown on top of editor).
     pub search_dialog: Option<SearchDialogState>,
+    /// Unsaved changes confirmation dialog overlay.
+    pub unsaved_dialog: Option<UnsavedDialogField>,
 }
 
 #[derive(Clone)]
@@ -318,6 +320,32 @@ impl SearchDialogField {
     }
 }
 
+// --- Unsaved changes dialog ---
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum UnsavedDialogField {
+    ButtonSave,
+    ButtonDiscard,
+    ButtonCancel,
+}
+
+impl UnsavedDialogField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::ButtonSave => Self::ButtonDiscard,
+            Self::ButtonDiscard => Self::ButtonCancel,
+            Self::ButtonCancel => Self::ButtonSave,
+        }
+    }
+    pub fn prev(self) -> Self {
+        match self {
+            Self::ButtonSave => Self::ButtonCancel,
+            Self::ButtonDiscard => Self::ButtonSave,
+            Self::ButtonCancel => Self::ButtonDiscard,
+        }
+    }
+}
+
 // --- Copy/Move dialog ---
 
 #[derive(Clone)]
@@ -550,6 +578,7 @@ impl App {
             goto_line_input: None,
             needs_clear: false,
             search_dialog: None,
+            unsaved_dialog: None,
         }
     }
 
@@ -610,6 +639,17 @@ impl App {
                 KeyCode::Enter => Action::DialogConfirm,
                 KeyCode::Backspace => Action::DialogBackspace,
                 KeyCode::Char(c) if c.is_ascii_digit() || c == ':' => Action::DialogInput(c),
+                _ => Action::None,
+            };
+        }
+
+        // Unsaved dialog intercepts keys when active
+        if self.unsaved_dialog.is_some() {
+            return match key.code {
+                KeyCode::Esc => Action::QuickSearchClear,
+                KeyCode::Enter => Action::DialogConfirm,
+                KeyCode::Tab | KeyCode::Right | KeyCode::Down => Action::MoveDown,
+                KeyCode::BackTab | KeyCode::Left | KeyCode::Up => Action::MoveUp,
                 _ => Action::None,
             };
         }
@@ -870,6 +910,58 @@ impl App {
         // Go-to-line prompt intercepts all input when active
         if self.goto_line_input.is_some() {
             self.handle_goto_line_action(action);
+            return;
+        }
+
+        // Unsaved changes dialog intercepts when active
+        if self.unsaved_dialog.is_some() {
+            match action {
+                Action::DialogConfirm => {
+                    let focused = self.unsaved_dialog.unwrap();
+                    match focused {
+                        UnsavedDialogField::ButtonSave => {
+                            if let AppMode::Editing(ref mut e) = self.mode {
+                                match e.save() {
+                                    Ok(()) => {}
+                                    Err(err) => {
+                                        e.status_msg = Some(format!("Save failed: {}", err));
+                                        self.unsaved_dialog = None;
+                                        return;
+                                    }
+                                }
+                            }
+                            self.unsaved_dialog = None;
+                            self.mode = AppMode::Normal;
+                            self.needs_clear = true;
+                            self.panels[0].reload();
+                            self.panels[1].reload();
+                        }
+                        UnsavedDialogField::ButtonDiscard => {
+                            self.unsaved_dialog = None;
+                            self.mode = AppMode::Normal;
+                            self.needs_clear = true;
+                        }
+                        UnsavedDialogField::ButtonCancel => {
+                            self.unsaved_dialog = None;
+                        }
+                    }
+                }
+                Action::MoveDown => {
+                    if let Some(ref mut f) = self.unsaved_dialog {
+                        *f = f.next();
+                    }
+                }
+                Action::MoveUp => {
+                    if let Some(ref mut f) = self.unsaved_dialog {
+                        *f = f.prev();
+                    }
+                }
+                Action::QuickSearchClear => {
+                    // Esc — stay in editor
+                    self.unsaved_dialog = None;
+                }
+                _ => {}
+            }
             return;
         }
 
@@ -1175,8 +1267,13 @@ impl App {
                 self.goto_line_input = Some(String::new());
             }
             Action::DialogCancel => {
-                self.mode = AppMode::Normal;
-                self.needs_clear = true;
+                let modified = matches!(self.mode, AppMode::Editing(ref e) if e.modified);
+                if modified {
+                    self.unsaved_dialog = Some(UnsavedDialogField::ButtonSave);
+                } else {
+                    self.mode = AppMode::Normal;
+                    self.needs_clear = true;
+                }
             }
 
             // Selection

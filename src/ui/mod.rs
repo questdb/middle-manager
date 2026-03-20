@@ -87,6 +87,45 @@ fn render_editor(frame: &mut Frame, app: &mut App) {
         let area = search_dialog::render(frame, state);
         shadow::render_shadow(frame, area);
     }
+    if let Some(focused) = app.unsaved_dialog {
+        let area = render_unsaved_dialog(frame, focused);
+        shadow::render_shadow(frame, area);
+    }
+}
+
+fn render_unsaved_dialog(frame: &mut Frame, focused: crate::app::UnsavedDialogField) -> Rect {
+    use crate::app::UnsavedDialogField;
+
+    let layout = dialog_helpers::render_dialog_frame(frame, " Unsaved Changes ", 52, 7);
+    let (normal, highlight, _) = dialog_helpers::dialog_styles();
+
+    dialog_helpers::render_line(
+        frame,
+        layout.content,
+        1,
+        Line::from(Span::styled(
+            format!("{:<width$}", "Save changes before closing?", width = layout.cw),
+            normal,
+        )),
+    );
+
+    let t = theme();
+    dialog_helpers::render_separator(frame, layout.area, layout.inner.y + 3, t.dialog_border_style());
+
+    dialog_helpers::render_buttons(
+        frame,
+        layout.content,
+        4,
+        &[
+            ("{ Save }", focused == UnsavedDialogField::ButtonSave),
+            ("[ Don't Save ]", focused == UnsavedDialogField::ButtonDiscard),
+            ("[ Cancel ]", focused == UnsavedDialogField::ButtonCancel),
+        ],
+        normal,
+        highlight,
+    );
+
+    layout.outer
 }
 
 fn render_goto_prompt(frame: &mut Frame, input: &str) {
