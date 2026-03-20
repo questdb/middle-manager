@@ -31,7 +31,6 @@ pub struct App {
     pub unsaved_dialog: Option<UnsavedDialogField>,
 }
 
-#[derive(Clone)]
 pub enum AppMode {
     Normal,
     QuickSearch,
@@ -853,7 +852,7 @@ impl App {
         if ctrl {
             return match key.code {
                 KeyCode::Char('s') => Action::EditorSave,
-                KeyCode::Char('k') => Action::EditorDeleteLine,
+                KeyCode::Char('k') | KeyCode::Char('y') => Action::EditorDeleteLine,
                 KeyCode::Char('c') => Action::CopySelection,
                 KeyCode::Char('a') => Action::SelectAll,
                 KeyCode::Char('f') => Action::SearchPrompt,

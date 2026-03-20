@@ -1,4 +1,5 @@
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
@@ -14,14 +15,20 @@ pub enum AppEvent {
 
 pub struct EventHandler {
     rx: mpsc::Receiver<AppEvent>,
-    _thread: thread::JoinHandle<()>,
+    stop: Arc<AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 impl EventHandler {
     pub fn new(tick_rate: Duration) -> Self {
         let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
 
         let thread = thread::spawn(move || loop {
+            if stop_flag.load(Ordering::Relaxed) {
+                return;
+            }
             if event::poll(tick_rate).unwrap_or(false) {
                 match event::read() {
                     Ok(Event::Key(key)) => {
@@ -48,7 +55,8 @@ impl EventHandler {
 
         Self {
             rx,
-            _thread: thread,
+            stop,
+            thread: Some(thread),
         }
     }
 
@@ -59,5 +67,20 @@ impl EventHandler {
     /// Drain any queued events (useful after suspending for an editor).
     pub fn drain(&self) {
         while self.rx.try_recv().is_ok() {}
+    }
+
+    /// Signal the event thread to stop and wait for it to finish.
+    /// Must be called before disabling raw mode to avoid stdout garbage.
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+impl Drop for EventHandler {
+    fn drop(&mut self) {
+        self.stop();
     }
 }

@@ -41,6 +41,22 @@ pub struct Theme {
     pub viewer_text_fg: Color,
     pub viewer_hint_fg: Color,
     pub viewer_hint_bg: Color,
+    // Syntax highlighting
+    pub syn_keyword: Color,
+    pub syn_function: Color,
+    pub syn_type: Color,
+    pub syn_string: Color,
+    pub syn_number: Color,
+    pub syn_comment: Color,
+    pub syn_variable: Color,
+    pub syn_constant: Color,
+    pub syn_operator: Color,
+    pub syn_punctuation: Color,
+    pub syn_attribute: Color,
+    pub syn_tag: Color,
+    pub syn_property: Color,
+    pub syn_escape: Color,
+    pub syn_constructor: Color,
 }
 
 impl Theme {
@@ -86,6 +102,21 @@ impl Theme {
             viewer_text_fg: Color::LightCyan,
             viewer_hint_fg: Color::Black,
             viewer_hint_bg: Color::Cyan,
+            syn_keyword: Color::Yellow,
+            syn_function: Color::LightBlue,
+            syn_type: Color::Magenta,
+            syn_string: Color::LightGreen,
+            syn_number: Color::Cyan,
+            syn_comment: Color::DarkGray,
+            syn_variable: Color::White,
+            syn_constant: Color::Cyan,
+            syn_operator: Color::White,
+            syn_punctuation: Color::White,
+            syn_attribute: Color::Yellow,
+            syn_tag: Color::LightRed,
+            syn_property: Color::LightCyan,
+            syn_escape: Color::LightRed,
+            syn_constructor: Color::Yellow,
         }
     }
 }

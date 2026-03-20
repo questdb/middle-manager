@@ -5,6 +5,7 @@ mod event;
 mod fs_ops;
 mod hex_viewer;
 mod panel;
+mod syntax;
 mod theme;
 mod ui;
 mod viewer;
@@ -62,7 +63,7 @@ fn main() -> Result<()> {
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::new();
-    let events = EventHandler::new(Duration::from_millis(250));
+    let mut events = EventHandler::new(Duration::from_millis(250));
 
     loop {
         // Clear if needed (e.g. after leaving a full-screen mode)
@@ -124,6 +125,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
             break;
         }
     }
+
+    // Stop event thread before returning (terminal cleanup happens in main)
+    events.stop();
 
     Ok(())
 }

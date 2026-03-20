@@ -6,6 +6,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthChar;
 
 use crate::editor::EditorState;
+use crate::syntax::SyntaxHighlighter;
 use crate::theme::theme;
 
 pub fn render(frame: &mut Frame, area: Rect, editor: &mut EditorState) {
@@ -38,14 +39,27 @@ pub fn render(frame: &mut Frame, area: Rect, editor: &mut EditorState) {
 
     let num_style = Style::default().fg(Color::Yellow).bg(t.bg);
     let sep_style = Style::default().fg(Color::DarkGray).bg(t.bg);
-    let text_style = Style::default().fg(Color::LightCyan).bg(t.bg);
+    let default_text_style = Style::default().fg(Color::LightCyan).bg(t.bg);
     let sel_style = Style::default().fg(Color::Black).bg(Color::LightCyan);
+
+    // Build syntax-highlighted color map.
+    // Small files (< 10MB): use cached full-file parse — always accurate.
+    // Large files: feed tree-sitter context lines before viewport.
+    let syntax_colors = if editor.syntax.has_full_parse() {
+        build_syntax_colors_from_cache(&content, &editor.syntax)
+    } else {
+        const CONTEXT_LINES: usize = 200;
+        let context_start = editor.scroll_y.saturating_sub(CONTEXT_LINES);
+        let context = editor.get_lines_range(context_start, editor.scroll_y);
+        let context_line_count = context.len();
+        build_syntax_colors(&context, &content, &mut editor.syntax, context_line_count)
+    };
 
     let inner_width = inner.width as usize;
     let mut lines: Vec<Line> = Vec::with_capacity(editor.visible_lines);
     let bg_style = Style::default().bg(t.bg);
 
-    for (vline, text) in &content {
+    for (line_idx, (vline, text)) in content.iter().enumerate() {
         let line_num = vline + 1;
 
         let display_text = truncate_to_width(text, editor.scroll_x, editor.visible_cols);
@@ -65,13 +79,19 @@ pub fn render(frame: &mut Frame, area: Rect, editor: &mut EditorState) {
             ((sl, dsc), (el, dec))
         });
 
-        let text_spans = build_text_spans(
+        // Get per-char colors for this line (in original char space)
+        let line_colors = syntax_colors.get(line_idx);
+
+        let text_spans = build_highlighted_spans(
             &display_text,
+            text,
             *vline,
-            0, // scroll already handled by the column conversion
+            editor.scroll_x,
             display_sel,
-            text_style,
+            line_colors,
+            default_text_style,
             sel_style,
+            t.bg,
         );
 
         let mut spans = vec![
@@ -206,6 +226,7 @@ fn truncate_to_width(text: &str, scroll_x: usize, max_width: usize) -> String {
 
 /// Split a display line into spans, highlighting the selected region.
 /// Columns are expected in display-space (tabs already accounted for).
+#[allow(dead_code)]
 fn build_text_spans<'a>(
     display_text: &str,
     vline: usize,
@@ -267,6 +288,357 @@ fn build_text_spans<'a>(
     }
 
     spans
+}
+
+/// Build per-line syntax colors from the cached full-file parse.
+/// Uses stored line byte offsets to look up the right spans.
+fn build_syntax_colors_from_cache(
+    content: &[(usize, String)],
+    syntax: &SyntaxHighlighter,
+) -> Vec<Vec<Color>> {
+    let default_color = Color::LightCyan;
+
+    if !syntax.is_active() || content.is_empty() {
+        return content
+            .iter()
+            .map(|(_, text)| vec![default_color; text.chars().count()])
+            .collect();
+    }
+
+    let mut result: Vec<Vec<Color>> = content
+        .iter()
+        .map(|(_, text)| vec![default_color; text.chars().count()])
+        .collect();
+
+    for (vis_idx, (vline, text)) in content.iter().enumerate() {
+        let line_start_byte = syntax.line_byte_offset(*vline);
+        let line_end_byte = line_start_byte + text.len();
+
+        let spans = syntax.get_cached_spans(line_start_byte, line_end_byte);
+        for &(span_start, span_end, color) in spans {
+            let byte_start_in_line = span_start.saturating_sub(line_start_byte);
+            let byte_end_in_line = (span_end - line_start_byte).min(text.len());
+
+            let char_start = text[..byte_start_in_line].chars().count();
+            let char_end = text[..byte_end_in_line].chars().count();
+
+            for i in char_start..char_end.min(result[vis_idx].len()) {
+                result[vis_idx][i] = color;
+            }
+        }
+    }
+
+    result
+}
+
+/// Build per-line syntax color arrays from tree-sitter highlighting.
+/// `context` contains lines BEFORE the visible area (for multi-line constructs).
+/// `content` contains the visible lines.
+/// `context_line_count` is how many context lines were prepended.
+/// Returns a Vec (one per visible line) of Vec<Color> (one per original char).
+fn build_syntax_colors(
+    context: &[String],
+    content: &[(usize, String)],
+    syntax: &mut SyntaxHighlighter,
+    context_line_count: usize,
+) -> Vec<Vec<Color>> {
+    let default_color = Color::LightCyan;
+
+    if !syntax.is_active() || content.is_empty() {
+        return content
+            .iter()
+            .map(|(_, text)| vec![default_color; text.chars().count()])
+            .collect();
+    }
+
+    // Join context + visible lines into a single string for tree-sitter
+    let mut all_lines: Vec<&str> = Vec::with_capacity(context.len() + content.len());
+    for line in context {
+        all_lines.push(line.as_str());
+    }
+    for (_, text) in content {
+        all_lines.push(text.as_str());
+    }
+    let joined = all_lines.join("\n");
+
+    let highlights = syntax.highlight_text(&joined);
+
+    // Build byte-offset boundaries for ALL lines (context + visible)
+    let total_lines = context_line_count + content.len();
+    let mut line_byte_starts = Vec::with_capacity(total_lines);
+    let mut offset = 0;
+    for &line_text in &all_lines {
+        line_byte_starts.push(offset);
+        offset += line_text.len() + 1;
+    }
+
+    // Only populate colors for the visible lines (skip context lines)
+    let mut result: Vec<Vec<Color>> = content
+        .iter()
+        .map(|(_, text)| vec![default_color; text.chars().count()])
+        .collect();
+
+    for (span_start, span_end, color) in &highlights {
+        let first_line = line_byte_starts
+            .partition_point(|&start| start <= *span_start)
+            .saturating_sub(1);
+
+        for all_line_idx in first_line..total_lines {
+            // Skip context lines — we only color visible lines
+            if all_line_idx < context_line_count {
+                let line_end_byte = line_byte_starts[all_line_idx] + all_lines[all_line_idx].len();
+                if *span_end <= line_end_byte {
+                    break;
+                }
+                continue;
+            }
+
+            let visible_idx = all_line_idx - context_line_count;
+            if visible_idx >= content.len() {
+                break;
+            }
+
+            let line_start_byte = line_byte_starts[all_line_idx];
+            let line_text = all_lines[all_line_idx];
+            let line_end_byte = line_start_byte + line_text.len();
+
+            if *span_start >= line_end_byte {
+                continue;
+            }
+            if *span_end <= line_start_byte {
+                break;
+            }
+
+            let byte_start_in_line = span_start.saturating_sub(line_start_byte);
+            let byte_end_in_line = (*span_end - line_start_byte).min(line_text.len());
+
+            let char_start = line_text[..byte_start_in_line].chars().count();
+            let char_end = line_text[..byte_end_in_line].chars().count();
+
+            for i in char_start..char_end.min(result[visible_idx].len()) {
+                result[visible_idx][i] = *color;
+            }
+        }
+    }
+
+    result
+}
+
+/// Build highlighted spans for a display line, combining syntax colors and selection.
+#[allow(clippy::too_many_arguments)]
+fn build_highlighted_spans<'a>(
+    display_text: &str,
+    orig_text: &str,
+    vline: usize,
+    scroll_x: usize,
+    sel_range: Option<((usize, usize), (usize, usize))>,
+    line_colors: Option<&Vec<Color>>,
+    default_style: Style,
+    sel_style: Style,
+    bg: Color,
+) -> Vec<Span<'a>> {
+    let ((sl, sc), (el, ec)) = match sel_range {
+        Some(r) => r,
+        None => {
+            // No selection — just apply syntax colors
+            return build_colored_spans(display_text, orig_text, scroll_x, line_colors, default_style, bg);
+        }
+    };
+
+    if vline < sl || vline > el {
+        return build_colored_spans(display_text, orig_text, scroll_x, line_colors, default_style, bg);
+    }
+
+    let display_chars: Vec<char> = display_text.chars().collect();
+    let len = display_chars.len();
+    let continues = vline != el;
+
+    let sel_start = if vline == sl { sc.min(len) } else { 0 };
+    let sel_end = if vline == el { ec.min(len) } else { len };
+
+    if sel_start >= sel_end && !continues {
+        return build_colored_spans(display_text, orig_text, scroll_x, line_colors, default_style, bg);
+    }
+
+    // Build with selection overlay
+    let mut spans = Vec::new();
+
+    // Before selection
+    if sel_start > 0 {
+        let segment: String = display_chars[..sel_start].iter().collect();
+        let sub_spans = build_colored_spans(&segment, orig_text, scroll_x, line_colors, default_style, bg);
+        spans.extend(sub_spans);
+    }
+
+    // Selected region
+    if sel_end > sel_start {
+        let segment: String = display_chars[sel_start..sel_end].iter().collect();
+        spans.push(Span::styled(segment, sel_style));
+    }
+
+    // Continuation marker for multi-line selection
+    if continues {
+        spans.push(Span::styled(" ", sel_style));
+    }
+
+    // After selection
+    if sel_end < len {
+        let segment: String = display_chars[sel_end..].iter().collect();
+        // For the after-selection part, we need to offset the color lookup
+        let offset_colors: Option<Vec<Color>> = line_colors.map(|colors| {
+            let orig_char_start = display_col_to_orig_char(orig_text, sel_end, scroll_x);
+            if orig_char_start < colors.len() {
+                colors[orig_char_start..].to_vec()
+            } else {
+                vec![]
+            }
+        });
+        let sub_spans = build_colored_spans_with_offset(
+            &segment,
+            offset_colors.as_ref(),
+            default_style,
+            bg,
+        );
+        spans.extend(sub_spans);
+    }
+
+    spans
+}
+
+/// Build spans with syntax colors applied (no selection).
+/// Maps display characters back to original char positions for correct
+/// color lookup, handling tab expansion and control char stripping.
+fn build_colored_spans<'a>(
+    display_text: &str,
+    orig_text: &str,
+    scroll_x: usize,
+    line_colors: Option<&Vec<Color>>,
+    default_style: Style,
+    bg: Color,
+) -> Vec<Span<'a>> {
+    let colors = match line_colors {
+        Some(c) if !c.is_empty() => c,
+        _ => return vec![Span::styled(display_text.to_owned(), default_style)],
+    };
+
+    // Collect original chars once (avoids O(n²) .chars().count()/.nth() calls)
+    let orig_chars: Vec<char> = orig_text.chars().collect();
+
+    // Build a mapping: for each display char, which original char index does it
+    // correspond to? Tabs expand to multiple display chars that all map to the
+    // same original index.
+    let mut display_to_orig: Vec<usize> = Vec::with_capacity(display_text.chars().count());
+    let mut orig_idx = scroll_x;
+    while orig_idx < orig_chars.len() {
+        let ch = orig_chars[orig_idx];
+        if ch == '\t' {
+            let dcol = display_to_orig.len();
+            let tab_width = 4 - (dcol % 4);
+            for _ in 0..tab_width {
+                display_to_orig.push(orig_idx); // all tab spaces → same orig index
+            }
+            orig_idx += 1;
+        } else if ch.is_control() {
+            // Control chars are stripped from display, skip
+            orig_idx += 1;
+        } else {
+            display_to_orig.push(orig_idx);
+            orig_idx += 1;
+        }
+        if display_to_orig.len() >= display_text.chars().count() {
+            break;
+        }
+    }
+
+    // Build spans by grouping consecutive chars with the same color
+    let mut spans = Vec::new();
+    let mut current_color = Color::LightCyan;
+    let mut current_text = String::new();
+
+    for (disp_idx, ch) in display_text.chars().enumerate() {
+        let color = display_to_orig
+            .get(disp_idx)
+            .and_then(|&oi| colors.get(oi))
+            .copied()
+            .unwrap_or(Color::LightCyan);
+
+        if color != current_color && !current_text.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(&mut current_text),
+                Style::default().fg(current_color).bg(bg),
+            ));
+        }
+        current_color = color;
+        current_text.push(ch);
+    }
+
+    if !current_text.is_empty() {
+        spans.push(Span::styled(
+            current_text,
+            Style::default().fg(current_color).bg(bg),
+        ));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(display_text.to_owned(), default_style));
+    }
+
+    spans
+}
+
+/// Build colored spans with pre-offset color array (for after-selection segments).
+fn build_colored_spans_with_offset<'a>(
+    text: &str,
+    colors: Option<&Vec<Color>>,
+    default_style: Style,
+    bg: Color,
+) -> Vec<Span<'a>> {
+    let colors = match colors {
+        Some(c) if !c.is_empty() => c,
+        _ => return vec![Span::styled(text.to_owned(), default_style)],
+    };
+
+    let mut spans = Vec::new();
+    let mut current_color = Color::LightCyan;
+    let mut current_text = String::new();
+
+    for (i, ch) in text.chars().enumerate() {
+        let color = if i < colors.len() { colors[i] } else { Color::LightCyan };
+        if color != current_color && !current_text.is_empty() {
+            spans.push(Span::styled(
+                std::mem::take(&mut current_text),
+                Style::default().fg(current_color).bg(bg),
+            ));
+        }
+        current_color = color;
+        current_text.push(ch);
+    }
+
+    if !current_text.is_empty() {
+        spans.push(Span::styled(
+            current_text,
+            Style::default().fg(current_color).bg(bg),
+        ));
+    }
+
+    spans
+}
+
+/// Convert a display column to an original char index (for color lookup).
+fn display_col_to_orig_char(text: &str, display_col: usize, scroll_x: usize) -> usize {
+    let mut dcol = 0;
+    for (i, ch) in text.chars().enumerate() {
+        if i < scroll_x { continue; }
+        if dcol >= display_col { return i; }
+        if ch == '\t' {
+            dcol += 4 - (dcol % 4);
+        } else if ch.is_control() {
+            continue;
+        } else {
+            dcol += 1;
+        }
+    }
+    text.chars().count()
 }
 
 #[cfg(test)]

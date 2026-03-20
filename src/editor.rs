@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 
 use crate::app::SearchDirection;
+use crate::syntax::SyntaxHighlighter;
 
 #[derive(Clone)]
 pub struct SearchParams {
@@ -15,7 +16,6 @@ pub struct SearchParams {
 
 const INDEX_INTERVAL: usize = 1000;
 
-#[derive(Clone)]
 pub struct EditorState {
     pub path: PathBuf,
     pub file_size: u64,
@@ -56,6 +56,9 @@ pub struct EditorState {
 
     /// Last search parameters for find-next/find-previous.
     pub last_search: Option<SearchParams>,
+
+    /// Syntax highlighter (None if language not detected).
+    pub syntax: SyntaxHighlighter,
 }
 
 #[derive(Clone)]
@@ -67,6 +70,7 @@ enum Segment {
 impl EditorState {
     pub fn open(path: PathBuf) -> Self {
         let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let syntax = SyntaxHighlighter::new(&path, ratatui::style::Color::LightCyan);
         let mut state = Self {
             path,
             file_size,
@@ -93,6 +97,7 @@ impl EditorState {
             selection_anchor: None,
             search_selection: false,
             last_search: None,
+            syntax,
         };
         // Pre-scan first batch of lines for immediate display
         state.scan_to_line(10_000);
@@ -198,6 +203,13 @@ impl EditorState {
         self.segments.splice(seg_idx..seg_idx + 1, new_segs);
     }
 
+    fn mark_modified(&mut self) {
+        if !self.modified {
+            self.syntax.invalidate_cache();
+        }
+        self.modified = true;
+    }
+
     // --- Editing operations ---
 
     pub fn insert_char(&mut self, c: char) {
@@ -212,7 +224,7 @@ impl EditorState {
             self.cursor_col += 1;
             self.desired_col = self.cursor_col;
         }
-        self.modified = true;
+        self.mark_modified();
         self.scroll_to_cursor();
     }
 
@@ -244,7 +256,7 @@ impl EditorState {
             self.cursor_line = prev;
             self.cursor_col = new_col;
             self.desired_col = self.cursor_col;
-            self.modified = true;
+            self.mark_modified();
             self.scroll_to_cursor();
             return;
         }
@@ -260,7 +272,7 @@ impl EditorState {
             self.cursor_col -= 1;
             self.desired_col = self.cursor_col;
         }
-        self.modified = true;
+        self.mark_modified();
     }
 
     pub fn delete_char_forward(&mut self) {
@@ -283,7 +295,7 @@ impl EditorState {
                 lines[offset] = joined;
             }
             self.remove_virtual_line(next);
-            self.modified = true;
+            self.mark_modified();
             return;
         }
 
@@ -296,7 +308,7 @@ impl EditorState {
             let byte_end = char_to_byte(line, self.cursor_col + 1);
             line.drain(byte_start..byte_end);
         }
-        self.modified = true;
+        self.mark_modified();
     }
 
     pub fn insert_newline(&mut self) {
@@ -315,7 +327,7 @@ impl EditorState {
         self.cursor_line += 1;
         self.cursor_col = 0;
         self.desired_col = 0;
-        self.modified = true;
+        self.mark_modified();
         self.scroll_to_cursor();
     }
 
@@ -334,7 +346,7 @@ impl EditorState {
             }
             self.cursor_col = 0;
             self.desired_col = 0;
-            self.modified = true;
+            self.mark_modified();
             return;
         }
 
@@ -344,7 +356,7 @@ impl EditorState {
             self.cursor_line = self.total_virtual_lines().saturating_sub(1);
         }
         self.clamp_cursor_col();
-        self.modified = true;
+        self.mark_modified();
         self.scroll_to_cursor();
     }
 
@@ -1095,6 +1107,18 @@ impl EditorState {
 
     // --- Visible content ---
 
+    /// Get lines in a range [start, end) for syntax highlighting context.
+    pub fn get_lines_range(&mut self, start: usize, end: usize) -> Vec<String> {
+        let mut result = Vec::with_capacity(end.saturating_sub(start));
+        for vline in start..end {
+            match self.get_line_text(vline) {
+                Some(text) => result.push(text),
+                None => break,
+            }
+        }
+        result
+    }
+
     pub fn visible_content(&mut self) -> Vec<(usize, String)> {
         let mut result = Vec::with_capacity(self.visible_lines);
         for i in 0..self.visible_lines {
@@ -1645,13 +1669,14 @@ mod tests {
     use std::io::Write;
 
     fn create_test_editor(content: &str) -> EditorState {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir();
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!(
-            "mm_test_{}.txt",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "mm_test_{}_{}.txt",
+            std::process::id(),
+            id,
         ));
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
@@ -2532,13 +2557,14 @@ mod tests {
     /// Create a test file large enough to force multi-chunk reads (>4MB).
     /// Returns (editor, line_number_of_needle) with a known "NEEDLE" on one line.
     fn create_large_test_editor(needle_line: usize, total_lines: usize) -> (EditorState, usize) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LARGE_COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir();
+        let id = LARGE_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!(
-            "mm_large_test_{}.txt",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "mm_large_test_{}_{}.txt",
+            std::process::id(),
+            id,
         ));
         let mut f = std::fs::File::create(&path).unwrap();
         for i in 0..total_lines {
@@ -2627,13 +2653,14 @@ mod tests {
     fn search_backward_findnext_large_file() {
         // Two needles: cursor past both. Backward find should hit the later one first,
         // then the earlier one on repeat.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static LARGE2_COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir();
+        let id = LARGE2_COUNTER.fetch_add(1, Ordering::Relaxed);
         let path = dir.join(format!(
-            "mm_large2_{}.txt",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
+            "mm_large2_{}_{}.txt",
+            std::process::id(),
+            id,
         ));
         let mut f = std::fs::File::create(&path).unwrap();
         let total = 80_000;
