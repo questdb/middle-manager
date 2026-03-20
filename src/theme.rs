@@ -60,6 +60,14 @@ pub struct Theme {
     pub syn_constructor: Color,
     // Cursor
     pub editor_cursor: SetCursorStyle,
+    // Git
+    pub git_modified_fg: Color,
+    pub git_added_fg: Color,
+    pub git_deleted_fg: Color,
+    pub git_untracked_fg: Color,
+    pub git_conflict_fg: Color,
+    pub git_renamed_fg: Color,
+    pub git_branch_fg: Color,
 }
 
 impl Theme {
@@ -121,6 +129,13 @@ impl Theme {
             syn_escape: Color::LightRed,
             syn_constructor: Color::Yellow,
             editor_cursor: SetCursorStyle::BlinkingBar,
+            git_modified_fg: Color::Yellow,
+            git_added_fg: Color::LightGreen,
+            git_deleted_fg: Color::LightRed,
+            git_untracked_fg: Color::DarkGray,
+            git_conflict_fg: Color::LightRed,
+            git_renamed_fg: Color::Magenta,
+            git_branch_fg: Color::LightGreen,
         }
     }
 }
@@ -182,6 +197,18 @@ impl Theme {
             .fg(self.selected_fg)
             .bg(self.bg)
             .add_modifier(Modifier::BOLD)
+    }
+
+    pub fn git_status_color(&self, status: crate::panel::git::GitFileStatus) -> Color {
+        use crate::panel::git::GitFileStatus;
+        match status {
+            GitFileStatus::Modified => self.git_modified_fg,
+            GitFileStatus::Added => self.git_added_fg,
+            GitFileStatus::Deleted => self.git_deleted_fg,
+            GitFileStatus::Renamed => self.git_renamed_fg,
+            GitFileStatus::Untracked => self.git_untracked_fg,
+            GitFileStatus::Conflict => self.git_conflict_fg,
+        }
     }
 
     pub fn dialog_bg_style(&self) -> Style {

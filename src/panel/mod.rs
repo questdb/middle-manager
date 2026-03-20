@@ -1,4 +1,5 @@
 pub mod entry;
+pub mod git;
 pub mod sort;
 
 use std::collections::BTreeSet;
@@ -18,6 +19,7 @@ pub struct Panel {
     pub quick_search: Option<String>,
     pub error: Option<String>,
     pub selected_indices: BTreeSet<usize>,
+    pub git_info: Option<git::GitInfo>,
 }
 
 impl Panel {
@@ -31,6 +33,7 @@ impl Panel {
             quick_search: None,
             error: None,
             selected_indices: BTreeSet::new(),
+            git_info: None,
         };
         panel.reload();
         if !panel.entries.is_empty() {
@@ -66,6 +69,11 @@ impl Panel {
         }
 
         self.apply_sort();
+    }
+
+    /// Refresh git info using the shared cache.
+    pub fn refresh_git(&mut self, cache: &mut git::GitCache) {
+        self.git_info = cache.get_info(&self.current_dir);
     }
 
     pub fn apply_sort(&mut self) {

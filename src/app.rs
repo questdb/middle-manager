@@ -10,6 +10,7 @@ use crate::action::Action;
 use crate::editor::EditorState;
 use crate::fs_ops;
 use crate::hex_viewer::HexViewerState;
+use crate::panel::git::GitCache;
 use crate::panel::Panel;
 use crate::viewer::ViewerState;
 
@@ -29,6 +30,8 @@ pub struct App {
     pub search_dialog: Option<SearchDialogState>,
     /// Unsaved changes confirmation dialog overlay.
     pub unsaved_dialog: Option<UnsavedDialogField>,
+    /// Shared git status cache across panels.
+    git_cache: GitCache,
 }
 
 pub enum AppMode {
@@ -566,8 +569,12 @@ impl CopyDialogField {
 impl App {
     pub fn new() -> Self {
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+        let mut git_cache = GitCache::new();
+        let mut panels = [Panel::new(cwd.clone()), Panel::new(cwd)];
+        panels[0].refresh_git(&mut git_cache);
+        panels[1].refresh_git(&mut git_cache);
         Self {
-            panels: [Panel::new(cwd.clone()), Panel::new(cwd)],
+            panels,
             active_panel: 0,
             mode: AppMode::Normal,
             should_quit: false,
@@ -578,7 +585,18 @@ impl App {
             needs_clear: false,
             search_dialog: None,
             unsaved_dialog: None,
+            git_cache,
         }
+    }
+
+    /// Reload both panels and refresh git status.
+    pub fn reload_panels(&mut self) {
+        self.panels[0].reload();
+        self.panels[1].reload();
+        self.git_cache.invalidate(&self.panels[0].current_dir);
+        self.git_cache.invalidate(&self.panels[1].current_dir);
+        self.panels[0].refresh_git(&mut self.git_cache);
+        self.panels[1].refresh_git(&mut self.git_cache);
     }
 
     pub fn take_edit_request(&mut self) -> Option<String> {
@@ -932,8 +950,7 @@ impl App {
                             self.unsaved_dialog = None;
                             self.mode = AppMode::Normal;
                             self.needs_clear = true;
-                            self.panels[0].reload();
-                            self.panels[1].reload();
+                            self.reload_panels();
                         }
                         UnsavedDialogField::ButtonDiscard => {
                             self.unsaved_dialog = None;
@@ -1146,6 +1163,7 @@ impl App {
         if let Some(entry) = panel.selected_entry().cloned() {
             if entry.is_dir {
                 panel.navigate_into();
+                self.panels[self.active_panel].refresh_git(&mut self.git_cache);
             } else {
                 self.open_file(entry.path);
             }
@@ -1154,6 +1172,7 @@ impl App {
 
     fn handle_go_up(&mut self) {
         self.active_panel_mut().navigate_up();
+        self.panels[self.active_panel].refresh_git(&mut self.git_cache);
     }
 
     fn handle_switch_panel(&mut self) {
@@ -1428,8 +1447,7 @@ impl App {
                     }
                 }
                 // Reload panels after save
-                self.panels[0].reload();
-                self.panels[1].reload();
+                self.reload_panels();
             }
 
             // Search
@@ -1868,8 +1886,7 @@ impl App {
         }
 
         self.mode = AppMode::Normal;
-        self.panels[0].reload();
-        self.panels[1].reload();
+        self.reload_panels();
     }
 
     // --- Copy dialog handler ---
@@ -1993,8 +2010,7 @@ impl App {
         }
 
         self.mode = AppMode::Normal;
-        self.panels[0].reload();
-        self.panels[1].reload();
+        self.reload_panels();
     }
 
     // --- Mouse handlers ---
@@ -2229,8 +2245,7 @@ impl App {
         }
 
         self.mode = AppMode::Normal;
-        self.panels[0].reload();
-        self.panels[1].reload();
+        self.reload_panels();
     }
 
     fn handle_dialog_cancel(&mut self) {

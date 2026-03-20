@@ -98,8 +98,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
             events.drain();
 
             // Reload panels
-            app.panels[0].reload();
-            app.panels[1].reload();
+            app.reload_panels();
             continue;
         }
 
