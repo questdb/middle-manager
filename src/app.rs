@@ -781,6 +781,7 @@ impl App {
             KeyCode::F(8) => Action::Delete,
             KeyCode::F(9) => Action::CycleSort,
             KeyCode::F(10) => Action::Quit,
+            KeyCode::F(11) => Action::OpenPr,
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
             KeyCode::Char(c) if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' => {
                 Action::QuickSearch(c)
@@ -1066,7 +1067,14 @@ impl App {
         }
 
         match action {
-            Action::None | Action::Tick => {}
+            Action::None => {}
+            Action::Tick => {
+                // Poll for async PR query results
+                if self.git_cache.poll_pending() {
+                    self.panels[0].refresh_git(&mut self.git_cache);
+                    self.panels[1].refresh_git(&mut self.git_cache);
+                }
+            }
             Action::Quit => self.should_quit = true,
             Action::Resize(_, _) => {}
             Action::Toggle => self.handle_toggle_viewer(),
@@ -1131,6 +1139,17 @@ impl App {
             // Sorting
             Action::CycleSort => {
                 self.active_panel_mut().cycle_sort();
+            }
+
+            // GitHub
+            Action::OpenPr => {
+                if let Some(ref gi) = self.active_panel().git_info {
+                    if let Some(ref pr) = gi.pr {
+                        crate::panel::github::open_url(&pr.url);
+                    } else {
+                        self.status_message = Some("No PR for this branch".to_string());
+                    }
+                }
             }
 
             // Mouse

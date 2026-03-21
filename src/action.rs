@@ -83,6 +83,9 @@ pub enum Action {
     MouseScrollUp(u16, u16),
     MouseScrollDown(u16, u16),
 
+    // GitHub
+    OpenPr,
+
     // Application
     Quit,
     Resize(u16, u16),

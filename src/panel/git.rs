@@ -63,6 +63,8 @@ pub struct GitInfo {
     pub total_untracked: usize,
     pub total_renamed: usize,
     pub total_conflict: usize,
+    /// PR info from GitHub (if gh CLI is available).
+    pub pr: Option<super::github::PrInfo>,
 }
 
 /// Cached git state per repository root.
@@ -70,6 +72,8 @@ pub struct GitInfo {
 pub struct GitCache {
     /// Repo root path → cached data.
     cache: HashMap<PathBuf, CacheEntry>,
+    /// Pending async PR queries. Checked on each get_info call.
+    pr_receivers: HashMap<PathBuf, std::sync::mpsc::Receiver<Option<super::github::PrInfo>>>,
 }
 
 struct CacheEntry {
@@ -78,6 +82,8 @@ struct CacheEntry {
     behind: usize,
     /// All statuses keyed by repo-relative path.
     all_statuses: HashMap<String, GitFileStatus>,
+    /// PR info from GitHub (populated asynchronously).
+    pr: Option<super::github::PrInfo>,
     /// When this entry was last refreshed.
     last_refresh: Instant,
 }
@@ -89,6 +95,7 @@ impl GitCache {
     pub fn new() -> Self {
         Self {
             cache: HashMap::new(),
+            pr_receivers: HashMap::new(),
         }
     }
 
@@ -99,6 +106,16 @@ impl GitCache {
 
         let repo_root = get_repo_root(&dir)?;
 
+        // Check for completed async PR queries
+        if let Some(rx) = self.pr_receivers.get(&repo_root) {
+            if let Ok(pr_result) = rx.try_recv() {
+                if let Some(entry) = self.cache.get_mut(&repo_root) {
+                    entry.pr = pr_result;
+                }
+                self.pr_receivers.remove(&repo_root);
+            }
+        }
+
         // Check cache freshness
         let needs_refresh = self
             .cache
@@ -107,7 +124,36 @@ impl GitCache {
             .unwrap_or(true);
 
         if needs_refresh {
-            if let Some(entry) = query_repo(&dir, &repo_root) {
+            if let Some(mut entry) = query_repo(&dir, &repo_root) {
+                // Preserve PR info from old cache entry to avoid flicker
+                let old_branch = self.cache.get(&repo_root).map(|e| e.branch.clone());
+                let old_pr = self.cache.get(&repo_root).and_then(|e| e.pr.clone());
+
+                if let Some(ref old_pr_info) = old_pr {
+                    entry.pr = Some(old_pr_info.clone());
+                }
+
+                // Only re-query PR if branch changed or no PR info yet
+                let branch_changed = old_branch.as_deref() != Some(&entry.branch);
+                let no_pr = entry.pr.is_none() && !self.pr_receivers.contains_key(&repo_root);
+
+                if branch_changed || no_pr {
+                    let branch = entry.branch.clone();
+                    let dir_clone = dir.clone();
+                    let root_clone = repo_root.clone();
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let pr = super::github::query_pr_info(&dir_clone, &branch);
+                        let _ = tx.send(pr);
+                    });
+                    self.pr_receivers.insert(root_clone, rx);
+
+                    // Clear stale PR on branch change
+                    if branch_changed {
+                        entry.pr = None;
+                    }
+                }
+
                 self.cache.insert(repo_root.clone(), entry);
             } else {
                 self.cache.remove(&repo_root);
@@ -185,7 +231,31 @@ impl GitCache {
             total_untracked,
             total_renamed,
             total_conflict,
+            pr: entry.pr.clone(),
         })
+    }
+
+    /// Check for completed async PR queries and update cache.
+    /// Returns true if any PR info was updated (panels should re-read).
+    pub fn poll_pending(&mut self) -> bool {
+        let mut updated = false;
+        let mut completed = Vec::new();
+
+        for (root, rx) in &self.pr_receivers {
+            if let Ok(pr_result) = rx.try_recv() {
+                if let Some(entry) = self.cache.get_mut(root) {
+                    entry.pr = pr_result;
+                }
+                completed.push(root.clone());
+                updated = true;
+            }
+        }
+
+        for root in completed {
+            self.pr_receivers.remove(&root);
+        }
+
+        updated
     }
 
     /// Force refresh for a specific directory's repo.
@@ -350,6 +420,7 @@ fn query_repo(dir: &Path, _repo_root: &Path) -> Option<CacheEntry> {
         ahead,
         behind,
         all_statuses,
+        pr: None, // populated asynchronously
         last_refresh: Instant::now(),
     })
 }

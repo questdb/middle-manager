@@ -4,6 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Row, Table};
 use ratatui::Frame;
 
+use crate::panel::github::PrCheckStatus;
 use crate::panel::sort::SortField;
 use crate::panel::Panel;
 use crate::theme::{theme, Theme};
@@ -282,6 +283,27 @@ fn build_git_suffix(panel: &Panel, t: &Theme) -> Vec<Span<'static>> {
                 ));
                 first = false;
             }
+        }
+    }
+
+    // PR status
+    if let Some(ref pr) = gi.pr {
+        let (pr_color, check_marker) = match pr.checks {
+            PrCheckStatus::Pass => (t.git_added_fg, pr.checks.marker()),
+            PrCheckStatus::Fail => (t.git_deleted_fg, pr.checks.marker()),
+            PrCheckStatus::Pending => (ratatui::style::Color::Yellow, pr.checks.marker()),
+            PrCheckStatus::None => (t.git_branch_fg, ""),
+        };
+        spans.push(Span::styled("  ", sep));
+        spans.push(Span::styled(
+            format!("PR #{}", pr.number),
+            Style::default().fg(t.git_branch_fg).bg(t.bg),
+        ));
+        if !check_marker.is_empty() {
+            spans.push(Span::styled(
+                format!(" {}", check_marker),
+                Style::default().fg(pr_color).bg(t.bg),
+            ));
         }
     }
 

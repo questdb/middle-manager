@@ -1,5 +1,6 @@
 pub mod entry;
 pub mod git;
+pub mod github;
 pub mod sort;
 
 use std::collections::BTreeSet;
