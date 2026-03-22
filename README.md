@@ -59,6 +59,7 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Tree-sitter syntax highlighting for Rust, Java, Python, JavaScript/TypeScript, JSON, Go, C, Bash, TOML
 - Hybrid highlighting: files under 10 MB get a cached full parse (always accurate); larger files use a context-window approach
 - Search (F7) with forward/backward, case-sensitive toggle, wrap-around
+- **Undo/redo** (Ctrl+Z / Ctrl+Shift+Z): operation-based with minimal deltas, word-level grouping, 10K entry cap
 - Streaming byte-level search — seeks directly to cursor position, no full-file scan
 - Search results highlighted; Shift+F7 repeats last search
 - Text selection with Shift+arrow keys
@@ -168,6 +169,8 @@ cargo build --release
 | Shift+arrows | Select text |
 | Ctrl+A | Select all |
 | Ctrl+C | Copy selection to clipboard |
+| Ctrl+Z | Undo |
+| Ctrl+Shift+Z | Redo |
 | Ctrl+K / Ctrl+Y | Delete line |
 | Ctrl+G | Go to line:col |
 | Ctrl+F / F7 | Search |
@@ -230,7 +233,7 @@ This project is in early development. Things we're considering:
 
 - [ ] Search in viewer (F3)
 - [ ] Syntax highlighting in viewer
-- [ ] Undo/redo in editor
+- [x] Undo/redo in editor
 - [ ] File permissions dialog
 - [ ] Configurable key bindings
 - [ ] Multiple color schemes
