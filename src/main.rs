@@ -62,6 +62,9 @@ fn main() -> Result<()> {
         crossterm::cursor::SetCursorStyle::DefaultUserShape
     )?;
     terminal.show_cursor()?;
+    // Flush to ensure all escape sequences are fully written before the shell takes over
+    use std::io::Write;
+    let _ = io::stdout().flush();
 
     if let Err(e) = result {
         eprintln!("Error: {}", e);

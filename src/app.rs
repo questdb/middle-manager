@@ -41,6 +41,7 @@ pub struct App {
     pub should_quit: bool,
     pub status_message: Option<String>,
     pub panel_areas: [Rect; 2],
+    pub ci_panel_areas: [Option<Rect>; 2],
     last_click: Option<(Instant, u16, u16)>,
     /// Go-to-line prompt state. When Some, an input overlay is shown.
     pub goto_line_input: Option<String>,
@@ -50,6 +51,8 @@ pub struct App {
     pub search_dialog: Option<SearchDialogState>,
     /// Unsaved changes confirmation dialog overlay.
     pub unsaved_dialog: Option<UnsavedDialogField>,
+    /// Quit confirmation dialog: true = Quit focused, false = Cancel focused.
+    pub quit_confirm: Option<bool>,
     /// Shared git status cache across panels.
     git_cache: GitCache,
     /// Persistent state (search, paths, sort, etc.)
@@ -639,6 +642,7 @@ impl App {
             should_quit: false,
             status_message: None,
             panel_areas: [Rect::default(); 2],
+            ci_panel_areas: [None, None],
             last_click: None,
             goto_line_input: None,
             needs_clear: false,
@@ -649,6 +653,7 @@ impl App {
             dir_watcher,
             ci_panels: [None, None],
             ci_focused: None,
+            quit_confirm: None,
         }
     }
 
@@ -674,6 +679,25 @@ impl App {
         self.panels[0].refresh_git(&mut self.git_cache);
         self.panels[1].refresh_git(&mut self.git_cache);
         self.update_watched_dirs();
+    }
+
+    /// Close CI panels that are no longer relevant (branch changed or left the repo).
+    fn check_ci_panels(&mut self) {
+        for side in 0..2 {
+            if let Some(ref ci) = self.ci_panels[side] {
+                let still_valid = self.panels[side]
+                    .git_info
+                    .as_ref()
+                    .map(|gi| gi.branch == ci.branch)
+                    .unwrap_or(false);
+                if !still_valid && ci.download.is_none() {
+                    self.ci_panels[side] = None;
+                    if self.ci_focused == Some(side) {
+                        self.ci_focused = None;
+                    }
+                }
+            }
+        }
     }
 
     /// Update filesystem watcher to track current panel directories.
@@ -744,6 +768,16 @@ impl App {
             };
         }
 
+        // Quit confirmation intercepts keys
+        if self.quit_confirm.is_some() {
+            return match key.code {
+                KeyCode::Enter => Action::DialogConfirm,
+                KeyCode::Esc => Action::DialogCancel,
+                KeyCode::Tab | KeyCode::Left | KeyCode::Right => Action::SwitchPanel,
+                _ => Action::None,
+            };
+        }
+
         // Unsaved dialog intercepts keys when active
         if self.unsaved_dialog.is_some() {
             return match key.code {
@@ -761,9 +795,12 @@ impl App {
                 KeyCode::Up => Action::MoveUp,
                 KeyCode::Down => Action::MoveDown,
                 KeyCode::Enter => Action::Enter,
+                KeyCode::Right => Action::CursorRight,
+                KeyCode::Left => Action::GoUp,
                 KeyCode::Char('o') => Action::OpenPr,
                 KeyCode::Tab => Action::SwitchPanel,
                 KeyCode::F(2) => Action::ToggleCi,
+                KeyCode::F(10) => Action::Quit,
                 _ => Action::None,
             };
         }
@@ -824,7 +861,7 @@ impl App {
             KeyCode::Char(c) if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' => {
                 Action::QuickSearch(c)
             }
-            KeyCode::Esc => Action::Quit,
+            // Esc does nothing in normal mode — use F10 to quit
             _ => Action::None,
         }
     }
@@ -1029,6 +1066,42 @@ impl App {
             return;
         }
 
+        // F10 Quit — always confirm, works from any panel/mode
+        if matches!(action, Action::Quit)
+            && self.unsaved_dialog.is_none()
+            && self.quit_confirm.is_none()
+        {
+            let has_unsaved = matches!(self.mode, AppMode::Editing(ref e) if e.modified);
+            if has_unsaved {
+                self.unsaved_dialog = Some(UnsavedDialogField::ButtonSave);
+            } else {
+                self.quit_confirm = Some(true); // Quit button focused
+            }
+            return;
+        }
+
+        // Quit confirmation dialog
+        if self.quit_confirm.is_some() {
+            match action {
+                Action::DialogConfirm => {
+                    if self.quit_confirm == Some(true) {
+                        self.should_quit = true;
+                    } else {
+                        self.quit_confirm = None;
+                    }
+                }
+                Action::DialogCancel => {
+                    self.quit_confirm = None;
+                }
+                Action::SwitchPanel => {
+                    self.quit_confirm = Some(!self.quit_confirm.unwrap_or(true));
+                }
+                Action::None | Action::Tick | Action::Resize(_, _) => {}
+                _ => {}
+            }
+            return;
+        }
+
         // Unsaved changes dialog intercepts when active
         if self.unsaved_dialog.is_some() {
             match action {
@@ -1214,9 +1287,18 @@ impl App {
             Action::ToggleCi => {
                 let side = self.active_panel;
                 if self.ci_panels[side].is_some() {
-                    self.ci_panels[side] = None;
-                    if self.ci_focused == Some(side) {
-                        self.ci_focused = None;
+                    if self.ci_panels[side]
+                        .as_ref()
+                        .map(|ci| ci.download.is_some())
+                        .unwrap_or(false)
+                    {
+                        self.status_message =
+                            Some("Download in progress — wait for it to complete".to_string());
+                    } else {
+                        self.ci_panels[side] = None;
+                        if self.ci_focused == Some(side) {
+                            self.ci_focused = None;
+                        }
                     }
                 } else if let Some(ref gi) = self.active_panel().git_info {
                     let dir = self.active_panel().current_dir.clone();
@@ -1328,6 +1410,7 @@ impl App {
                 panel.navigate_into();
                 self.panels[self.active_panel].refresh_git(&mut self.git_cache);
                 self.update_watched_dirs();
+                self.check_ci_panels();
             } else {
                 self.open_file(entry.path);
             }
@@ -1338,6 +1421,7 @@ impl App {
         self.active_panel_mut().navigate_up();
         self.panels[self.active_panel].refresh_git(&mut self.git_cache);
         self.update_watched_dirs();
+        self.check_ci_panels();
     }
 
     fn handle_switch_panel(&mut self) {
@@ -2048,12 +2132,33 @@ impl App {
                     self.start_ci_log_download(side, run_id, &step);
                 }
             }
+            Action::CursorRight => {
+                // Right: expand only (don't download on steps)
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.enter(); // returns Some for steps but we ignore it
+                }
+            }
+            Action::GoUp => {
+                // Left: collapse expanded check, or jump to parent check from step
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.collapse_or_parent();
+                }
+            }
             Action::SwitchPanel => {
                 self.handle_switch_panel();
             }
             Action::ToggleCi => {
-                self.ci_panels[side] = None;
-                self.ci_focused = None;
+                if self.ci_panels[side]
+                    .as_ref()
+                    .map(|ci| ci.download.is_some())
+                    .unwrap_or(false)
+                {
+                    self.status_message =
+                        Some("Download in progress — wait for it to complete".to_string());
+                } else {
+                    self.ci_panels[side] = None;
+                    self.ci_focused = None;
+                }
             }
             Action::OpenPr => {
                 if let Some(ref ci) = self.ci_panels[side] {
@@ -2062,6 +2167,11 @@ impl App {
                     }
                 }
             }
+            // Let mouse events through to the normal handler
+            Action::MouseClick(col, row) => self.handle_mouse_click(col, row),
+            Action::MouseDoubleClick(col, row) => self.handle_mouse_double_click(col, row),
+            Action::MouseScrollUp(col, row) => self.handle_mouse_scroll(col, row, -3),
+            Action::MouseScrollDown(col, row) => self.handle_mouse_scroll(col, row, 3),
             _ => {}
         }
     }
@@ -2094,15 +2204,38 @@ impl App {
                 step.name.clone(),
             ));
         } else if run_id > 0 {
-            // GitHub Actions: zip download + extract
+            // GitHub Actions: per-job log download (plain text, fast)
             let repo = ci.repo.clone();
-            ci.download = Some(crate::ci::LogDownload::start_github(
-                &repo,
-                run_id,
-                step.number,
-                &step.name,
-                output_path,
-            ));
+            // Find the job_id for this check
+            let job_id = self.ci_panels[side]
+                .as_ref()
+                .and_then(|ci| {
+                    if let crate::ci::CiView::Tree { items, selected, .. } = &ci.view {
+                        // Walk back from selected to find the parent check
+                        for i in (0..=*selected).rev() {
+                            if let crate::ci::TreeItem::Check { check, .. } = &items[i] {
+                                return Some(check.job_id);
+                            }
+                        }
+                    }
+                    None
+                })
+                .unwrap_or(0);
+
+            if job_id > 0 {
+                let ci = self.ci_panels[side].as_mut().unwrap();
+                ci.download = Some(crate::ci::LogDownload::start_github(
+                    &repo,
+                    run_id,
+                    step.number,
+                    &step.name,
+                    output_path,
+                    job_id,
+                ));
+            } else {
+                self.status_message = Some("Cannot download: no job ID found".to_string());
+            }
+            return;
         } else {
             self.status_message = Some("Cannot download logs: no run ID found".to_string());
         }
@@ -2400,7 +2533,45 @@ impl App {
             return;
         }
 
+        // Check if click is in a CI panel
+        for side in 0..2 {
+            if let Some(ci_area) = self.ci_panel_areas[side] {
+                if col >= ci_area.x
+                    && col < ci_area.x + ci_area.width
+                    && row >= ci_area.y
+                    && row < ci_area.y + ci_area.height
+                {
+                    self.ci_focused = Some(side);
+                    // Compute which item was clicked
+                    if let Some(ref mut ci) = self.ci_panels[side] {
+                        // Account for border (1 row for top border)
+                        let inner_y = ci_area.y + 1;
+                        if row >= inner_y {
+                            let click_offset = (row - inner_y) as usize;
+                            let scroll = match &ci.view {
+                                crate::ci::CiView::Tree { scroll, .. } => *scroll,
+                                _ => 0,
+                            };
+                            let target = scroll + click_offset;
+                            let item_count = match &ci.view {
+                                crate::ci::CiView::Tree { items, .. } => items.len(),
+                                _ => 0,
+                            };
+                            if target < item_count {
+                                if let crate::ci::CiView::Tree { selected, .. } = &mut ci.view {
+                                    *selected = target;
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Click on a file panel — unfocus CI
         if let Some(panel_idx) = self.panel_at(col, row) {
+            self.ci_focused = None;
             self.active_panel = panel_idx;
             if let Some(entry_idx) = self.row_to_entry_index(panel_idx, row) {
                 self.panels[panel_idx].table_state.select(Some(entry_idx));

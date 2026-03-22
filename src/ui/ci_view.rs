@@ -20,10 +20,14 @@ pub fn render(frame: &mut Frame, area: Rect, ci: &mut CiPanel, is_active: bool) 
                     .iter()
                     .filter(|c| c.status == CiStatus::Failure)
                     .count();
+                let pr_label = ci
+                    .pr_number
+                    .map(|n| format!(" PR #{}", n))
+                    .unwrap_or_default();
                 if failed > 0 {
-                    format!(" CI Checks ({} failed / {}) ", failed, total)
+                    format!(" CI{} ({} failed / {}) ", pr_label, failed, total)
                 } else {
-                    format!(" CI Checks ({}) ", total)
+                    format!(" CI{} ({}) ", pr_label, total)
                 }
             }
             CiView::Loading(msg) => format!(" {} ", msg),
@@ -58,7 +62,7 @@ pub fn render(frame: &mut Frame, area: Rect, ci: &mut CiPanel, is_active: bool) 
             scroll,
             ..
         } => {
-            render_tree(frame, inner, t, is_active, items, *selected, *scroll);
+            render_tree(frame, inner, t, is_active, items, *selected, *scroll, ci.spinner_tick);
         }
         CiView::Loading(_) => {}
         CiView::Error(msg) => {
@@ -79,6 +83,7 @@ fn render_tree(
     items: &[TreeItem],
     selected: usize,
     scroll: usize,
+    spinner_tick: usize,
 ) {
     let visible_height = area.height as usize;
     let highlight = if is_active {
@@ -97,9 +102,13 @@ fn render_tree(
 
         match item {
             TreeItem::Check {
-                check, expanded, ..
+                check, expanded, loading, ..
             } => {
-                let arrow = if *expanded { "\u{25bc}" } else { "\u{25b6}" }; // ▼ / ▶
+                let arrow = if *expanded {
+                    "\u{25bc}" // ▼
+                } else {
+                    "\u{25b6}" // ▶
+                };
                 let marker = check.status.marker();
                 let marker_style = if is_sel {
                     highlight
@@ -114,11 +123,20 @@ fn render_tree(
                     Style::default().fg(t.border).bg(t.bg)
                 };
 
-                lines.push(Line::from(vec![
+                let mut spans = vec![
                     Span::styled(format!(" {} ", marker), marker_style),
                     Span::styled(format!("{} ", arrow), arrow_style),
                     Span::styled(check.display_name(), text_style),
-                ]));
+                ];
+
+                if *loading {
+                    let braille = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+                    let c = braille[spinner_tick % braille.len()];
+                    let loading_style = Style::default().fg(t.header_fg).bg(t.bg);
+                    spans.push(Span::styled(format!("  {} loading...", c), loading_style));
+                }
+
+                lines.push(Line::from(spans));
             }
             TreeItem::Step { step, .. } => {
                 let marker = step.status.marker();

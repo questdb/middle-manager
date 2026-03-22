@@ -37,15 +37,6 @@ impl CiCheck {
         self.details_url.contains("github.com") && self.job_id > 0
     }
 
-    pub fn ci_provider(&self) -> &'static str {
-        if self.details_url.contains("dev.azure.com") {
-            "Azure DevOps"
-        } else if self.details_url.contains("github.com") {
-            "GitHub Actions"
-        } else {
-            "External CI"
-        }
-    }
 }
 
 /// A step within a CI job.
@@ -94,7 +85,6 @@ pub enum TreeItem {
     Check {
         check: CiCheck,
         expanded: bool,
-        #[allow(dead_code)]
         loading: bool,
     },
     Step {
@@ -125,8 +115,6 @@ const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧
 pub struct LogDownload {
     pub step_name: String,
     pub output_path: PathBuf,
-    #[allow(dead_code)]
-    pub total_bytes: Option<u64>,
     rx: std::sync::mpsc::Receiver<Result<(), String>>,
 }
 
@@ -159,70 +147,42 @@ impl LogDownload {
         Self {
             step_name,
             output_path,
-            total_bytes: None,
             rx,
         }
     }
 
     /// Start download for a GitHub Actions log (zip, then extract specific step).
+    /// Start download for a GitHub Actions job log (plain text, per-job API).
     pub fn start_github(
         repo: &str,
-        run_id: u64,
-        step_number: u64,
+        _run_id: u64,
+        _step_number: u64,
         step_name: &str,
         output_path: PathBuf,
+        job_id: u64,
     ) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
-        let repo = repo.to_string();
-        let step_name_clone = step_name.to_string();
         let path = output_path.clone();
+
+        // Use per-job log API: plain text, no zip, much faster
+        let url = format!("repos/{}/actions/jobs/{}/logs", repo, job_id);
 
         std::thread::spawn(move || {
             let result = (|| -> Result<(), String> {
-                let tmp_dir = std::env::temp_dir().join(format!("mm_ci_logs_{}", run_id));
-                let _ = std::fs::create_dir_all(&tmp_dir);
-                let zip_path = tmp_dir.join("logs.zip");
-
-                let zip_file = std::fs::File::create(&zip_path)
-                    .map_err(|e| format!("Failed to create temp file: {}", e))?;
+                let out_file = std::fs::File::create(&path)
+                    .map_err(|e| format!("Failed to create file: {}", e))?;
 
                 let output = Command::new("gh")
-                    .args([
-                        "api",
-                        &format!("repos/{}/actions/runs/{}/logs", repo, run_id),
-                        "-H",
-                        "Accept: application/vnd.github+json",
-                    ])
-                    .stdout(zip_file)
+                    .args(["api", &url, "-H", "Accept: application/vnd.github+json"])
+                    .stdout(out_file)
                     .stderr(Stdio::null())
                     .output()
                     .map_err(|e| format!("Failed to download: {}", e))?;
 
                 if !output.status.success() {
-                    return Err("Failed to download logs".to_string());
+                    return Err("Failed to download job log".to_string());
                 }
-
-                let _ = Command::new("unzip")
-                    .args(["-o", "-q"])
-                    .arg(&zip_path)
-                    .arg("-d")
-                    .arg(&tmp_dir)
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status();
-
-                // GitHub Actions bundles all steps into one file per job.
-                // Try step-level match first, then fall back to any log file.
-                let log_file = find_step_log(&tmp_dir, step_number, &step_name_clone)
-                    .or_else(|| find_any_log(&tmp_dir));
-
-                if let Some(log_file) = log_file {
-                    std::fs::copy(&log_file, &path)
-                        .map_err(|e| format!("Failed to copy log: {}", e))?;
-                    Ok(())
-                } else {
-                    Err("No log files found in archive".to_string())
-                }
+                Ok(())
             })();
             let _ = tx.send(result);
         });
@@ -230,7 +190,6 @@ impl LogDownload {
         Self {
             step_name: step_name.to_string(),
             output_path,
-            total_bytes: None,
             rx,
         }
     }
@@ -275,14 +234,18 @@ fn format_size(bytes: u64) -> String {
 pub struct CiPanel {
     pub view: CiView,
     pub repo: String,
+    pub branch: String,
+    pub pr_number: Option<u64>,
     /// Receiver for async check fetches.
-    pending_checks: Option<std::sync::mpsc::Receiver<Result<Vec<CiCheck>, String>>>,
+    pending_checks: Option<std::sync::mpsc::Receiver<Result<(Option<u64>, Vec<CiCheck>), String>>>,
     /// Spinner tick counter.
     pub spinner_tick: usize,
     /// Visible height (set by renderer).
     pub visible_height: usize,
     /// Active log download.
     pub download: Option<LogDownload>,
+    /// Pending async step fetch: (item_index, check_idx, check, receiver)
+    pending_steps: Option<(usize, usize, CiCheck, std::sync::mpsc::Receiver<Result<Vec<CiStep>, String>>)>,
 }
 
 impl CiPanel {
@@ -293,41 +256,50 @@ impl CiPanel {
             return Self {
                 view: CiView::Error("Not a GitHub repository".to_string()),
                 repo,
+                branch: branch.to_string(),
+                pr_number: None,
                 pending_checks: None,
                 spinner_tick: 0,
                 visible_height: 0,
                 download: None,
+                pending_steps: None,
             };
         }
 
         // Spawn async fetch
         let (tx, rx) = std::sync::mpsc::channel();
         let dir = dir.to_path_buf();
-        let branch = branch.to_string();
+        let branch_str = branch.to_string();
+        let branch_clone = branch_str.clone();
         std::thread::spawn(move || {
-            let result = query_checks(&dir, &branch);
+            let result = query_checks(&dir, &branch_clone);
             let _ = tx.send(result);
         });
 
         Self {
             view: CiView::Loading("Fetching checks...".to_string()),
             repo,
+            branch: branch_str,
+            pr_number: None,
             pending_checks: Some(rx),
             spinner_tick: 0,
             visible_height: 0,
             download: None,
+            pending_steps: None,
         }
     }
 
     /// Poll for async results. Call on each tick.
     pub fn poll(&mut self) {
         self.spinner_tick = self.spinner_tick.wrapping_add(1);
+        self.poll_steps();
 
         if let Some(ref rx) = self.pending_checks {
             if let Ok(result) = rx.try_recv() {
                 self.pending_checks = None;
                 match result {
-                    Ok(mut checks) => {
+                    Ok((pr_number, mut checks)) => {
+                        self.pr_number = pr_number;
                         checks.sort_by(|a, b| {
                             a.status.sort_priority().cmp(&b.status.sort_priority())
                         });
@@ -353,6 +325,50 @@ impl CiPanel {
             } else {
                 let c = SPINNER[self.spinner_tick % SPINNER.len()];
                 self.view = CiView::Loading(format!("{} Fetching checks...", c));
+            }
+        }
+    }
+
+    /// Poll for async step fetch results.
+    fn poll_steps(&mut self) {
+        if let Some((item_idx, check_idx, ref check, ref rx)) = self.pending_steps {
+            if let Ok(result) = rx.try_recv() {
+                let check = check.clone();
+                self.pending_steps = None;
+
+                if let CiView::Tree { items, .. } = &mut self.view {
+                    match result {
+                        Ok(steps) => {
+                            items[item_idx] = TreeItem::Check {
+                                check: check.clone(),
+                                expanded: true,
+                                loading: false,
+                            };
+                            let step_items: Vec<TreeItem> = steps
+                                .into_iter()
+                                .map(|step| TreeItem::Step { step, check_idx })
+                                .collect();
+                            for (i, item) in step_items.into_iter().enumerate() {
+                                items.insert(item_idx + 1 + i, item);
+                            }
+                        }
+                        Err(_) => {
+                            // Revert to collapsed
+                            items[item_idx] = TreeItem::Check {
+                                check,
+                                expanded: false,
+                                loading: false,
+                            };
+                        }
+                    }
+                }
+            } else {
+                // Still loading — update the check's loading state
+                if let CiView::Tree { items, .. } = &mut self.view {
+                    if let Some(TreeItem::Check { loading, .. }) = items.get_mut(item_idx) {
+                        *loading = true;
+                    }
+                }
             }
         }
     }
@@ -388,41 +404,39 @@ impl CiPanel {
                         None
                     }
                     Some(TreeItem::Check { check, .. }) => {
-                        // Expand: fetch steps and insert below
                         let check = check.clone();
-                        let steps_result = if let Some(ref azure) = check.azure_info {
-                            query_azure_steps(azure)
-                        } else if check.is_github_actions() {
-                            query_steps(&repo, check.job_id)
-                        } else {
-                            Err(format!("{} — press 'o' to open in browser", check.ci_provider()))
+
+                        if !check.is_github_actions() && check.azure_info.is_none() {
+                            // Can't fetch steps — hint to use browser
+                            return None;
+                        }
+
+                        let check_idx = checks
+                            .iter()
+                            .position(|c| c.details_url == check.details_url)
+                            .unwrap_or(0);
+
+                        // Mark as loading
+                        items[sel] = TreeItem::Check {
+                            check: check.clone(),
+                            expanded: false,
+                            loading: true,
                         };
 
-                        // Find which check index this is
-                        let check_idx = checks.iter().position(|c| c.details_url == check.details_url).unwrap_or(0);
+                        // Spawn async step fetch
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        let azure_info = check.azure_info.clone();
+                        let job_id = check.job_id;
+                        std::thread::spawn(move || {
+                            let result = if let Some(ref azure) = azure_info {
+                                query_azure_steps(azure)
+                            } else {
+                                query_steps(&repo, job_id)
+                            };
+                            let _ = tx.send(result);
+                        });
 
-                        match steps_result {
-                            Ok(steps) => {
-                                // Mark as expanded
-                                items[sel] = TreeItem::Check {
-                                    check: check.clone(),
-                                    expanded: true,
-                                    loading: false,
-                                };
-                                // Insert step items after the check
-                                let step_items: Vec<TreeItem> = steps
-                                    .into_iter()
-                                    .map(|step| TreeItem::Step { step, check_idx })
-                                    .collect();
-                                let insert_pos = sel + 1;
-                                for (i, item) in step_items.into_iter().enumerate() {
-                                    items.insert(insert_pos + i, item);
-                                }
-                            }
-                            Err(_e) => {
-                                // Can't expand — just open in browser hint is in the provider name
-                            }
-                        }
+                        self.pending_steps = Some((sel, check_idx, check, rx));
                         None
                     }
                     Some(TreeItem::Step { step, check_idx }) => {
@@ -470,6 +484,31 @@ impl CiPanel {
         }
     }
 
+    /// Left arrow: collapse if on expanded check, jump to parent if on step.
+    pub fn collapse_or_parent(&mut self) {
+        if let CiView::Tree { items, selected, scroll, .. } = &mut self.view {
+            let sel = *selected;
+            match &items[sel] {
+                TreeItem::Check { expanded: true, .. } => {
+                    Self::collapse_at(items, sel);
+                }
+                TreeItem::Step { .. } => {
+                    // Jump to parent check
+                    for i in (0..sel).rev() {
+                        if matches!(items[i], TreeItem::Check { .. }) {
+                            *selected = i;
+                            if *selected < *scroll {
+                                *scroll = *selected;
+                            }
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     pub fn move_up(&mut self) {
         if let CiView::Tree { selected, scroll, .. } = &mut self.view {
             if *selected > 0 {
@@ -511,11 +550,11 @@ fn detect_repo(dir: &Path) -> Option<String> {
 }
 
 /// Query check runs for a branch's latest PR or commit.
-fn query_checks(dir: &Path, _branch: &str) -> Result<Vec<CiCheck>, String> {
+fn query_checks(dir: &Path, _branch: &str) -> Result<(Option<u64>, Vec<CiCheck>), String> {
     let output = Command::new("gh")
         .args([
             "pr", "view",
-            "--json", "statusCheckRollup",
+            "--json", "number,statusCheckRollup",
         ])
         .current_dir(dir)
         .stdout(Stdio::piped())
@@ -531,6 +570,8 @@ fn query_checks(dir: &Path, _branch: &str) -> Result<Vec<CiCheck>, String> {
 
     #[derive(Deserialize)]
     struct PrResponse {
+        #[serde(default)]
+        number: Option<u64>,
         #[serde(rename = "statusCheckRollup", default)]
         checks: Vec<GhCheck>,
     }
@@ -578,7 +619,7 @@ fn query_checks(dir: &Path, _branch: &str) -> Result<Vec<CiCheck>, String> {
         })
         .collect();
 
-    Ok(checks)
+    Ok((pr.number, checks))
 }
 
 /// Parse run_id and job_id from a GitHub Actions details URL.
@@ -795,129 +836,3 @@ fn query_azure_steps(azure: &AzureInfo) -> Result<Vec<CiStep>, String> {
     Ok(steps)
 }
 
-#[allow(dead_code)]
-/// Download logs for a run and return the path to the extracted log file.
-pub fn download_run_logs(repo: &str, run_id: u64) -> Result<std::path::PathBuf, String> {
-    let tmp_dir = std::env::temp_dir().join(format!("mm_ci_logs_{}", run_id));
-    let _ = std::fs::create_dir_all(&tmp_dir);
-
-    let zip_path = tmp_dir.join("logs.zip");
-
-    // Download the log archive
-    let output = Command::new("gh")
-        .args([
-            "api",
-            &format!("repos/{}/actions/runs/{}/logs", repo, run_id),
-            "-H", "Accept: application/vnd.github+json",
-        ])
-        .stdout(std::fs::File::create(&zip_path).map_err(|e| e.to_string())?)
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| format!("Failed to download logs: {}", e))?;
-
-    if !output.status.success() {
-        return Err("Failed to download logs".to_string());
-    }
-
-    // Extract the zip
-    let extract_status = Command::new("unzip")
-        .args(["-o", "-q"])
-        .arg(&zip_path)
-        .arg("-d")
-        .arg(&tmp_dir)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to extract logs: {}", e))?;
-
-    if !extract_status.success() {
-        return Err("Failed to extract log archive".to_string());
-    }
-
-    Ok(tmp_dir)
-}
-
-#[allow(dead_code)]
-/// Download a log from a direct URL (Azure DevOps) and return the path.
-pub fn download_log_url(url: &str, label: &str) -> Result<std::path::PathBuf, String> {
-    let tmp_dir = std::env::temp_dir().join("mm_ci_logs");
-    let _ = std::fs::create_dir_all(&tmp_dir);
-
-    let safe_name: String = label
-        .chars()
-        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-        .collect();
-    let path = tmp_dir.join(format!("{}.txt", safe_name));
-
-    let output = Command::new("curl")
-        .args(["-s", "-o"])
-        .arg(&path)
-        .arg(url)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .map_err(|e| format!("Failed to download log: {}", e))?;
-
-    if !output.status.success() {
-        return Err("Failed to download log".to_string());
-    }
-
-    Ok(path)
-}
-
-/// Find the largest log file in the directory (fallback for GitHub Actions).
-fn find_any_log(logs_dir: &Path) -> Option<PathBuf> {
-    let mut best: Option<(PathBuf, u64)> = None;
-
-    fn scan_dir(dir: &Path, best: &mut Option<(PathBuf, u64)>) {
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    scan_dir(&path, best);
-                } else if path.extension().and_then(|e| e.to_str()) == Some("txt") {
-                    let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-                    if best.as_ref().map(|(_, s)| size > *s).unwrap_or(true) {
-                        *best = Some((path, size));
-                    }
-                }
-            }
-        }
-    }
-
-    scan_dir(logs_dir, &mut best);
-    best.map(|(p, _)| p)
-}
-
-/// Find the log file for a specific step within the extracted logs directory.
-pub fn find_step_log(logs_dir: &Path, step_number: u64, _step_name: &str) -> Option<std::path::PathBuf> {
-    // GitHub Actions log files are named like: "0_stepname.txt" or "StepNumber_StepName.txt"
-    if let Ok(entries) = std::fs::read_dir(logs_dir) {
-        // First try: look in subdirectories (job-name/step-file)
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                if let Ok(sub_entries) = std::fs::read_dir(&path) {
-                    for sub_entry in sub_entries.flatten() {
-                        let sub_path = sub_entry.path();
-                        let name = sub_path.file_name()
-                            .map(|n| n.to_string_lossy().to_string())
-                            .unwrap_or_default();
-                        if name.starts_with(&format!("{}_", step_number)) && name.ends_with(".txt") {
-                            return Some(sub_path);
-                        }
-                    }
-                }
-            }
-            // Also check top-level files
-            let name = path.file_name()
-                .map(|n| n.to_string_lossy().to_string())
-                .unwrap_or_default();
-            if name.starts_with(&format!("{}_", step_number)) && name.ends_with(".txt") {
-                return Some(path);
-            }
-        }
-    }
-
-    None
-}

@@ -33,6 +33,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     if let Some(ref input) = app.goto_line_input {
         render_goto_prompt(frame, input);
     }
+
+    // Render quit confirmation overlay
+    if let Some(quit_focused) = app.quit_confirm {
+        let area = render_quit_dialog(frame, quit_focused);
+        shadow::render_shadow(frame, area);
+    }
 }
 
 fn render_normal(frame: &mut Frame, app: &mut App) {
@@ -66,6 +72,7 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
     };
 
     app.panel_areas = [left_area, right_area];
+    app.ci_panel_areas = [left_ci_area, right_ci_area];
 
     header::render(frame, header_area, app);
 
@@ -163,6 +170,40 @@ fn render_unsaved_dialog(frame: &mut Frame, focused: crate::app::UnsavedDialogFi
             ("[ Don't Save ]", focused == UnsavedDialogField::ButtonDiscard),
             ("[ Cancel ]", focused == UnsavedDialogField::ButtonCancel),
         ],
+        normal,
+        highlight,
+    );
+
+    layout.outer
+}
+
+fn render_quit_dialog(frame: &mut Frame, quit_focused: bool) -> Rect {
+    let layout = dialog_helpers::render_dialog_frame(frame, " Quit ", 40, 7);
+    let (normal, highlight, _) = dialog_helpers::dialog_styles();
+
+    dialog_helpers::render_line(
+        frame,
+        layout.content,
+        1,
+        Line::from(Span::styled(
+            format!("{:<width$}", "Quit Middle Manager?", width = layout.cw),
+            normal,
+        )),
+    );
+
+    let t = theme();
+    dialog_helpers::render_separator(
+        frame,
+        layout.area,
+        layout.inner.y + 3,
+        t.dialog_border_style(),
+    );
+
+    dialog_helpers::render_buttons(
+        frame,
+        layout.content,
+        4,
+        &[("{ Quit }", quit_focused), ("[ Cancel ]", !quit_focused)],
         normal,
         highlight,
     );
