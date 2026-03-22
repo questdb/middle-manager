@@ -14,6 +14,7 @@ use crate::panel::git::GitCache;
 use crate::panel::sort::SortField;
 use crate::panel::Panel;
 use crate::state::AppState;
+use crate::watcher::DirWatcher;
 
 fn sort_field_from_u8(v: u8) -> SortField {
     match v {
@@ -52,6 +53,8 @@ pub struct App {
     git_cache: GitCache,
     /// Persistent state (search, paths, sort, etc.)
     pub persisted: AppState,
+    /// Filesystem watcher for auto-refresh on external changes.
+    dir_watcher: Option<DirWatcher>,
 }
 
 pub enum AppMode {
@@ -619,6 +622,11 @@ impl App {
         panels[0].refresh_git(&mut git_cache);
         panels[1].refresh_git(&mut git_cache);
 
+        let mut dir_watcher = DirWatcher::new();
+        if let Some(ref mut w) = dir_watcher {
+            w.watch_dirs([&panels[0].current_dir, &panels[1].current_dir]);
+        }
+
         Self {
             panels,
             active_panel: 0,
@@ -633,6 +641,7 @@ impl App {
             unsaved_dialog: None,
             git_cache,
             persisted,
+            dir_watcher,
         }
     }
 
@@ -657,6 +666,14 @@ impl App {
         self.git_cache.invalidate(&self.panels[1].current_dir);
         self.panels[0].refresh_git(&mut self.git_cache);
         self.panels[1].refresh_git(&mut self.git_cache);
+        self.update_watched_dirs();
+    }
+
+    /// Update filesystem watcher to track current panel directories.
+    fn update_watched_dirs(&mut self) {
+        if let Some(ref mut w) = self.dir_watcher {
+            w.watch_dirs([&self.panels[0].current_dir, &self.panels[1].current_dir]);
+        }
     }
 
     pub fn take_edit_request(&mut self) -> Option<String> {
@@ -1074,6 +1091,12 @@ impl App {
                     self.panels[0].refresh_git(&mut self.git_cache);
                     self.panels[1].refresh_git(&mut self.git_cache);
                 }
+                // Check for filesystem changes (kqueue/inotify — zero cost if idle)
+                if let Some(ref w) = self.dir_watcher {
+                    if w.has_changes() {
+                        self.reload_panels();
+                    }
+                }
             }
             Action::Quit => self.should_quit = true,
             Action::Resize(_, _) => {}
@@ -1243,6 +1266,7 @@ impl App {
             if entry.is_dir {
                 panel.navigate_into();
                 self.panels[self.active_panel].refresh_git(&mut self.git_cache);
+                self.update_watched_dirs();
             } else {
                 self.open_file(entry.path);
             }
@@ -1252,6 +1276,7 @@ impl App {
     fn handle_go_up(&mut self) {
         self.active_panel_mut().navigate_up();
         self.panels[self.active_panel].refresh_git(&mut self.git_cache);
+        self.update_watched_dirs();
     }
 
     fn handle_switch_panel(&mut self) {
@@ -1359,7 +1384,14 @@ impl App {
 
         match action {
             Action::None | Action::Tick | Action::Resize(_, _) => {}
-            Action::Quit => self.should_quit = true,
+            Action::Quit => {
+                let modified = matches!(self.mode, AppMode::Editing(ref e) if e.modified);
+                if modified {
+                    self.unsaved_dialog = Some(UnsavedDialogField::ButtonSave);
+                } else {
+                    self.should_quit = true;
+                }
+            }
             Action::GotoLinePrompt => {
                 self.goto_line_input = Some(String::new());
             }

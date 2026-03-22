@@ -10,6 +10,7 @@ mod syntax;
 mod theme;
 mod ui;
 mod viewer;
+mod watcher;
 
 use std::io;
 use std::process::Command;
@@ -33,7 +34,12 @@ fn main() -> Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            crossterm::cursor::SetCursorStyle::DefaultUserShape
+        );
         original_hook(panic_info);
     }));
 
@@ -51,7 +57,8 @@ fn main() -> Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        crossterm::cursor::SetCursorStyle::DefaultUserShape
     )?;
     terminal.show_cursor()?;
 
