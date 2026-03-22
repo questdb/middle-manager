@@ -1010,6 +1010,8 @@ impl App {
                 KeyCode::Char('c') => Action::CopySelection,
                 KeyCode::Char('a') => Action::SelectAll,
                 KeyCode::Char('f') => Action::SearchPrompt,
+                KeyCode::Char('z') if shift => Action::EditorRedo,
+                KeyCode::Char('z') => Action::EditorUndo,
                 KeyCode::Char('g') => Action::GotoLinePrompt,
                 KeyCode::Char('q') => Action::DialogCancel,
                 KeyCode::Left => Action::WordLeft,   // Ctrl+Left (Linux)
@@ -1250,6 +1252,8 @@ impl App {
             | Action::CopySelection
             | Action::WordLeft
             | Action::WordRight
+            | Action::EditorUndo
+            | Action::EditorRedo
             | Action::SearchPrompt
             | Action::FindNext => {}
 
@@ -1722,6 +1726,16 @@ impl App {
                 if let AppMode::Editing(ref mut e) = self.mode {
                     e.status_msg = None;
                     e.delete_line();
+                }
+            }
+            Action::EditorUndo => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.undo();
+                }
+            }
+            Action::EditorRedo => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.redo();
                 }
             }
             Action::EditorSave => {

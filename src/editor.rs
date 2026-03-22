@@ -59,6 +59,56 @@ pub struct EditorState {
 
     /// Syntax highlighter (None if language not detected).
     pub syntax: SyntaxHighlighter,
+
+    /// Undo/redo stacks.
+    undo_stack: Vec<UndoEntry>,
+    redo_stack: Vec<UndoEntry>,
+}
+
+/// Minimal operation-based undo entry. Stores what changed, not full line copies.
+#[derive(Clone, Debug)]
+enum UndoOp {
+    /// Insert text at (line, col). Inverse: delete the same range.
+    Insert {
+        line: usize,
+        col: usize,
+        text: String,
+    },
+    /// Delete text at (line, col). Inverse: re-insert the text.
+    Delete {
+        line: usize,
+        col: usize,
+        text: String,
+    },
+    /// Split line at (line, col) into two lines. Inverse: join.
+    SplitLine {
+        line: usize,
+        col: usize,
+    },
+    /// Join line with the next line at (line). Inverse: split.
+    JoinLine {
+        line: usize,
+        col: usize, // column where the join happened (= length of first line before join)
+    },
+    /// Delete an entire line. Inverse: re-insert.
+    DeleteLine {
+        line: usize,
+        text: String,
+    },
+    /// Clear a line (single-line file). Inverse: restore text.
+    ClearLine {
+        line: usize,
+        text: String,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct UndoEntry {
+    op: UndoOp,
+    cursor_before: (usize, usize),
+    cursor_after: (usize, usize),
+    /// For grouping consecutive same-type ops.
+    groupable: bool,
 }
 
 #[derive(Clone)]
@@ -98,6 +148,8 @@ impl EditorState {
             search_selection: false,
             last_search: None,
             syntax,
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         };
         // Pre-scan first batch of lines for immediate display
         state.scan_to_line(10_000);
@@ -203,6 +255,218 @@ impl EditorState {
         self.segments.splice(seg_idx..seg_idx + 1, new_segs);
     }
 
+    // --- Undo/Redo ---
+
+    fn push_undo(&mut self, entry: UndoEntry) {
+        self.redo_stack.clear();
+
+        // Try to merge with top of undo stack (grouping consecutive inserts/deletes)
+        if entry.groupable {
+            if let Some(top) = self.undo_stack.last_mut() {
+                if top.groupable && top.cursor_after == entry.cursor_before {
+                    match (&mut top.op, &entry.op) {
+                        // Merge consecutive inserts on same line
+                        (
+                            UndoOp::Insert { line: l1, text: t1, .. },
+                            UndoOp::Insert { line: l2, text: t2, .. },
+                        ) if l1 == l2 => {
+                            // Break on whitespace
+                            let last_was_ws = t1.chars().last().map(|c| c.is_whitespace()).unwrap_or(false);
+                            let new_is_ws = t2.chars().any(|c| c.is_whitespace());
+                            if !last_was_ws && !new_is_ws {
+                                t1.push_str(t2);
+                                top.cursor_after = entry.cursor_after;
+                                return;
+                            }
+                        }
+                        // Merge consecutive backward deletes on same line
+                        (
+                            UndoOp::Delete { line: l1, col: c1, text: t1 },
+                            UndoOp::Delete { line: l2, col: c2, text: t2 },
+                        ) if l1 == l2 => {
+                            // Backward delete: new col is one less, prepend
+                            if *c2 + t2.len() == *c1 {
+                                t1.insert_str(0, t2);
+                                *c1 = *c2;
+                                top.cursor_after = entry.cursor_after;
+                                return;
+                            }
+                            // Forward delete: same col, append
+                            if *c1 == *c2 {
+                                t1.push_str(t2);
+                                top.cursor_after = entry.cursor_after;
+                                return;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        // Cap undo stack at 10,000 entries
+        if self.undo_stack.len() >= 10_000 {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push(entry);
+    }
+
+    /// Insert a new virtual line at the given position.
+    fn insert_virtual_line_at(&mut self, virtual_line: usize, text: String) {
+        let total = self.total_virtual_lines();
+        if total == 0 {
+            self.segments.push(Segment::Buffer { lines: vec![text] });
+            return;
+        }
+        if virtual_line >= total {
+            let last = total - 1;
+            self.materialize_line(last);
+            let (seg_idx, offset) = self.find_segment(last).unwrap();
+            if let Segment::Buffer { ref mut lines } = self.segments[seg_idx] {
+                lines.insert(offset + 1, text);
+            }
+            return;
+        }
+        self.materialize_line(virtual_line);
+        let (seg_idx, offset) = self.find_segment(virtual_line).unwrap();
+        if let Segment::Buffer { ref mut lines } = self.segments[seg_idx] {
+            lines.insert(offset, text);
+        }
+    }
+
+    /// Apply an operation (used by redo).
+    fn apply_op(&mut self, op: &UndoOp) {
+        match op {
+            UndoOp::Insert { line, col, text } => {
+                self.materialize_line(*line);
+                let (seg_idx, offset) = self.find_segment(*line).unwrap();
+                if let Segment::Buffer { ref mut lines } = self.segments[seg_idx] {
+                    let byte_pos = char_to_byte(&lines[offset], *col);
+                    lines[offset].insert_str(byte_pos, text);
+                }
+            }
+            UndoOp::Delete { line, col, text } => {
+                self.materialize_line(*line);
+                let (seg_idx, offset) = self.find_segment(*line).unwrap();
+                if let Segment::Buffer { ref mut lines } = self.segments[seg_idx] {
+                    let byte_start = char_to_byte(&lines[offset], *col);
+                    let byte_end = char_to_byte(&lines[offset], *col + text.chars().count());
+                    lines[offset].drain(byte_start..byte_end);
+                }
+            }
+            UndoOp::SplitLine { line, col } => {
+                self.materialize_line(*line);
+                let (seg_idx, offset) = self.find_segment(*line).unwrap();
+                if let Segment::Buffer { ref mut lines } = self.segments[seg_idx] {
+                    let byte_pos = char_to_byte(&lines[offset], *col);
+                    let rest = lines[offset][byte_pos..].to_string();
+                    lines[offset].truncate(byte_pos);
+                    lines.insert(offset + 1, rest);
+                }
+            }
+            UndoOp::JoinLine { line, .. } => {
+                self.materialize_line(*line);
+                self.materialize_line(*line + 1);
+                let next_text = self.get_line_text(*line + 1).unwrap_or_default();
+                let (seg_idx, offset) = self.find_segment(*line).unwrap();
+                if let Segment::Buffer { ref mut lines } = self.segments[seg_idx] {
+                    lines[offset].push_str(&next_text);
+                }
+                self.remove_virtual_line(*line + 1);
+            }
+            UndoOp::DeleteLine { line, .. } => {
+                self.remove_virtual_line(*line);
+            }
+            UndoOp::ClearLine { line, .. } => {
+                self.materialize_line(*line);
+                let (seg_idx, offset) = self.find_segment(*line).unwrap();
+                if let Segment::Buffer { ref mut lines } = self.segments[seg_idx] {
+                    lines[offset] = String::new();
+                }
+            }
+        }
+    }
+
+    /// Apply the inverse of an operation (used by undo).
+    fn apply_inverse(&mut self, op: &UndoOp) {
+        match op {
+            // Inverse of Insert = Delete
+            UndoOp::Insert { line, col, text } => {
+                self.apply_op(&UndoOp::Delete {
+                    line: *line,
+                    col: *col,
+                    text: text.clone(),
+                });
+            }
+            // Inverse of Delete = Insert
+            UndoOp::Delete { line, col, text } => {
+                self.apply_op(&UndoOp::Insert {
+                    line: *line,
+                    col: *col,
+                    text: text.clone(),
+                });
+            }
+            // Inverse of SplitLine = JoinLine
+            UndoOp::SplitLine { line, col } => {
+                self.apply_op(&UndoOp::JoinLine {
+                    line: *line,
+                    col: *col,
+                });
+            }
+            // Inverse of JoinLine = SplitLine
+            UndoOp::JoinLine { line, col } => {
+                self.apply_op(&UndoOp::SplitLine {
+                    line: *line,
+                    col: *col,
+                });
+            }
+            // Inverse of DeleteLine = re-insert
+            UndoOp::DeleteLine { line, text } => {
+                self.insert_virtual_line_at(*line, text.clone());
+            }
+            // Inverse of ClearLine = restore text
+            UndoOp::ClearLine { line, text } => {
+                self.materialize_line(*line);
+                let (seg_idx, offset) = self.find_segment(*line).unwrap();
+                if let Segment::Buffer { ref mut lines } = self.segments[seg_idx] {
+                    lines[offset] = text.clone();
+                }
+            }
+        }
+    }
+
+    pub fn undo(&mut self) {
+        let entry = match self.undo_stack.pop() {
+            Some(e) => e,
+            None => return,
+        };
+
+        self.apply_inverse(&entry.op);
+        self.cursor_line = entry.cursor_before.0;
+        self.cursor_col = entry.cursor_before.1;
+        self.desired_col = self.cursor_col;
+        self.mark_modified();
+        self.scroll_to_cursor();
+
+        self.redo_stack.push(entry);
+    }
+
+    pub fn redo(&mut self) {
+        let entry = match self.redo_stack.pop() {
+            Some(e) => e,
+            None => return,
+        };
+
+        self.apply_op(&entry.op);
+        self.cursor_line = entry.cursor_after.0;
+        self.cursor_col = entry.cursor_after.1;
+        self.desired_col = self.cursor_col;
+        self.mark_modified();
+        self.scroll_to_cursor();
+
+        self.undo_stack.push(entry);
+    }
+
     fn mark_modified(&mut self) {
         if !self.modified {
             self.syntax.invalidate_cache();
@@ -214,8 +478,9 @@ impl EditorState {
 
     pub fn insert_char(&mut self, c: char) {
         let vline = self.cursor_line;
-        self.materialize_line(vline);
+        let cursor_before = (self.cursor_line, self.cursor_col);
 
+        self.materialize_line(vline);
         let (seg_idx, offset) = self.find_segment(vline).unwrap();
         if let Segment::Buffer { ref mut lines } = self.segments[seg_idx] {
             let line = &mut lines[offset];
@@ -224,38 +489,56 @@ impl EditorState {
             self.cursor_col += 1;
             self.desired_col = self.cursor_col;
         }
+
+        let mut s = String::new();
+        s.push(c);
+        self.push_undo(UndoEntry {
+            op: UndoOp::Insert {
+                line: vline,
+                col: cursor_before.1,
+                text: s,
+            },
+            cursor_before,
+            cursor_after: (self.cursor_line, self.cursor_col),
+            groupable: true,
+        });
         self.mark_modified();
         self.scroll_to_cursor();
     }
 
     pub fn delete_char_backward(&mut self) {
+        let cursor_before = (self.cursor_line, self.cursor_col);
+
         if self.cursor_col == 0 {
-            // Join with previous line
             if self.cursor_line == 0 {
                 return;
             }
             let prev = self.cursor_line - 1;
+            let prev_text = self.get_line_text(prev).unwrap_or_default();
+            let new_col = prev_text.chars().count();
+
             self.materialize_line(prev);
             self.materialize_line(self.cursor_line);
-
-            // Recalculate segment positions after materialization
-            let prev_text = self.get_line_text(prev).unwrap_or_default();
-            let cur_text = self.get_line_text(self.cursor_line).unwrap_or_default();
-            let new_col = prev_text.chars().count();
-            let joined = format!("{}{}", prev_text, cur_text);
-
-            // Set the previous line to the joined text
+            let next_text = self.get_line_text(self.cursor_line).unwrap_or_default();
             let (seg_idx, offset) = self.find_segment(prev).unwrap();
             if let Segment::Buffer { ref mut lines } = self.segments[seg_idx] {
-                lines[offset] = joined;
+                lines[offset].push_str(&next_text);
             }
-
-            // Remove the current line
             self.remove_virtual_line(self.cursor_line);
 
             self.cursor_line = prev;
             self.cursor_col = new_col;
             self.desired_col = self.cursor_col;
+
+            self.push_undo(UndoEntry {
+                op: UndoOp::JoinLine {
+                    line: prev,
+                    col: new_col,
+                },
+                cursor_before,
+                cursor_after: (self.cursor_line, self.cursor_col),
+                groupable: false,
+            });
             self.mark_modified();
             self.scroll_to_cursor();
             return;
@@ -263,58 +546,102 @@ impl EditorState {
 
         let vline = self.cursor_line;
         self.materialize_line(vline);
-        let (seg_idx, offset) = self.find_segment(vline).unwrap();
-        if let Segment::Buffer { ref mut lines } = self.segments[seg_idx] {
-            let line = &mut lines[offset];
-            let byte_pos = char_to_byte(line, self.cursor_col);
-            let prev_byte = char_to_byte(line, self.cursor_col - 1);
-            line.drain(prev_byte..byte_pos);
-            self.cursor_col -= 1;
-            self.desired_col = self.cursor_col;
-        }
+        let deleted_char = {
+            let (seg_idx, offset) = self.find_segment(vline).unwrap();
+            if let Segment::Buffer { ref mut lines } = self.segments[seg_idx] {
+                let line = &mut lines[offset];
+                let byte_pos = char_to_byte(line, self.cursor_col);
+                let prev_byte = char_to_byte(line, self.cursor_col - 1);
+                let deleted: String = line[prev_byte..byte_pos].to_string();
+                line.drain(prev_byte..byte_pos);
+                self.cursor_col -= 1;
+                self.desired_col = self.cursor_col;
+                deleted
+            } else {
+                return;
+            }
+        };
+
+        self.push_undo(UndoEntry {
+            op: UndoOp::Delete {
+                line: vline,
+                col: self.cursor_col,
+                text: deleted_char,
+            },
+            cursor_before,
+            cursor_after: (self.cursor_line, self.cursor_col),
+            groupable: true,
+        });
         self.mark_modified();
     }
 
     pub fn delete_char_forward(&mut self) {
+        let cursor_before = (self.cursor_line, self.cursor_col);
         let line_len = self.current_line_len();
+
         if self.cursor_col >= line_len {
-            // Join with next line
             let next = self.cursor_line + 1;
             if next >= self.total_virtual_lines() {
                 return;
             }
+            let col = self.current_line_len();
+
             self.materialize_line(self.cursor_line);
             self.materialize_line(next);
-
-            let cur_text = self.get_line_text(self.cursor_line).unwrap_or_default();
             let next_text = self.get_line_text(next).unwrap_or_default();
-            let joined = format!("{}{}", cur_text, next_text);
-
             let (seg_idx, offset) = self.find_segment(self.cursor_line).unwrap();
             if let Segment::Buffer { ref mut lines } = self.segments[seg_idx] {
-                lines[offset] = joined;
+                lines[offset].push_str(&next_text);
             }
             self.remove_virtual_line(next);
+
+            self.push_undo(UndoEntry {
+                op: UndoOp::JoinLine {
+                    line: self.cursor_line,
+                    col,
+                },
+                cursor_before,
+                cursor_after: cursor_before,
+                groupable: false,
+            });
             self.mark_modified();
             return;
         }
 
         let vline = self.cursor_line;
         self.materialize_line(vline);
-        let (seg_idx, offset) = self.find_segment(vline).unwrap();
-        if let Segment::Buffer { ref mut lines } = self.segments[seg_idx] {
-            let line = &mut lines[offset];
-            let byte_start = char_to_byte(line, self.cursor_col);
-            let byte_end = char_to_byte(line, self.cursor_col + 1);
-            line.drain(byte_start..byte_end);
-        }
+        let deleted_char = {
+            let (seg_idx, offset) = self.find_segment(vline).unwrap();
+            if let Segment::Buffer { ref mut lines } = self.segments[seg_idx] {
+                let line = &mut lines[offset];
+                let byte_start = char_to_byte(line, self.cursor_col);
+                let byte_end = char_to_byte(line, self.cursor_col + 1);
+                let deleted: String = line[byte_start..byte_end].to_string();
+                line.drain(byte_start..byte_end);
+                deleted
+            } else {
+                return;
+            }
+        };
+
+        self.push_undo(UndoEntry {
+            op: UndoOp::Delete {
+                line: vline,
+                col: self.cursor_col,
+                text: deleted_char,
+            },
+            cursor_before,
+            cursor_after: cursor_before,
+            groupable: true,
+        });
         self.mark_modified();
     }
 
     pub fn insert_newline(&mut self) {
         let vline = self.cursor_line;
-        self.materialize_line(vline);
+        let cursor_before = (self.cursor_line, self.cursor_col);
 
+        self.materialize_line(vline);
         let (seg_idx, offset) = self.find_segment(vline).unwrap();
         if let Segment::Buffer { ref mut lines } = self.segments[seg_idx] {
             let line = &mut lines[offset];
@@ -327,6 +654,16 @@ impl EditorState {
         self.cursor_line += 1;
         self.cursor_col = 0;
         self.desired_col = 0;
+
+        self.push_undo(UndoEntry {
+            op: UndoOp::SplitLine {
+                line: vline,
+                col: cursor_before.1,
+            },
+            cursor_before,
+            cursor_after: (self.cursor_line, self.cursor_col),
+            groupable: false,
+        });
         self.mark_modified();
         self.scroll_to_cursor();
     }
@@ -337,8 +674,11 @@ impl EditorState {
             return;
         }
 
+        let cursor_before = (self.cursor_line, self.cursor_col);
+        let line_text = self.get_line_text(self.cursor_line).unwrap_or_default();
+        let vline = self.cursor_line;
+
         if total == 1 {
-            // Clear the only line
             self.materialize_line(0);
             let (seg_idx, offset) = self.find_segment(0).unwrap();
             if let Segment::Buffer { ref mut lines } = self.segments[seg_idx] {
@@ -346,6 +686,15 @@ impl EditorState {
             }
             self.cursor_col = 0;
             self.desired_col = 0;
+            self.push_undo(UndoEntry {
+                op: UndoOp::ClearLine {
+                    line: 0,
+                    text: line_text,
+                },
+                cursor_before,
+                cursor_after: (0, 0),
+                groupable: false,
+            });
             self.mark_modified();
             return;
         }
@@ -356,6 +705,16 @@ impl EditorState {
             self.cursor_line = self.total_virtual_lines().saturating_sub(1);
         }
         self.clamp_cursor_col();
+
+        self.push_undo(UndoEntry {
+            op: UndoOp::DeleteLine {
+                line: vline,
+                text: line_text,
+            },
+            cursor_before,
+            cursor_after: (self.cursor_line, self.cursor_col),
+            groupable: false,
+        });
         self.mark_modified();
         self.scroll_to_cursor();
     }
@@ -2339,6 +2698,295 @@ mod tests {
                 editor.selected_text()
             );
         }
+    }
+
+    // --- Undo/Redo tests ---
+
+    #[test]
+    fn undo_insert_char() {
+        let mut editor = create_test_editor("hello\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 5;
+        editor.insert_char('!');
+        assert_eq!(editor.get_line_text(0), Some("hello!".to_string()));
+        editor.undo();
+        assert_eq!(editor.get_line_text(0), Some("hello".to_string()));
+        assert_eq!(editor.cursor_col, 5);
+    }
+
+    #[test]
+    fn redo_insert_char() {
+        let mut editor = create_test_editor("hello\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 5;
+        editor.insert_char('!');
+        editor.undo();
+        editor.redo();
+        assert_eq!(editor.get_line_text(0), Some("hello!".to_string()));
+        assert_eq!(editor.cursor_col, 6);
+    }
+
+    #[test]
+    fn undo_delete_backward() {
+        let mut editor = create_test_editor("hello\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 5;
+        editor.delete_char_backward();
+        assert_eq!(editor.get_line_text(0), Some("hell".to_string()));
+        editor.undo();
+        assert_eq!(editor.get_line_text(0), Some("hello".to_string()));
+        assert_eq!(editor.cursor_col, 5);
+    }
+
+    #[test]
+    fn undo_delete_backward_join() {
+        let mut editor = create_test_editor("hello\nworld\n");
+        editor.cursor_line = 1;
+        editor.cursor_col = 0;
+        editor.delete_char_backward();
+        assert_eq!(editor.get_line_text(0), Some("helloworld".to_string()));
+        editor.undo();
+        assert_eq!(editor.get_line_text(0), Some("hello".to_string()));
+        assert_eq!(editor.get_line_text(1), Some("world".to_string()));
+        assert_eq!(editor.cursor_line, 1);
+        assert_eq!(editor.cursor_col, 0);
+    }
+
+    #[test]
+    fn undo_insert_newline() {
+        let mut editor = create_test_editor("hello world\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 5;
+        editor.insert_newline();
+        assert_eq!(editor.get_line_text(0), Some("hello".to_string()));
+        assert_eq!(editor.get_line_text(1), Some(" world".to_string()));
+        editor.undo();
+        assert_eq!(editor.get_line_text(0), Some("hello world".to_string()));
+        assert_eq!(editor.cursor_line, 0);
+        assert_eq!(editor.cursor_col, 5);
+    }
+
+    #[test]
+    fn undo_delete_line() {
+        let mut editor = create_test_editor("aaa\nbbb\nccc\n");
+        editor.cursor_line = 1;
+        editor.cursor_col = 0;
+        editor.delete_line();
+        assert_eq!(editor.get_line_text(0), Some("aaa".to_string()));
+        assert_eq!(editor.get_line_text(1), Some("ccc".to_string()));
+        editor.undo();
+        assert_eq!(editor.get_line_text(0), Some("aaa".to_string()));
+        assert_eq!(editor.get_line_text(1), Some("bbb".to_string()));
+        assert_eq!(editor.get_line_text(2), Some("ccc".to_string()));
+    }
+
+    #[test]
+    fn undo_groups_consecutive_typing() {
+        let mut editor = create_test_editor("hello\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 5;
+        // Type "abc" — should be one undo group
+        editor.insert_char('a');
+        editor.insert_char('b');
+        editor.insert_char('c');
+        assert_eq!(editor.get_line_text(0), Some("helloabc".to_string()));
+        // Single undo should revert all three
+        editor.undo();
+        assert_eq!(editor.get_line_text(0), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn undo_breaks_group_on_whitespace() {
+        let mut editor = create_test_editor("\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+        editor.insert_char('a');
+        editor.insert_char('b');
+        editor.insert_char(' '); // whitespace breaks the group
+        editor.insert_char('c');
+        assert_eq!(editor.get_line_text(0), Some("ab c".to_string()));
+        editor.undo(); // undoes "c"
+        assert_eq!(editor.get_line_text(0), Some("ab ".to_string()));
+        editor.undo(); // undoes " "
+        assert_eq!(editor.get_line_text(0), Some("ab".to_string()));
+        editor.undo(); // undoes "ab"
+        assert_eq!(editor.get_line_text(0), Some("".to_string()));
+    }
+
+    #[test]
+    fn redo_cleared_on_new_edit() {
+        let mut editor = create_test_editor("hello\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 5;
+        editor.insert_char('!');
+        editor.undo();
+        // New edit should clear redo stack
+        editor.insert_char('?');
+        editor.redo(); // should do nothing
+        assert_eq!(editor.get_line_text(0), Some("hello?".to_string()));
+    }
+
+    #[test]
+    fn multiple_undo_redo_cycle() {
+        let mut editor = create_test_editor("abc\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 3;
+
+        editor.insert_newline(); // "abc" → "abc\n" + new line
+        editor.insert_char('d');
+        editor.insert_char('e');
+
+        editor.undo(); // undo "de"
+        editor.undo(); // undo newline
+
+        assert_eq!(editor.get_line_text(0), Some("abc".to_string()));
+
+        editor.redo(); // redo newline
+        assert_eq!(editor.get_line_text(0), Some("abc".to_string()));
+        assert_eq!(editor.get_line_text(1), Some("".to_string()));
+
+        editor.redo(); // redo "de"
+        assert_eq!(editor.get_line_text(1), Some("de".to_string()));
+    }
+
+    #[test]
+    fn undo_on_empty_stack() {
+        let mut editor = create_test_editor("hello\n");
+        // Undo with nothing to undo — should not panic
+        editor.undo();
+        assert_eq!(editor.get_line_text(0), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn redo_on_empty_stack() {
+        let mut editor = create_test_editor("hello\n");
+        // Redo with nothing to redo — should not panic
+        editor.redo();
+        assert_eq!(editor.get_line_text(0), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn undo_delete_line_single_line_file() {
+        let mut editor = create_test_editor("only line\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+        editor.delete_line();
+        // Single line file — line is cleared, not removed
+        assert_eq!(editor.get_line_text(0), Some("".to_string()));
+        editor.undo();
+        assert_eq!(editor.get_line_text(0), Some("only line".to_string()));
+    }
+
+    #[test]
+    fn undo_delete_line_last_line() {
+        let mut editor = create_test_editor("aaa\nbbb\n");
+        editor.cursor_line = 1;
+        editor.delete_line();
+        assert_eq!(editor.total_virtual_lines(), 1);
+        editor.undo();
+        assert_eq!(editor.get_line_text(0), Some("aaa".to_string()));
+        assert_eq!(editor.get_line_text(1), Some("bbb".to_string()));
+    }
+
+    #[test]
+    fn undo_insert_at_beginning_of_file() {
+        let mut editor = create_test_editor("hello\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+        editor.insert_char('X');
+        assert_eq!(editor.get_line_text(0), Some("Xhello".to_string()));
+        editor.undo();
+        assert_eq!(editor.get_line_text(0), Some("hello".to_string()));
+        assert_eq!(editor.cursor_col, 0);
+    }
+
+    #[test]
+    fn undo_newline_at_end_of_file() {
+        let mut editor = create_test_editor("hello\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 5;
+        editor.insert_newline();
+        assert_eq!(editor.total_virtual_lines(), 2);
+        editor.undo();
+        assert_eq!(editor.total_virtual_lines(), 1);
+        assert_eq!(editor.get_line_text(0), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn undo_all_then_redo_all() {
+        let mut editor = create_test_editor("x\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 1;
+        editor.insert_char('a');
+        editor.insert_char(' '); // breaks group
+        editor.insert_char('b');
+        assert_eq!(editor.get_line_text(0), Some("xa b".to_string()));
+
+        // Undo everything
+        editor.undo(); // "b"
+        editor.undo(); // " "
+        editor.undo(); // "a"
+        assert_eq!(editor.get_line_text(0), Some("x".to_string()));
+
+        // Undo past the beginning — should be no-op
+        editor.undo();
+        assert_eq!(editor.get_line_text(0), Some("x".to_string()));
+
+        // Redo everything
+        editor.redo(); // "a"
+        editor.redo(); // " "
+        editor.redo(); // "b"
+        assert_eq!(editor.get_line_text(0), Some("xa b".to_string()));
+
+        // Redo past the end — should be no-op
+        editor.redo();
+        assert_eq!(editor.get_line_text(0), Some("xa b".to_string()));
+    }
+
+    #[test]
+    fn undo_delete_forward_at_end_of_line() {
+        let mut editor = create_test_editor("hello\nworld\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 5; // end of "hello"
+        editor.delete_char_forward(); // joins with "world"
+        assert_eq!(editor.get_line_text(0), Some("helloworld".to_string()));
+        editor.undo();
+        assert_eq!(editor.get_line_text(0), Some("hello".to_string()));
+        assert_eq!(editor.get_line_text(1), Some("world".to_string()));
+    }
+
+    #[test]
+    fn undo_preserves_cursor_position() {
+        let mut editor = create_test_editor("abcdef\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 3;
+        editor.insert_char('X');
+        assert_eq!(editor.cursor_col, 4);
+        editor.undo();
+        assert_eq!(editor.cursor_col, 3); // cursor restored to before insert
+        editor.redo();
+        assert_eq!(editor.cursor_col, 4); // cursor at after position
+    }
+
+    #[test]
+    fn no_undo_for_noop_operations() {
+        let mut editor = create_test_editor("hello\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+        // Backspace at position 0 on first line — no-op
+        editor.delete_char_backward();
+        // Undo stack should be empty
+        assert_eq!(editor.undo_stack.len(), 0);
+
+        // Delete forward at end of last line — no-op
+        editor.cursor_col = 5;
+        editor.cursor_line = 0;
+        // Only one line, cursor at end
+        let total = editor.total_virtual_lines();
+        if editor.cursor_col >= editor.current_line_len() && editor.cursor_line + 1 >= total {
+            editor.delete_char_forward(); // no-op
+        }
+        assert_eq!(editor.undo_stack.len(), 0);
     }
 
     // --- Word navigation tests ---

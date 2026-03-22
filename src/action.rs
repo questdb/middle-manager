@@ -66,6 +66,10 @@ pub enum Action {
     WordLeft,
     WordRight,
 
+    // Editor undo/redo
+    EditorUndo,
+    EditorRedo,
+
     // Editor
     EditBuiltin,
     CursorLeft,
