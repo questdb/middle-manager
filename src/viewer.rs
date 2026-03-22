@@ -31,6 +31,11 @@ pub struct ViewerState {
     pub scroll_offset: usize,
     pub visible_lines: usize,
 
+    /// Horizontal scroll offset (display columns) for unwrapped mode.
+    pub scroll_x: usize,
+    /// Whether lines wrap at the viewport edge.
+    pub wrap_mode: bool,
+
     pub error: Option<String>,
 }
 
@@ -46,6 +51,8 @@ impl ViewerState {
             buffer_first_line: 0,
             scroll_offset: 0,
             visible_lines: 0,
+            scroll_x: 0,
+            wrap_mode: false,
             error: None,
         };
 
@@ -79,12 +86,26 @@ impl ViewerState {
         self.ensure_buffer_covers_viewport();
     }
 
+    pub fn scroll_left(&mut self, amount: usize) {
+        self.scroll_x = self.scroll_x.saturating_sub(amount);
+    }
+
+    pub fn scroll_right(&mut self, amount: usize) {
+        self.scroll_x = self.scroll_x.saturating_add(amount);
+    }
+
+    pub fn toggle_wrap(&mut self) {
+        self.wrap_mode = !self.wrap_mode;
+        self.scroll_x = 0;
+    }
+
     /// Returns `(line_number, text)` pairs for the current viewport.
-    pub fn visible_line_iter(&mut self) -> Vec<(usize, String)> {
-        self.ensure_buffer_covers_viewport();
+    /// `count` specifies how many file lines to fetch (may differ from `visible_lines`
+    /// when wrapping is enabled and extra lines are needed).
+    pub fn visible_line_iter(&mut self, count: usize) -> Vec<(usize, String)> {
+        self.ensure_buffer_covers(self.scroll_offset, count);
 
         let start = self.scroll_offset;
-        let count = self.visible_lines;
 
         let mut out = Vec::with_capacity(count);
         for i in 0..count {
@@ -128,8 +149,17 @@ impl ViewerState {
 
     /// Make sure the buffer contains the current viewport, reloading from disk if needed.
     fn ensure_buffer_covers_viewport(&mut self) {
-        let vp_start = self.scroll_offset;
-        let vp_end = vp_start + self.visible_lines;
+        self.ensure_buffer_covers(self.scroll_offset, self.visible_lines);
+    }
+
+    fn ensure_buffer_covers(&mut self, start: usize, count: usize) {
+        let vp_start = start;
+        // Clamp to known line count so we don't re-read past EOF every frame.
+        let vp_end = if self.scan_complete {
+            (vp_start + count).min(self.lines_scanned)
+        } else {
+            vp_start + count
+        };
 
         let buf_start = self.buffer_first_line;
         let buf_end = buf_start + self.buffer.len();
@@ -142,7 +172,7 @@ impl ViewerState {
 
         if need_reload {
             // Center the buffer around the viewport.
-            let center = vp_start + self.visible_lines / 2;
+            let center = vp_start + count / 2;
             let target = center.saturating_sub(BUFFER_LINES / 2);
             self.load_buffer_at_line(target);
         }

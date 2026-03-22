@@ -53,6 +53,11 @@ pub enum Action {
     SelectAll,
     CopySelection,
 
+    // Viewer
+    ViewerScrollLeft,
+    ViewerScrollRight,
+    ToggleViewerWrap,
+
     // Editor
     EditBuiltin,
     CursorLeft,

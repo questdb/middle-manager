@@ -391,12 +391,15 @@ impl App {
         match key.code {
             KeyCode::Up => Action::MoveUp,
             KeyCode::Down => Action::MoveDown,
+            KeyCode::Left => Action::ViewerScrollLeft,
+            KeyCode::Right => Action::ViewerScrollRight,
             KeyCode::PageUp => Action::PageUp,
             KeyCode::PageDown => Action::PageDown,
             KeyCode::Home => Action::MoveToTop,
             KeyCode::End => Action::MoveToBottom,
             KeyCode::Tab | KeyCode::F(4) => Action::Toggle, // switch text <-> hex
             KeyCode::Char('g') => Action::GotoLinePrompt,
+            KeyCode::Char('w') => Action::ToggleViewerWrap,
             KeyCode::Char('q') | KeyCode::Esc => Action::DialogCancel,
             _ => Action::None,
         }
@@ -499,6 +502,27 @@ impl App {
             | Action::SelectPageDown
             | Action::SelectAll
             | Action::CopySelection => {}
+
+            // Viewer-specific
+            Action::ViewerScrollLeft => {
+                if let AppMode::Viewing(ref mut v) = self.mode {
+                    if !v.wrap_mode {
+                        v.scroll_left(4);
+                    }
+                }
+            }
+            Action::ViewerScrollRight => {
+                if let AppMode::Viewing(ref mut v) = self.mode {
+                    if !v.wrap_mode {
+                        v.scroll_right(4);
+                    }
+                }
+            }
+            Action::ToggleViewerWrap => {
+                if let AppMode::Viewing(ref mut v) = self.mode {
+                    v.toggle_wrap();
+                }
+            }
 
             // Navigation
             Action::MoveUp => self.handle_move_up(),
