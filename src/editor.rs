@@ -1989,7 +1989,7 @@ fn char_to_byte(s: &str, char_pos: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-fn osc52_copy(text: &str) {
+pub(crate) fn osc52_copy(text: &str) {
     use std::io::Write;
     let encoded = base64_encode(text.as_bytes());
     let osc = format!("\x1b]52;c;{}\x1b\\", encoded);

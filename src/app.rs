@@ -63,6 +63,19 @@ pub struct App {
     pub ci_panels: [Option<CiPanel>; 2],
     /// Which CI panel has focus (None = file panel has focus).
     pub ci_focused: Option<usize>,
+    /// Go-to-path input per panel side. When Some, a path editor is shown at the top of the panel.
+    pub goto_path: [Option<GotoPathState>; 2],
+}
+
+pub struct GotoPathState {
+    pub input: String,
+    pub cursor: usize,
+    /// Tab-completion candidates (directory names).
+    pub completions: Vec<String>,
+    /// Currently highlighted completion index.
+    pub comp_index: Option<usize>,
+    /// The prefix that was being completed (used to detect when input changes).
+    pub comp_base: Option<String>,
 }
 
 pub enum AppMode {
@@ -654,6 +667,7 @@ impl App {
             ci_panels: [None, None],
             ci_focused: None,
             quit_confirm: None,
+            goto_path: [None, None],
         }
     }
 
@@ -768,12 +782,29 @@ impl App {
             };
         }
 
+        // Go-to-path input intercepts keys
+        if self.goto_path[self.active_panel].is_some() {
+            return match key.code {
+                KeyCode::Esc => Action::DialogCancel,
+                KeyCode::Enter => Action::DialogConfirm,
+                KeyCode::Backspace => Action::DialogBackspace,
+                KeyCode::Left => Action::CursorLeft,
+                KeyCode::Right => Action::CursorRight,
+                KeyCode::Home => Action::CursorLineStart,
+                KeyCode::End => Action::CursorLineEnd,
+                KeyCode::Tab => Action::MoveDown,     // next completion
+                KeyCode::BackTab => Action::MoveUp,   // prev completion
+                KeyCode::Char(c) => Action::DialogInput(c),
+                _ => Action::None,
+            };
+        }
+
         // Quit confirmation intercepts keys
         if self.quit_confirm.is_some() {
             return match key.code {
                 KeyCode::Enter => Action::DialogConfirm,
                 KeyCode::Esc => Action::DialogCancel,
-                KeyCode::Tab | KeyCode::Left | KeyCode::Right => Action::SwitchPanel,
+                KeyCode::Tab | KeyCode::Left | KeyCode::Right | KeyCode::BackTab => Action::SwitchPanel,
                 _ => Action::None,
             };
         }
@@ -794,11 +825,16 @@ impl App {
             return match key.code {
                 KeyCode::Up => Action::MoveUp,
                 KeyCode::Down => Action::MoveDown,
+                KeyCode::PageUp => Action::PageUp,
+                KeyCode::PageDown => Action::PageDown,
+                KeyCode::Home => Action::MoveToTop,
+                KeyCode::End => Action::MoveToBottom,
                 KeyCode::Enter => Action::Enter,
                 KeyCode::Right => Action::CursorRight,
                 KeyCode::Left => Action::GoUp,
                 KeyCode::Char('o') => Action::OpenPr,
                 KeyCode::Tab => Action::SwitchPanel,
+                KeyCode::BackTab => Action::SwitchPanelReverse,
                 KeyCode::F(2) => Action::ToggleCi,
                 KeyCode::F(10) => Action::Quit,
                 _ => Action::None,
@@ -835,6 +871,7 @@ impl App {
             KeyCode::Enter => Action::Enter,
             KeyCode::Backspace => Action::GoUp,
             KeyCode::Tab => Action::SwitchPanel,
+            KeyCode::BackTab => Action::SwitchPanelReverse,
             KeyCode::F(3) => Action::ViewFile,
             KeyCode::F(4) => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -858,6 +895,9 @@ impl App {
             KeyCode::F(2) => Action::ToggleCi,
             KeyCode::F(11) => Action::OpenPr,
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::CopyName,
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::CopyPath,
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::GotoPathPrompt,
             KeyCode::Char(c) if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' => {
                 Action::QuickSearch(c)
             }
@@ -1068,6 +1108,12 @@ impl App {
             return;
         }
 
+        // Go-to-path input intercepts all input when active
+        if self.goto_path[self.active_panel].is_some() {
+            self.handle_goto_path_action(action);
+            return;
+        }
+
         // F10 Quit — always confirm, works from any panel/mode
         if matches!(action, Action::Quit)
             && self.unsaved_dialog.is_none()
@@ -1095,7 +1141,7 @@ impl App {
                 Action::DialogCancel => {
                     self.quit_confirm = None;
                 }
-                Action::SwitchPanel => {
+                Action::SwitchPanel | Action::SwitchPanelReverse => {
                     self.quit_confirm = Some(!self.quit_confirm.unwrap_or(true));
                 }
                 Action::None | Action::Tick | Action::Resize(_, _) => {}
@@ -1272,6 +1318,7 @@ impl App {
             Action::Enter => self.handle_enter(),
             Action::GoUp => self.handle_go_up(),
             Action::SwitchPanel => self.handle_switch_panel(),
+            Action::SwitchPanelReverse => self.handle_switch_panel_reverse(),
 
             // File operations
             Action::Copy => self.handle_copy(),
@@ -1281,6 +1328,35 @@ impl App {
             Action::Delete => self.handle_delete(),
             Action::ViewFile => self.handle_view_file(),
             Action::EditFile => self.handle_edit_file(),
+
+            // Clipboard
+            Action::CopyName => {
+                if let Some(entry) = self.active_panel().selected_entry() {
+                    let name = entry.name.clone();
+                    crate::editor::osc52_copy(&name);
+                    self.status_message = Some(format!("Copied: {}", name));
+                }
+            }
+            Action::CopyPath => {
+                if let Some(entry) = self.active_panel().selected_entry() {
+                    let path = entry.path.display().to_string();
+                    crate::editor::osc52_copy(&path);
+                    self.status_message = Some(format!("Copied: {}", path));
+                }
+            }
+
+            // Go-to-path
+            Action::GotoPathPrompt => {
+                let path = self.active_panel().current_dir.to_string_lossy().to_string();
+                let cursor = path.len();
+                self.goto_path[self.active_panel] = Some(GotoPathState {
+                    input: path,
+                    cursor,
+                    completions: Vec::new(),
+                    comp_index: None,
+                    comp_base: None,
+                });
+            }
 
             // Sorting
             Action::CycleSort => {
@@ -1429,6 +1505,14 @@ impl App {
     }
 
     fn handle_switch_panel(&mut self) {
+        self.handle_switch_panel_dir(false);
+    }
+
+    fn handle_switch_panel_reverse(&mut self) {
+        self.handle_switch_panel_dir(true);
+    }
+
+    fn handle_switch_panel_dir(&mut self, reverse: bool) {
         let has_left_ci = self.ci_panels[0].is_some();
         let has_right_ci = self.ci_panels[1].is_some();
 
@@ -1450,7 +1534,16 @@ impl App {
             order.iter().position(|&(s, ci)| s == self.active_panel && !ci)
         };
 
-        let next = current.map(|i| (i + 1) % order.len()).unwrap_or(0);
+        let len = order.len();
+        let next = current
+            .map(|i| {
+                if reverse {
+                    (i + len - 1) % len
+                } else {
+                    (i + 1) % len
+                }
+            })
+            .unwrap_or(0);
         let (side, is_ci) = order[next];
 
         if is_ci {
@@ -1482,6 +1575,261 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    fn handle_goto_path_action(&mut self, action: Action) {
+        let side = self.active_panel;
+        match action {
+            Action::DialogCancel => {
+                self.goto_path[side] = None;
+            }
+            Action::DialogConfirm => {
+                // If completions are visible and one is selected, apply it
+                if let Some(ref mut state) = self.goto_path[side] {
+                    if let Some(idx) = state.comp_index {
+                        if let Some(completion) = state.completions.get(idx).cloned() {
+                            Self::apply_completion(state, &completion);
+                            return;
+                        }
+                    }
+                }
+                if let Some(state) = self.goto_path[side].take() {
+                    self.goto_path_navigate(side, &state.input);
+                }
+            }
+            Action::DialogInput(c) => {
+                if let Some(ref mut state) = self.goto_path[side] {
+                    state.input.insert(state.cursor, c);
+                    state.cursor += c.len_utf8();
+                    state.completions.clear();
+                    state.comp_index = None;
+                    state.comp_base = None;
+                }
+            }
+            Action::DialogBackspace => {
+                if let Some(ref mut state) = self.goto_path[side] {
+                    if state.cursor > 0 {
+                        let prev = state.input[..state.cursor]
+                            .char_indices()
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        state.input.remove(prev);
+                        state.cursor = prev;
+                        state.completions.clear();
+                        state.comp_index = None;
+                        state.comp_base = None;
+                    }
+                }
+            }
+            Action::MoveDown => {
+                // Tab: trigger or cycle completion
+                if let Some(ref mut state) = self.goto_path[side] {
+                    if state.completions.is_empty() {
+                        Self::populate_completions(state);
+                        if state.completions.len() == 1 {
+                            let completion = state.completions[0].clone();
+                            Self::apply_completion(state, &completion);
+                        } else if !state.completions.is_empty() {
+                            // Fill common prefix first
+                            let applied = Self::apply_common_prefix(state);
+                            if !applied {
+                                state.comp_index = Some(0);
+                            }
+                        }
+                    } else {
+                        // Cycle forward
+                        let len = state.completions.len();
+                        state.comp_index = Some(match state.comp_index {
+                            Some(i) => (i + 1) % len,
+                            None => 0,
+                        });
+                    }
+                }
+            }
+            Action::MoveUp => {
+                // Shift+Tab: cycle backward
+                if let Some(ref mut state) = self.goto_path[side] {
+                    if !state.completions.is_empty() {
+                        let len = state.completions.len();
+                        state.comp_index = Some(match state.comp_index {
+                            Some(i) => (i + len - 1) % len,
+                            None => len - 1,
+                        });
+                    }
+                }
+            }
+            Action::CursorLeft => {
+                if let Some(ref mut state) = self.goto_path[side] {
+                    if state.cursor > 0 {
+                        state.cursor = state.input[..state.cursor]
+                            .char_indices()
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                    }
+                    state.completions.clear();
+                    state.comp_index = None;
+                    state.comp_base = None;
+                }
+            }
+            Action::CursorRight => {
+                if let Some(ref mut state) = self.goto_path[side] {
+                    if state.cursor < state.input.len() {
+                        state.cursor += state.input[state.cursor..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+                    }
+                    state.completions.clear();
+                    state.comp_index = None;
+                    state.comp_base = None;
+                }
+            }
+            Action::CursorLineStart => {
+                if let Some(ref mut state) = self.goto_path[side] {
+                    state.cursor = 0;
+                    state.completions.clear();
+                    state.comp_index = None;
+                    state.comp_base = None;
+                }
+            }
+            Action::CursorLineEnd => {
+                if let Some(ref mut state) = self.goto_path[side] {
+                    state.cursor = state.input.len();
+                    state.completions.clear();
+                    state.comp_index = None;
+                    state.comp_base = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Expand ~ and split the input into (parent_dir, prefix_to_match).
+    fn expand_goto_input(input: &str) -> (PathBuf, String) {
+        let expanded = if input.starts_with('~') {
+            if let Some(home) = std::env::var_os("HOME") {
+                format!("{}{}", home.to_string_lossy(), &input[1..])
+            } else {
+                input.to_string()
+            }
+        } else {
+            input.to_string()
+        };
+
+        let path = PathBuf::from(&expanded);
+        if expanded.ends_with('/') || expanded.is_empty() {
+            // Completing inside a directory
+            (path, String::new())
+        } else {
+            // Completing a partial name
+            let parent = path.parent().unwrap_or(&path).to_path_buf();
+            let prefix = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            (parent, prefix)
+        }
+    }
+
+    fn populate_completions(state: &mut GotoPathState) {
+        let (dir, prefix) = Self::expand_goto_input(&state.input);
+        let prefix_lower = prefix.to_lowercase();
+
+        state.comp_base = Some(state.input.clone());
+        state.comp_index = None;
+        state.completions.clear();
+
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let mut matches: Vec<String> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let is_dir = e.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                    if !is_dir {
+                        return None;
+                    }
+                    if name.to_lowercase().starts_with(&prefix_lower) {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            matches.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+            state.completions = matches;
+        }
+    }
+
+    /// Apply the longest common prefix of all completions. Returns true if the
+    /// input was actually extended (i.e. there was a common prefix beyond what
+    /// was already typed).
+    fn apply_common_prefix(state: &mut GotoPathState) -> bool {
+        if state.completions.is_empty() {
+            return false;
+        }
+
+        let (_, prefix) = Self::expand_goto_input(&state.input);
+
+        // Find longest common prefix among completions
+        let first = &state.completions[0];
+        let mut common_len = first.len();
+        for candidate in &state.completions[1..] {
+            common_len = common_len.min(
+                first
+                    .chars()
+                    .zip(candidate.chars())
+                    .take_while(|(a, b)| a.to_lowercase().eq(b.to_lowercase()))
+                    .count(),
+            );
+        }
+
+        let common: String = first.chars().take(common_len).collect();
+        if common.len() > prefix.len() {
+            // Replace the prefix portion with the common prefix
+            let suffix = &common[prefix.len()..];
+            state.input.insert_str(state.cursor, suffix);
+            state.cursor += suffix.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn apply_completion(state: &mut GotoPathState, name: &str) {
+        let (_, prefix) = Self::expand_goto_input(&state.input);
+
+        // Replace the typed prefix with the full name + /
+        let suffix = format!("{}/", &name[prefix.len()..]);
+        state.input.insert_str(state.cursor, &suffix);
+        state.cursor += suffix.len();
+        state.completions.clear();
+        state.comp_index = None;
+        state.comp_base = None;
+    }
+
+    fn goto_path_navigate(&mut self, side: usize, input: &str) {
+        let expanded = if input.starts_with('~') {
+            if let Some(home) = std::env::var_os("HOME") {
+                let home = home.to_string_lossy();
+                format!("{}{}", home, &input[1..])
+            } else {
+                input.to_string()
+            }
+        } else {
+            input.to_string()
+        };
+
+        let path = PathBuf::from(&expanded);
+        if path.is_dir() {
+            self.panels[side].current_dir = path;
+            self.panels[side].reload();
+            self.panels[side].table_state.select(Some(0));
+            self.panels[side].refresh_git(&mut self.git_cache);
+            if let Some(ref mut w) = self.dir_watcher {
+                w.watch_dirs([&self.panels[0].current_dir, &self.panels[1].current_dir]);
+            }
+        } else {
+            self.status_message = Some(format!("Not a directory: {}", expanded));
         }
     }
 
@@ -2042,7 +2390,7 @@ impl App {
                     s.cursor_end();
                 }
             }
-            Action::SwitchPanel => {
+            Action::SwitchPanel | Action::SwitchPanelReverse => {
                 if let Some(ref mut s) = self.search_dialog {
                     s.focused = match s.focused {
                         SearchDialogField::ButtonFind => SearchDialogField::ButtonCancel,
@@ -2137,6 +2485,26 @@ impl App {
                     ci.move_down();
                 }
             }
+            Action::PageUp => {
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.page_up();
+                }
+            }
+            Action::PageDown => {
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.page_down();
+                }
+            }
+            Action::MoveToTop => {
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.move_to_top();
+                }
+            }
+            Action::MoveToBottom => {
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.move_to_bottom();
+                }
+            }
             Action::Enter => {
                 // enter() returns Some if a step was selected for log viewing
                 let log_info = self.ci_panels[side]
@@ -2160,6 +2528,9 @@ impl App {
             }
             Action::SwitchPanel => {
                 self.handle_switch_panel();
+            }
+            Action::SwitchPanelReverse => {
+                self.handle_switch_panel_reverse();
             }
             Action::ToggleCi => {
                 if self.ci_panels[side]
@@ -2327,7 +2698,7 @@ impl App {
                     state.cursor_end();
                 }
             }
-            Action::SwitchPanel => {
+            Action::SwitchPanel | Action::SwitchPanelReverse => {
                 // Swap between OK and Cancel buttons
                 if let AppMode::MkdirDialog(ref mut state) = self.mode {
                     state.focused = match state.focused {
@@ -2448,7 +2819,7 @@ impl App {
                     state.cursor_end();
                 }
             }
-            Action::SwitchPanel => {
+            Action::SwitchPanel | Action::SwitchPanelReverse => {
                 if let AppMode::CopyDialog(ref mut state) = self.mode {
                     state.focused = match state.focused {
                         CopyDialogField::ButtonCopy => CopyDialogField::ButtonCancel,
@@ -2719,7 +3090,7 @@ impl App {
                     state.cursor_end();
                 }
             }
-            Action::SwitchPanel => {
+            Action::SwitchPanel | Action::SwitchPanelReverse => {
                 if let AppMode::Dialog(ref mut state) = self.mode {
                     state.focused = match state.focused {
                         DialogField::ButtonOk => DialogField::ButtonCancel,

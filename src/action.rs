@@ -12,6 +12,10 @@ pub enum Action {
     Enter,
     GoUp,
     SwitchPanel,
+    SwitchPanelReverse,
+    CopyName,
+    CopyPath,
+    GotoPathPrompt,
 
     // Panel multi-file selection
     ToggleSelect,

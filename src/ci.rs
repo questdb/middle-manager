@@ -531,6 +531,45 @@ impl CiPanel {
             }
         }
     }
+
+    pub fn page_up(&mut self) {
+        let vh = self.visible_height.max(1);
+        if let CiView::Tree { selected, scroll, .. } = &mut self.view {
+            *selected = selected.saturating_sub(vh);
+            if *selected < *scroll {
+                *scroll = *selected;
+            }
+        }
+    }
+
+    pub fn page_down(&mut self) {
+        let vh = self.visible_height.max(1);
+        if let CiView::Tree { selected, scroll, items, .. } = &mut self.view {
+            let max = items.len().saturating_sub(1);
+            *selected = (*selected + vh).min(max);
+            if vh > 0 && *selected >= *scroll + vh {
+                *scroll = *selected - vh + 1;
+            }
+        }
+    }
+
+    pub fn move_to_top(&mut self) {
+        if let CiView::Tree { selected, scroll, .. } = &mut self.view {
+            *selected = 0;
+            *scroll = 0;
+        }
+    }
+
+    pub fn move_to_bottom(&mut self) {
+        let vh = self.visible_height;
+        if let CiView::Tree { selected, scroll, items, .. } = &mut self.view {
+            let max = items.len().saturating_sub(1);
+            *selected = max;
+            if vh > 0 && *selected >= *scroll + vh {
+                *scroll = *selected - vh + 1;
+            }
+        }
+    }
 }
 
 /// Detect the GitHub owner/repo from the current directory.

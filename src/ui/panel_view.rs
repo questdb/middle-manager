@@ -1,13 +1,127 @@
-use ratatui::layout::{Constraint, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Row, Table};
 use ratatui::Frame;
 
+use crate::app::GotoPathState;
 use crate::panel::github::PrCheckStatus;
 use crate::panel::sort::SortField;
 use crate::panel::Panel;
 use crate::theme::{theme, Theme};
+
+pub fn render_with_goto(
+    frame: &mut Frame,
+    area: Rect,
+    panel: &mut Panel,
+    is_active: bool,
+    goto_path: Option<&GotoPathState>,
+) {
+    if let Some(state) = goto_path {
+        let comp_rows = if state.completions.len() > 1 {
+            (state.completions.len() as u16).min(8) // show at most 8 candidates
+        } else {
+            0
+        };
+
+        let [goto_area, comp_area, panel_area] = Layout::vertical([
+            Constraint::Length(1),
+            Constraint::Length(comp_rows),
+            Constraint::Fill(1),
+        ]).areas(area);
+
+        render_goto_path_input(frame, goto_area, state);
+        if comp_rows > 0 {
+            render_completions(frame, comp_area, state);
+        }
+        render(frame, panel_area, panel, is_active);
+    } else {
+        render(frame, area, panel, is_active);
+    }
+}
+
+fn render_goto_path_input(frame: &mut Frame, area: Rect, state: &GotoPathState) {
+    let t = theme();
+
+    let prompt_style = Style::default().fg(t.search_label_fg).bg(t.search_label_bg);
+    let input_style = Style::default()
+        .fg(t.editor_text_fg)
+        .bg(t.bg)
+        .add_modifier(Modifier::BOLD);
+    let cursor_style = Style::default().fg(t.dialog_cursor_fg).bg(t.dialog_bg);
+
+    let before = &state.input[..state.cursor];
+    let cursor_char = state.input[state.cursor..].chars().next();
+    let after_start = state.cursor + cursor_char.map(|c| c.len_utf8()).unwrap_or(0);
+    let after = &state.input[after_start..];
+
+    // Scroll the input so the cursor is visible
+    let prompt_prefix = "Go: ";
+    let available = area.width as usize - prompt_prefix.len();
+    let display_start = if before.len() >= available {
+        before.len() - available + 1
+    } else {
+        0
+    };
+
+    let visible_before = &before[display_start..];
+
+    let mut spans = vec![
+        Span::styled(prompt_prefix, prompt_style),
+        Span::styled(visible_before.to_string(), input_style),
+    ];
+    if let Some(c) = cursor_char {
+        spans.push(Span::styled(c.to_string(), cursor_style));
+    } else {
+        spans.push(Span::styled(" ", cursor_style));
+    }
+    if !after.is_empty() {
+        spans.push(Span::styled(after.to_string(), input_style));
+    }
+
+    let line = Line::from(spans);
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(line).style(Style::default().bg(t.bg)),
+        area,
+    );
+}
+
+fn render_completions(frame: &mut Frame, area: Rect, state: &GotoPathState) {
+    let t = theme();
+    let normal = Style::default().fg(t.dir_fg).bg(t.bg).add_modifier(Modifier::BOLD);
+    let highlight = Style::default().fg(t.highlight_fg).bg(t.highlight_bg).add_modifier(Modifier::BOLD);
+
+    // Scroll the list so the selected item is visible
+    let max_visible = area.height as usize;
+    let selected = state.comp_index.unwrap_or(0);
+    let scroll = if selected >= max_visible {
+        selected - max_visible + 1
+    } else {
+        0
+    };
+
+    for (i, row) in (0..max_visible).enumerate() {
+        let idx = scroll + i;
+        let y = area.y + row as u16;
+        if y >= area.y + area.height {
+            break;
+        }
+        let row_area = Rect::new(area.x, y, area.width, 1);
+
+        if idx < state.completions.len() {
+            let name = &state.completions[idx];
+            let style = if state.comp_index == Some(idx) { highlight } else { normal };
+            let display = format!("  /{}", name);
+            let line = Line::from(Span::styled(display, style));
+            // Fill background for the whole row
+            let bg_fill = ratatui::widgets::Paragraph::new(line).style(style);
+            frame.render_widget(bg_fill, row_area);
+        } else {
+            let bg_fill = ratatui::widgets::Paragraph::new("").style(Style::default().bg(t.bg));
+            frame.render_widget(bg_fill, row_area);
+        }
+    }
+}
 
 pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool) {
     let t = theme();

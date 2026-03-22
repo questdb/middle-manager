@@ -83,8 +83,8 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
         (app.active_panel == 0, app.active_panel == 1)
     };
     let [left_panel, right_panel] = app.panels.each_mut();
-    panel_view::render(frame, left_area, left_panel, left_active);
-    panel_view::render(frame, right_area, right_panel, right_active);
+    panel_view::render_with_goto(frame, left_area, left_panel, left_active, app.goto_path[0].as_ref());
+    panel_view::render_with_goto(frame, right_area, right_panel, right_active, app.goto_path[1].as_ref());
 
     // Render CI panels
     if let (Some(ci_area), Some(ref mut ci)) = (left_ci_area, &mut app.ci_panels[0]) {

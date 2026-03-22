@@ -39,7 +39,7 @@ pub fn render(frame: &mut Frame, area: Rect, editor: &mut EditorState) {
 
     let num_style = Style::default().fg(Color::Yellow).bg(t.bg);
     let sep_style = Style::default().fg(Color::DarkGray).bg(t.bg);
-    let default_text_style = Style::default().fg(Color::LightCyan).bg(t.bg);
+    let default_text_style = Style::default().fg(t.editor_text_fg).bg(t.bg);
     let sel_style = Style::default().fg(Color::Black).bg(Color::LightCyan);
 
     // Build syntax-highlighted color map.

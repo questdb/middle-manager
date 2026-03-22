@@ -59,7 +59,8 @@ pub struct Theme {
     pub syn_property: Color,
     pub syn_escape: Color,
     pub syn_constructor: Color,
-    // Cursor
+    // Editor
+    pub editor_text_fg: Color,
     pub editor_cursor: SetCursorStyle,
     // Git
     pub git_modified_fg: Color,
@@ -130,6 +131,7 @@ impl Theme {
             syn_property: Color::LightCyan,
             syn_escape: Color::LightRed,
             syn_constructor: Color::Yellow,
+            editor_text_fg: Color::White,
             editor_cursor: SetCursorStyle::BlinkingBar,
             git_modified_fg: Color::Yellow,
             git_added_fg: Color::LightGreen,
