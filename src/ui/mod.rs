@@ -1,3 +1,4 @@
+pub mod ci_view;
 pub mod copy_dialog;
 pub mod dialog;
 pub mod dialog_helpers;
@@ -42,19 +43,60 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
     ])
     .areas(frame.area());
 
-    let [left_area, right_area] =
+    let [left_col, right_col] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(panels_area);
+
+    let (left_area, left_ci_area) = if app.ci_panels[0].is_some() {
+        let [top, bottom] = Layout::vertical([
+            Constraint::Percentage(60),
+            Constraint::Percentage(40),
+        ]).areas(left_col);
+        (top, Some(bottom))
+    } else {
+        (left_col, None)
+    };
+    let (right_area, right_ci_area) = if app.ci_panels[1].is_some() {
+        let [top, bottom] = Layout::vertical([
+            Constraint::Percentage(60),
+            Constraint::Percentage(40),
+        ]).areas(right_col);
+        (top, Some(bottom))
+    } else {
+        (right_col, None)
+    };
 
     app.panel_areas = [left_area, right_area];
 
     header::render(frame, header_area, app);
 
-    let (left_active, right_active) = (app.active_panel == 0, app.active_panel == 1);
+    // File panels are active only when no CI panel is focused
+    let (left_active, right_active) = if app.ci_focused.is_some() {
+        (false, false)
+    } else {
+        (app.active_panel == 0, app.active_panel == 1)
+    };
     let [left_panel, right_panel] = app.panels.each_mut();
     panel_view::render(frame, left_area, left_panel, left_active);
     panel_view::render(frame, right_area, right_panel, right_active);
 
-    footer::render(frame, footer_area);
+    // Render CI panels
+    if let (Some(ci_area), Some(ref mut ci)) = (left_ci_area, &mut app.ci_panels[0]) {
+        ci_view::render(frame, ci_area, ci, app.ci_focused == Some(0));
+    }
+    if let (Some(ci_area), Some(ref mut ci)) = (right_ci_area, &mut app.ci_panels[1]) {
+        ci_view::render(frame, ci_area, ci, app.ci_focused == Some(1));
+    }
+
+    // Show CI footer when CI panel is focused, otherwise normal footer
+    if let Some(side) = app.ci_focused {
+        if let Some(ref ci) = app.ci_panels[side] {
+            footer::render_ci(frame, footer_area, &ci.view);
+        } else {
+            footer::render(frame, footer_area);
+        }
+    } else {
+        footer::render(frame, footer_area);
+    }
 
     let dialog_area = match &app.mode {
         AppMode::Dialog(ref d) => Some(dialog::render(frame, d)),

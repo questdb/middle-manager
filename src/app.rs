@@ -10,6 +10,7 @@ use crate::action::Action;
 use crate::editor::EditorState;
 use crate::fs_ops;
 use crate::hex_viewer::HexViewerState;
+use crate::ci::CiPanel;
 use crate::panel::git::GitCache;
 use crate::panel::sort::SortField;
 use crate::panel::Panel;
@@ -55,6 +56,10 @@ pub struct App {
     pub persisted: AppState,
     /// Filesystem watcher for auto-refresh on external changes.
     dir_watcher: Option<DirWatcher>,
+    /// CI panels (one per file panel side, independently togglable).
+    pub ci_panels: [Option<CiPanel>; 2],
+    /// Which CI panel has focus (None = file panel has focus).
+    pub ci_focused: Option<usize>,
 }
 
 pub enum AppMode {
@@ -642,6 +647,8 @@ impl App {
             git_cache,
             persisted,
             dir_watcher,
+            ci_panels: [None, None],
+            ci_focused: None,
         }
     }
 
@@ -748,6 +755,19 @@ impl App {
             };
         }
 
+        // CI panel intercepts keys when focused
+        if self.ci_focused.is_some() {
+            return match key.code {
+                KeyCode::Up => Action::MoveUp,
+                KeyCode::Down => Action::MoveDown,
+                KeyCode::Enter => Action::Enter,
+                KeyCode::Char('o') => Action::OpenPr,
+                KeyCode::Tab => Action::SwitchPanel,
+                KeyCode::F(2) => Action::ToggleCi,
+                _ => Action::None,
+            };
+        }
+
         // Search dialog intercepts keys when active
         if let Some(ref state) = self.search_dialog {
             return Self::map_search_dialog_key(key, state.focused);
@@ -798,6 +818,7 @@ impl App {
             KeyCode::F(8) => Action::Delete,
             KeyCode::F(9) => Action::CycleSort,
             KeyCode::F(10) => Action::Quit,
+            KeyCode::F(2) => Action::ToggleCi,
             KeyCode::F(11) => Action::OpenPr,
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
             KeyCode::Char(c) if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' => {
@@ -1065,6 +1086,12 @@ impl App {
             return;
         }
 
+        // CI panel intercepts when focused
+        if self.ci_focused.is_some() {
+            self.handle_ci_action(action);
+            return;
+        }
+
         // Dialog, mkdir dialog, copy dialog, and editor have their own dispatch
         if matches!(self.mode, AppMode::Dialog(_)) {
             self.handle_dialog_action(action);
@@ -1086,6 +1113,25 @@ impl App {
         match action {
             Action::None => {}
             Action::Tick => {
+                // Poll all CI panels for async results and downloads
+                for ci in self.ci_panels.iter_mut().flatten() {
+                    ci.poll();
+                    if let Some(result) = ci.poll_download() {
+                        match result {
+                            Ok(path) => {
+                                self.ci_focused = None;
+                                self.mode = AppMode::Editing(
+                                    crate::editor::EditorState::open(path),
+                                );
+                                return;
+                            }
+                            Err(e) => {
+                                self.status_message =
+                                    Some(format!("Download failed: {}", e));
+                            }
+                        }
+                    }
+                }
                 // Poll for async PR query results
                 if self.git_cache.poll_pending() {
                     self.panels[0].refresh_git(&mut self.git_cache);
@@ -1164,7 +1210,22 @@ impl App {
                 self.active_panel_mut().cycle_sort();
             }
 
-            // GitHub
+            // CI / GitHub
+            Action::ToggleCi => {
+                let side = self.active_panel;
+                if self.ci_panels[side].is_some() {
+                    self.ci_panels[side] = None;
+                    if self.ci_focused == Some(side) {
+                        self.ci_focused = None;
+                    }
+                } else if let Some(ref gi) = self.active_panel().git_info {
+                    let dir = self.active_panel().current_dir.clone();
+                    self.ci_panels[side] = Some(CiPanel::for_branch(&dir, &gi.branch));
+                    self.ci_focused = Some(side);
+                } else {
+                    self.status_message = Some("Not in a git repository".to_string());
+                }
+            }
             Action::OpenPr => {
                 if let Some(ref gi) = self.active_panel().git_info {
                     if let Some(ref pr) = gi.pr {
@@ -1280,7 +1341,36 @@ impl App {
     }
 
     fn handle_switch_panel(&mut self) {
-        self.active_panel = 1 - self.active_panel;
+        let has_left_ci = self.ci_panels[0].is_some();
+        let has_right_ci = self.ci_panels[1].is_some();
+
+        if !has_left_ci && !has_right_ci {
+            self.active_panel = 1 - self.active_panel;
+            return;
+        }
+
+        // Tab order: left, left_ci?, right, right_ci?
+        let mut order: Vec<(usize, bool)> = Vec::with_capacity(4);
+        order.push((0, false));
+        if has_left_ci { order.push((0, true)); }
+        order.push((1, false));
+        if has_right_ci { order.push((1, true)); }
+
+        let current = if let Some(ci_side) = self.ci_focused {
+            order.iter().position(|&(s, ci)| s == ci_side && ci)
+        } else {
+            order.iter().position(|&(s, ci)| s == self.active_panel && !ci)
+        };
+
+        let next = current.map(|i| (i + 1) % order.len()).unwrap_or(0);
+        let (side, is_ci) = order[next];
+
+        if is_ci {
+            self.ci_focused = Some(side);
+        } else {
+            self.ci_focused = None;
+            self.active_panel = side;
+        }
     }
 
     fn handle_goto_line_action(&mut self, action: Action) {
@@ -1895,6 +1985,126 @@ impl App {
             if !e.find(&params) {
                 e.status_msg = Some(format!("'{}' not found", params.query));
             }
+        }
+    }
+
+    // --- CI panel handler ---
+
+    fn handle_ci_action(&mut self, action: Action) {
+        let side = match self.ci_focused {
+            Some(s) => s,
+            None => return,
+        };
+
+        match action {
+            Action::None | Action::Tick | Action::Resize(_, _) => {
+                // Poll all CI panels and check downloads
+                for ci in self.ci_panels.iter_mut() {
+                    if let Some(ref mut ci) = ci {
+                        ci.poll();
+                        if let Some(result) = ci.poll_download() {
+                            match result {
+                                Ok(path) => {
+                                    // Open downloaded log in editor
+                                    self.ci_focused = None;
+                                    self.mode = AppMode::Editing(
+                                        crate::editor::EditorState::open(path),
+                                    );
+                                    return;
+                                }
+                                Err(e) => {
+                                    self.status_message = Some(format!("Download failed: {}", e));
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(ref w) = self.dir_watcher {
+                    if w.has_changes() {
+                        self.reload_panels();
+                    }
+                }
+                if self.git_cache.poll_pending() {
+                    self.panels[0].refresh_git(&mut self.git_cache);
+                    self.panels[1].refresh_git(&mut self.git_cache);
+                }
+            }
+            Action::MoveUp => {
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.move_up();
+                }
+            }
+            Action::MoveDown => {
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.move_down();
+                }
+            }
+            Action::Enter => {
+                // enter() returns Some if a step was selected for log viewing
+                let log_info = self.ci_panels[side]
+                    .as_mut()
+                    .and_then(|ci| ci.enter());
+                if let Some((run_id, step)) = log_info {
+                    self.start_ci_log_download(side, run_id, &step);
+                }
+            }
+            Action::SwitchPanel => {
+                self.handle_switch_panel();
+            }
+            Action::ToggleCi => {
+                self.ci_panels[side] = None;
+                self.ci_focused = None;
+            }
+            Action::OpenPr => {
+                if let Some(ref ci) = self.ci_panels[side] {
+                    if let Some(url) = ci.selected_url() {
+                        crate::panel::github::open_url(url);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn start_ci_log_download(&mut self, side: usize, run_id: u64, step: &crate::ci::CiStep) {
+        let ci = match &mut self.ci_panels[side] {
+            Some(ci) => ci,
+            None => return,
+        };
+
+        if ci.download.is_some() {
+            return; // already downloading
+        }
+
+        // Build output filename in the active panel's current directory
+        let safe_name: String = step
+            .name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+            .collect();
+        let output_path = self.panels[self.active_panel]
+            .current_dir
+            .join(format!("{}.log", safe_name));
+
+        if let Some(ref url) = step.log_url {
+            // Azure: direct URL download
+            ci.download = Some(crate::ci::LogDownload::start(
+                url,
+                output_path,
+                step.name.clone(),
+            ));
+        } else if run_id > 0 {
+            // GitHub Actions: zip download + extract
+            let repo = ci.repo.clone();
+            ci.download = Some(crate::ci::LogDownload::start_github(
+                &repo,
+                run_id,
+                step.number,
+                &step.name,
+                output_path,
+            ));
+        } else {
+            self.status_message = Some("Cannot download logs: no run ID found".to_string());
         }
     }
 

@@ -1,5 +1,6 @@
 mod action;
 mod app;
+mod ci;
 mod editor;
 mod event;
 mod fs_ops;
