@@ -13,6 +13,11 @@ pub enum Action {
     GoUp,
     SwitchPanel,
 
+    // Panel multi-file selection
+    ToggleSelect,
+    SelectMoveUp,
+    SelectMoveDown,
+
     // File operations
     Copy,
     Move,
@@ -53,6 +58,18 @@ pub enum Action {
     SelectAll,
     CopySelection,
 
+    // Search (editor)
+    SearchPrompt,
+    FindNext,
+
+    // Word navigation (editor)
+    WordLeft,
+    WordRight,
+
+    // Editor undo/redo
+    EditorUndo,
+    EditorRedo,
+
     // Editor
     EditBuiltin,
     CursorLeft,
@@ -69,6 +86,10 @@ pub enum Action {
     MouseDoubleClick(u16, u16),
     MouseScrollUp(u16, u16),
     MouseScrollDown(u16, u16),
+
+    // GitHub / CI
+    OpenPr,
+    ToggleCi,
 
     // Application
     Quit,

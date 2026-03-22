@@ -10,7 +10,28 @@ use crate::action::Action;
 use crate::editor::EditorState;
 use crate::fs_ops;
 use crate::hex_viewer::HexViewerState;
+use crate::ci::CiPanel;
+use crate::panel::git::GitCache;
+use crate::panel::sort::SortField;
 use crate::panel::Panel;
+use crate::state::AppState;
+use crate::watcher::DirWatcher;
+
+fn sort_field_from_u8(v: u8) -> SortField {
+    match v {
+        1 => SortField::Size,
+        2 => SortField::Date,
+        _ => SortField::Name,
+    }
+}
+
+fn sort_field_to_u8(f: SortField) -> u8 {
+    match f {
+        SortField::Name => 0,
+        SortField::Size => 1,
+        SortField::Date => 2,
+    }
+}
 use crate::viewer::ViewerState;
 
 pub struct App {
@@ -20,18 +41,35 @@ pub struct App {
     pub should_quit: bool,
     pub status_message: Option<String>,
     pub panel_areas: [Rect; 2],
+    pub ci_panel_areas: [Option<Rect>; 2],
     last_click: Option<(Instant, u16, u16)>,
     /// Go-to-line prompt state. When Some, an input overlay is shown.
     pub goto_line_input: Option<String>,
     /// Set to true when the UI needs a full terminal clear (e.g. leaving full-screen mode).
     pub needs_clear: bool,
+    /// Search dialog overlay (shown on top of editor).
+    pub search_dialog: Option<SearchDialogState>,
+    /// Unsaved changes confirmation dialog overlay.
+    pub unsaved_dialog: Option<UnsavedDialogField>,
+    /// Quit confirmation dialog: true = Quit focused, false = Cancel focused.
+    pub quit_confirm: Option<bool>,
+    /// Shared git status cache across panels.
+    git_cache: GitCache,
+    /// Persistent state (search, paths, sort, etc.)
+    pub persisted: AppState,
+    /// Filesystem watcher for auto-refresh on external changes.
+    dir_watcher: Option<DirWatcher>,
+    /// CI panels (one per file panel side, independently togglable).
+    pub ci_panels: [Option<CiPanel>; 2],
+    /// Which CI panel has focus (None = file panel has focus).
+    pub ci_focused: Option<usize>,
 }
 
-#[derive(Clone)]
 pub enum AppMode {
     Normal,
     QuickSearch,
     Dialog(DialogState),
+    MkdirDialog(MkdirDialogState),
     CopyDialog(CopyDialogState),
     Viewing(ViewerState),
     HexViewing(HexViewerState),
@@ -46,14 +84,299 @@ pub struct DialogState {
     pub title: String,
     pub message: String,
     pub input: String,
+    pub cursor: usize,
     pub has_input: bool,
+    pub focused: DialogField,
+}
+
+impl DialogState {
+    pub fn insert_char(&mut self, c: char) {
+        let byte_pos = self.byte_offset(self.cursor);
+        self.input.insert(byte_pos, c);
+        self.cursor += 1;
+    }
+
+    pub fn delete_char_backward(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            let byte_pos = self.byte_offset(self.cursor);
+            self.input.remove(byte_pos);
+        }
+    }
+
+    pub fn cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn cursor_right(&mut self) {
+        let len = self.input.chars().count();
+        if self.cursor < len {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.input.chars().count();
+    }
+
+    fn byte_offset(&self, char_pos: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(char_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(self.input.len())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum DialogField {
+    Input,
+    ButtonOk,
+    ButtonCancel,
+}
+
+impl DialogField {
+    pub fn next(self, has_input: bool) -> Self {
+        match self {
+            Self::Input => Self::ButtonOk,
+            Self::ButtonOk => Self::ButtonCancel,
+            Self::ButtonCancel => {
+                if has_input {
+                    Self::Input
+                } else {
+                    Self::ButtonOk
+                }
+            }
+        }
+    }
+    pub fn prev(self, has_input: bool) -> Self {
+        match self {
+            Self::Input => Self::ButtonCancel,
+            Self::ButtonOk => {
+                if has_input {
+                    Self::Input
+                } else {
+                    Self::ButtonCancel
+                }
+            }
+            Self::ButtonCancel => Self::ButtonOk,
+        }
+    }
 }
 
 #[derive(Clone, PartialEq)]
 pub enum DialogKind {
     ConfirmDelete,
-    InputMkdir,
     InputRename,
+}
+
+// --- Make folder dialog ---
+
+#[derive(Clone)]
+pub struct MkdirDialogState {
+    pub input: String,
+    pub cursor: usize,
+    pub process_multiple: bool,
+    pub focused: MkdirDialogField,
+}
+
+impl MkdirDialogState {
+    pub fn new() -> Self {
+        Self {
+            input: String::new(),
+            cursor: 0,
+            process_multiple: false,
+            focused: MkdirDialogField::Input,
+        }
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        let byte_pos = self.byte_offset(self.cursor);
+        self.input.insert(byte_pos, c);
+        self.cursor += 1;
+    }
+
+    pub fn delete_char_backward(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            let byte_pos = self.byte_offset(self.cursor);
+            self.input.remove(byte_pos);
+        }
+    }
+
+    pub fn cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn cursor_right(&mut self) {
+        let len = self.input.chars().count();
+        if self.cursor < len {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.input.chars().count();
+    }
+
+    fn byte_offset(&self, char_pos: usize) -> usize {
+        self.input
+            .char_indices()
+            .nth(char_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(self.input.len())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum MkdirDialogField {
+    Input,
+    ProcessMultiple,
+    ButtonOk,
+    ButtonCancel,
+}
+
+impl MkdirDialogField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Input => Self::ProcessMultiple,
+            Self::ProcessMultiple => Self::ButtonOk,
+            Self::ButtonOk => Self::ButtonCancel,
+            Self::ButtonCancel => Self::Input,
+        }
+    }
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Input => Self::ButtonCancel,
+            Self::ProcessMultiple => Self::Input,
+            Self::ButtonOk => Self::ProcessMultiple,
+            Self::ButtonCancel => Self::ButtonOk,
+        }
+    }
+}
+
+// --- Search dialog ---
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum SearchDirection {
+    Forward,
+    Backward,
+}
+
+#[derive(Clone)]
+pub struct SearchDialogState {
+    pub query: String,
+    pub cursor: usize,
+    pub direction: SearchDirection,
+    pub case_sensitive: bool,
+    pub focused: SearchDialogField,
+}
+
+impl SearchDialogState {
+    pub fn insert_char(&mut self, c: char) {
+        let byte_pos = self.byte_offset(self.cursor);
+        self.query.insert(byte_pos, c);
+        self.cursor += 1;
+    }
+
+    pub fn delete_char_backward(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            let byte_pos = self.byte_offset(self.cursor);
+            self.query.remove(byte_pos);
+        }
+    }
+
+    pub fn cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn cursor_right(&mut self) {
+        let len = self.query.chars().count();
+        if self.cursor < len {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.query.chars().count();
+    }
+
+    fn byte_offset(&self, char_pos: usize) -> usize {
+        self.query
+            .char_indices()
+            .nth(char_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(self.query.len())
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum SearchDialogField {
+    Query,
+    Direction,
+    CaseSensitive,
+    ButtonFind,
+    ButtonCancel,
+}
+
+impl SearchDialogField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Query => Self::Direction,
+            Self::Direction => Self::CaseSensitive,
+            Self::CaseSensitive => Self::ButtonFind,
+            Self::ButtonFind => Self::ButtonCancel,
+            Self::ButtonCancel => Self::Query,
+        }
+    }
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Query => Self::ButtonCancel,
+            Self::Direction => Self::Query,
+            Self::CaseSensitive => Self::Direction,
+            Self::ButtonFind => Self::CaseSensitive,
+            Self::ButtonCancel => Self::ButtonFind,
+        }
+    }
+}
+
+// --- Unsaved changes dialog ---
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum UnsavedDialogField {
+    ButtonSave,
+    ButtonDiscard,
+    ButtonCancel,
+}
+
+impl UnsavedDialogField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::ButtonSave => Self::ButtonDiscard,
+            Self::ButtonDiscard => Self::ButtonCancel,
+            Self::ButtonCancel => Self::ButtonSave,
+        }
+    }
+    pub fn prev(self) -> Self {
+        match self {
+            Self::ButtonSave => Self::ButtonCancel,
+            Self::ButtonDiscard => Self::ButtonSave,
+            Self::ButtonCancel => Self::ButtonDiscard,
+        }
+    }
 }
 
 // --- Copy/Move dialog ---
@@ -61,7 +384,9 @@ pub enum DialogKind {
 #[derive(Clone)]
 pub struct CopyDialogState {
     pub source_name: String,
+    pub source_paths: Vec<PathBuf>,
     pub destination: String,
+    pub cursor: usize,
     pub is_move: bool,
     pub overwrite_mode: OverwriteMode,
     pub process_multiple: bool,
@@ -76,9 +401,17 @@ pub struct CopyDialogState {
 }
 
 impl CopyDialogState {
-    pub fn new(source_name: String, destination: String, is_move: bool) -> Self {
+    pub fn new(
+        source_name: String,
+        source_paths: Vec<PathBuf>,
+        destination: String,
+        is_move: bool,
+    ) -> Self {
+        let cursor = destination.chars().count();
         Self {
             source_name,
+            source_paths,
+            cursor,
             destination,
             is_move,
             overwrite_mode: OverwriteMode::Ask,
@@ -92,6 +425,47 @@ impl CopyDialogState {
             use_filter: false,
             focused: CopyDialogField::Destination,
         }
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        let byte_pos = self.byte_offset(self.cursor);
+        self.destination.insert(byte_pos, c);
+        self.cursor += 1;
+    }
+
+    pub fn delete_char_backward(&mut self) {
+        if self.cursor > 0 {
+            self.cursor -= 1;
+            let byte_pos = self.byte_offset(self.cursor);
+            self.destination.remove(byte_pos);
+        }
+    }
+
+    pub fn cursor_left(&mut self) {
+        self.cursor = self.cursor.saturating_sub(1);
+    }
+
+    pub fn cursor_right(&mut self) {
+        let len = self.destination.chars().count();
+        if self.cursor < len {
+            self.cursor += 1;
+        }
+    }
+
+    pub fn cursor_home(&mut self) {
+        self.cursor = 0;
+    }
+
+    pub fn cursor_end(&mut self) {
+        self.cursor = self.destination.chars().count();
+    }
+
+    fn byte_offset(&self, char_pos: usize) -> usize {
+        self.destination
+            .char_indices()
+            .nth(char_pos)
+            .map(|(i, _)| i)
+            .unwrap_or(self.destination.len())
     }
 
     pub fn toggle_focused(&mut self) {
@@ -225,17 +599,111 @@ impl CopyDialogField {
 
 impl App {
     pub fn new() -> Self {
+        let persisted = AppState::load();
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+
+        // Restore panel paths from saved state, fall back to cwd
+        let left_path = persisted
+            .left_panel_path
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| cwd.clone());
+        let right_path = persisted
+            .right_panel_path
+            .as_ref()
+            .map(PathBuf::from)
+            .filter(|p| p.is_dir())
+            .unwrap_or_else(|| cwd.clone());
+
+        let mut panels = [Panel::new(left_path), Panel::new(right_path)];
+
+        // Restore sort preferences
+        panels[0].sort_field = sort_field_from_u8(persisted.left_sort_field);
+        panels[0].sort_ascending = persisted.left_sort_ascending;
+        panels[0].apply_sort();
+        panels[1].sort_field = sort_field_from_u8(persisted.right_sort_field);
+        panels[1].sort_ascending = persisted.right_sort_ascending;
+        panels[1].apply_sort();
+
+        let mut git_cache = GitCache::new();
+        panels[0].refresh_git(&mut git_cache);
+        panels[1].refresh_git(&mut git_cache);
+
+        let mut dir_watcher = DirWatcher::new();
+        if let Some(ref mut w) = dir_watcher {
+            w.watch_dirs([&panels[0].current_dir, &panels[1].current_dir]);
+        }
+
         Self {
-            panels: [Panel::new(cwd.clone()), Panel::new(cwd)],
+            panels,
             active_panel: 0,
             mode: AppMode::Normal,
             should_quit: false,
             status_message: None,
             panel_areas: [Rect::default(); 2],
+            ci_panel_areas: [None, None],
             last_click: None,
             goto_line_input: None,
             needs_clear: false,
+            search_dialog: None,
+            unsaved_dialog: None,
+            git_cache,
+            persisted,
+            dir_watcher,
+            ci_panels: [None, None],
+            ci_focused: None,
+            quit_confirm: None,
+        }
+    }
+
+    /// Save current state to disk.
+    pub fn save_state(&mut self) {
+        self.persisted.left_panel_path =
+            Some(self.panels[0].current_dir.to_string_lossy().to_string());
+        self.persisted.right_panel_path =
+            Some(self.panels[1].current_dir.to_string_lossy().to_string());
+        self.persisted.left_sort_field = sort_field_to_u8(self.panels[0].sort_field);
+        self.persisted.left_sort_ascending = self.panels[0].sort_ascending;
+        self.persisted.right_sort_field = sort_field_to_u8(self.panels[1].sort_field);
+        self.persisted.right_sort_ascending = self.panels[1].sort_ascending;
+        self.persisted.save();
+    }
+
+    /// Reload both panels and refresh git status.
+    pub fn reload_panels(&mut self) {
+        self.panels[0].reload();
+        self.panels[1].reload();
+        self.git_cache.invalidate(&self.panels[0].current_dir);
+        self.git_cache.invalidate(&self.panels[1].current_dir);
+        self.panels[0].refresh_git(&mut self.git_cache);
+        self.panels[1].refresh_git(&mut self.git_cache);
+        self.update_watched_dirs();
+    }
+
+    /// Close CI panels that are no longer relevant (branch changed or left the repo).
+    fn check_ci_panels(&mut self) {
+        for side in 0..2 {
+            if let Some(ref ci) = self.ci_panels[side] {
+                let still_valid = self.panels[side]
+                    .git_info
+                    .as_ref()
+                    .map(|gi| gi.branch == ci.branch)
+                    .unwrap_or(false);
+                if !still_valid && ci.download.is_none() {
+                    self.ci_panels[side] = None;
+                    if self.ci_focused == Some(side) {
+                        self.ci_focused = None;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Update filesystem watcher to track current panel directories.
+    fn update_watched_dirs(&mut self) {
+        if let Some(ref mut w) = self.dir_watcher {
+            w.watch_dirs([&self.panels[0].current_dir, &self.panels[1].current_dir]);
         }
     }
 
@@ -300,10 +768,53 @@ impl App {
             };
         }
 
+        // Quit confirmation intercepts keys
+        if self.quit_confirm.is_some() {
+            return match key.code {
+                KeyCode::Enter => Action::DialogConfirm,
+                KeyCode::Esc => Action::DialogCancel,
+                KeyCode::Tab | KeyCode::Left | KeyCode::Right => Action::SwitchPanel,
+                _ => Action::None,
+            };
+        }
+
+        // Unsaved dialog intercepts keys when active
+        if self.unsaved_dialog.is_some() {
+            return match key.code {
+                KeyCode::Esc => Action::QuickSearchClear,
+                KeyCode::Enter => Action::DialogConfirm,
+                KeyCode::Tab | KeyCode::Right | KeyCode::Down => Action::MoveDown,
+                KeyCode::BackTab | KeyCode::Left | KeyCode::Up => Action::MoveUp,
+                _ => Action::None,
+            };
+        }
+
+        // CI panel intercepts keys when focused
+        if self.ci_focused.is_some() {
+            return match key.code {
+                KeyCode::Up => Action::MoveUp,
+                KeyCode::Down => Action::MoveDown,
+                KeyCode::Enter => Action::Enter,
+                KeyCode::Right => Action::CursorRight,
+                KeyCode::Left => Action::GoUp,
+                KeyCode::Char('o') => Action::OpenPr,
+                KeyCode::Tab => Action::SwitchPanel,
+                KeyCode::F(2) => Action::ToggleCi,
+                KeyCode::F(10) => Action::Quit,
+                _ => Action::None,
+            };
+        }
+
+        // Search dialog intercepts keys when active
+        if let Some(ref state) = self.search_dialog {
+            return Self::map_search_dialog_key(key, state.focused);
+        }
+
         match &self.mode {
             AppMode::Normal => self.map_normal_key(key),
             AppMode::QuickSearch => self.map_quick_search_key(key),
-            AppMode::Dialog(_) => self.map_dialog_key(key),
+            AppMode::Dialog(state) => Self::map_dialog_key(key, state.focused, state.has_input),
+            AppMode::MkdirDialog(state) => Self::map_mkdir_dialog_key(key, state.focused),
             AppMode::CopyDialog(state) => Self::map_copy_dialog_key(key, state.focused),
             AppMode::Viewing(_) | AppMode::HexViewing(_) => self.map_viewer_key(key),
             AppMode::Editing(_) => Self::map_editor_key(key),
@@ -312,6 +823,9 @@ impl App {
 
     fn map_normal_key(&self, key: KeyEvent) -> Action {
         match key.code {
+            KeyCode::Up if key.modifiers.contains(KeyModifiers::SHIFT) => Action::SelectMoveUp,
+            KeyCode::Down if key.modifiers.contains(KeyModifiers::SHIFT) => Action::SelectMoveDown,
+            KeyCode::Insert => Action::ToggleSelect,
             KeyCode::Up => Action::MoveUp,
             KeyCode::Down => Action::MoveDown,
             KeyCode::Home | KeyCode::Left => Action::MoveToTop,
@@ -341,11 +855,13 @@ impl App {
             KeyCode::F(8) => Action::Delete,
             KeyCode::F(9) => Action::CycleSort,
             KeyCode::F(10) => Action::Quit,
+            KeyCode::F(2) => Action::ToggleCi,
+            KeyCode::F(11) => Action::OpenPr,
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
             KeyCode::Char(c) if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' => {
                 Action::QuickSearch(c)
             }
-            KeyCode::Esc => Action::Quit,
+            // Esc does nothing in normal mode — use F10 to quit
             _ => Action::None,
         }
     }
@@ -360,29 +876,111 @@ impl App {
         }
     }
 
-    fn map_dialog_key(&self, key: KeyEvent) -> Action {
+    fn map_dialog_key(key: KeyEvent, focused: DialogField, has_input: bool) -> Action {
+        let on_buttons = matches!(focused, DialogField::ButtonOk | DialogField::ButtonCancel);
         match key.code {
-            KeyCode::Enter => Action::DialogConfirm,
             KeyCode::Esc => Action::DialogCancel,
-            KeyCode::Backspace => Action::DialogBackspace,
-            KeyCode::Char(c) => Action::DialogInput(c),
+            KeyCode::Enter => Action::DialogConfirm,
+            KeyCode::Tab => Action::MoveDown,
+            KeyCode::BackTab => Action::MoveUp,
+            KeyCode::Up if !has_input || on_buttons => Action::MoveUp,
+            KeyCode::Down if on_buttons => Action::None,
+            KeyCode::Down if !has_input || focused == DialogField::Input => Action::MoveDown,
+            KeyCode::Left if on_buttons => Action::SwitchPanel,
+            KeyCode::Right if on_buttons => Action::SwitchPanel,
+            KeyCode::Char(c) if focused == DialogField::Input => Action::DialogInput(c),
+            KeyCode::Backspace if focused == DialogField::Input => Action::DialogBackspace,
+            KeyCode::Left if focused == DialogField::Input => Action::CursorLeft,
+            KeyCode::Right if focused == DialogField::Input => Action::CursorRight,
+            KeyCode::Home if focused == DialogField::Input => Action::CursorLineStart,
+            KeyCode::End if focused == DialogField::Input => Action::CursorLineEnd,
             _ => Action::None,
         }
     }
 
-    fn map_copy_dialog_key(key: KeyEvent, focused: CopyDialogField) -> Action {
+    fn map_mkdir_dialog_key(key: KeyEvent, focused: MkdirDialogField) -> Action {
+        let on_buttons = matches!(
+            focused,
+            MkdirDialogField::ButtonOk | MkdirDialogField::ButtonCancel
+        );
         match key.code {
             KeyCode::Esc => Action::DialogCancel,
             KeyCode::Enter => Action::DialogConfirm,
             KeyCode::Tab => Action::MoveDown,
             KeyCode::BackTab => Action::MoveUp,
             KeyCode::Up => Action::MoveUp,
+            KeyCode::Down if on_buttons => Action::None, // stay on button row
             KeyCode::Down => Action::MoveDown,
+            KeyCode::Left if on_buttons => Action::SwitchPanel, // swap between buttons
+            KeyCode::Right if on_buttons => Action::SwitchPanel,
+            KeyCode::Char(' ') if focused == MkdirDialogField::ProcessMultiple => Action::Toggle,
+            KeyCode::Char(c) if focused == MkdirDialogField::Input => Action::DialogInput(c),
+            KeyCode::Backspace if focused == MkdirDialogField::Input => Action::DialogBackspace,
+            KeyCode::Left if focused == MkdirDialogField::Input => Action::CursorLeft,
+            KeyCode::Right if focused == MkdirDialogField::Input => Action::CursorRight,
+            KeyCode::Home if focused == MkdirDialogField::Input => Action::CursorLineStart,
+            KeyCode::End if focused == MkdirDialogField::Input => Action::CursorLineEnd,
+            _ => Action::None,
+        }
+    }
+
+    fn map_copy_dialog_key(key: KeyEvent, focused: CopyDialogField) -> Action {
+        let on_buttons = matches!(
+            focused,
+            CopyDialogField::ButtonCopy | CopyDialogField::ButtonCancel
+        );
+        match key.code {
+            KeyCode::Esc => Action::DialogCancel,
+            KeyCode::Enter => Action::DialogConfirm,
+            KeyCode::Tab => Action::MoveDown,
+            KeyCode::BackTab => Action::MoveUp,
+            KeyCode::Up => Action::MoveUp,
+            KeyCode::Down if on_buttons => Action::None,
+            KeyCode::Down => Action::MoveDown,
+            KeyCode::Left if on_buttons => Action::SwitchPanel,
+            KeyCode::Right if on_buttons => Action::SwitchPanel,
             KeyCode::Char(' ') if focused != CopyDialogField::Destination => Action::Toggle,
             KeyCode::Char(c) if focused == CopyDialogField::Destination => Action::DialogInput(c),
             KeyCode::Backspace if focused == CopyDialogField::Destination => {
                 Action::DialogBackspace
             }
+            KeyCode::Left if focused == CopyDialogField::Destination => Action::CursorLeft,
+            KeyCode::Right if focused == CopyDialogField::Destination => Action::CursorRight,
+            KeyCode::Home if focused == CopyDialogField::Destination => Action::CursorLineStart,
+            KeyCode::End if focused == CopyDialogField::Destination => Action::CursorLineEnd,
+            _ => Action::None,
+        }
+    }
+
+    fn map_search_dialog_key(key: KeyEvent, focused: SearchDialogField) -> Action {
+        let on_buttons = matches!(
+            focused,
+            SearchDialogField::ButtonFind | SearchDialogField::ButtonCancel
+        );
+        match key.code {
+            KeyCode::Esc => Action::DialogCancel,
+            KeyCode::Enter => Action::DialogConfirm,
+            KeyCode::Tab => Action::MoveDown,
+            KeyCode::BackTab => Action::MoveUp,
+            KeyCode::Up => Action::MoveUp,
+            KeyCode::Down if on_buttons => Action::None,
+            KeyCode::Down => Action::MoveDown,
+            KeyCode::Left if on_buttons => Action::SwitchPanel,
+            KeyCode::Right if on_buttons => Action::SwitchPanel,
+            KeyCode::Char(' ')
+                if matches!(
+                    focused,
+                    SearchDialogField::Direction | SearchDialogField::CaseSensitive
+                ) =>
+            {
+                Action::Toggle
+            }
+            KeyCode::Char(c) if focused == SearchDialogField::Query => Action::DialogInput(c),
+            KeyCode::Backspace if focused == SearchDialogField::Query => Action::DialogBackspace,
+            KeyCode::Left if focused == SearchDialogField::Query => Action::CursorLeft,
+            KeyCode::Right if focused == SearchDialogField::Query => Action::CursorRight,
+            KeyCode::Home if focused == SearchDialogField::Query => Action::CursorLineStart,
+            KeyCode::End if focused == SearchDialogField::Query => Action::CursorLineEnd,
             _ => Action::None,
         }
     }
@@ -405,22 +1003,36 @@ impl App {
     fn map_editor_key(key: KeyEvent) -> Action {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-
         if ctrl {
             return match key.code {
                 KeyCode::Char('s') => Action::EditorSave,
-                KeyCode::Char('k') => Action::EditorDeleteLine,
+                KeyCode::Char('k') | KeyCode::Char('y') => Action::EditorDeleteLine,
                 KeyCode::Char('c') => Action::CopySelection,
                 KeyCode::Char('a') => Action::SelectAll,
+                KeyCode::Char('f') => Action::SearchPrompt,
+                KeyCode::Char('z') if shift => Action::EditorRedo,
+                KeyCode::Char('z') => Action::EditorUndo,
                 KeyCode::Char('g') => Action::GotoLinePrompt,
                 KeyCode::Char('q') => Action::DialogCancel,
-                KeyCode::Home => Action::MoveToTop,
-                KeyCode::End => Action::MoveToBottom,
+                KeyCode::Left => Action::WordLeft,   // Ctrl+Left (Linux)
+                KeyCode::Right => Action::WordRight, // Ctrl+Right (Linux)
+                KeyCode::Home | KeyCode::Up => Action::MoveToTop,
+                KeyCode::End | KeyCode::Down => Action::MoveToBottom,
                 _ => Action::None,
             };
         }
 
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+
         match key.code {
+            KeyCode::F(7) if shift => Action::FindNext,
+            KeyCode::F(7) => Action::SearchPrompt,
+            // Fn+Opt+Up/Down on Mac → Alt+PageUp/PageDown → top/bottom of file
+            KeyCode::PageUp if alt => Action::MoveToTop,
+            KeyCode::PageDown if alt => Action::MoveToBottom,
+            // Opt+Left/Right on Mac → sends Alt+b/Alt+f (readline-style)
+            KeyCode::Char('b') if alt => Action::WordLeft,
+            KeyCode::Char('f') if alt => Action::WordRight,
             KeyCode::Up if shift => Action::SelectUp,
             KeyCode::Down if shift => Action::SelectDown,
             KeyCode::Left if shift => Action::SelectLeft,
@@ -456,7 +1068,114 @@ impl App {
             return;
         }
 
-        // Copy dialog and editor have their own dispatch
+        // F10 Quit — always confirm, works from any panel/mode
+        if matches!(action, Action::Quit)
+            && self.unsaved_dialog.is_none()
+            && self.quit_confirm.is_none()
+        {
+            let has_unsaved = matches!(self.mode, AppMode::Editing(ref e) if e.modified);
+            if has_unsaved {
+                self.unsaved_dialog = Some(UnsavedDialogField::ButtonSave);
+            } else {
+                self.quit_confirm = Some(true); // Quit button focused
+            }
+            return;
+        }
+
+        // Quit confirmation dialog
+        if self.quit_confirm.is_some() {
+            match action {
+                Action::DialogConfirm => {
+                    if self.quit_confirm == Some(true) {
+                        self.should_quit = true;
+                    } else {
+                        self.quit_confirm = None;
+                    }
+                }
+                Action::DialogCancel => {
+                    self.quit_confirm = None;
+                }
+                Action::SwitchPanel => {
+                    self.quit_confirm = Some(!self.quit_confirm.unwrap_or(true));
+                }
+                Action::None | Action::Tick | Action::Resize(_, _) => {}
+                _ => {}
+            }
+            return;
+        }
+
+        // Unsaved changes dialog intercepts when active
+        if self.unsaved_dialog.is_some() {
+            match action {
+                Action::DialogConfirm => {
+                    let focused = self.unsaved_dialog.unwrap();
+                    match focused {
+                        UnsavedDialogField::ButtonSave => {
+                            if let AppMode::Editing(ref mut e) = self.mode {
+                                match e.save() {
+                                    Ok(()) => {}
+                                    Err(err) => {
+                                        e.status_msg = Some(format!("Save failed: {}", err));
+                                        self.unsaved_dialog = None;
+                                        return;
+                                    }
+                                }
+                            }
+                            self.unsaved_dialog = None;
+                            self.mode = AppMode::Normal;
+                            self.needs_clear = true;
+                            self.reload_panels();
+                        }
+                        UnsavedDialogField::ButtonDiscard => {
+                            self.unsaved_dialog = None;
+                            self.mode = AppMode::Normal;
+                            self.needs_clear = true;
+                        }
+                        UnsavedDialogField::ButtonCancel => {
+                            self.unsaved_dialog = None;
+                        }
+                    }
+                }
+                Action::MoveDown => {
+                    if let Some(ref mut f) = self.unsaved_dialog {
+                        *f = f.next();
+                    }
+                }
+                Action::MoveUp => {
+                    if let Some(ref mut f) = self.unsaved_dialog {
+                        *f = f.prev();
+                    }
+                }
+                Action::QuickSearchClear => {
+                    // Esc — stay in editor
+                    self.unsaved_dialog = None;
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Search dialog overlay intercepts when active
+        if self.search_dialog.is_some() {
+            self.handle_search_dialog_action(action);
+            return;
+        }
+
+        // CI panel intercepts when focused
+        if self.ci_focused.is_some() {
+            self.handle_ci_action(action);
+            return;
+        }
+
+        // Dialog, mkdir dialog, copy dialog, and editor have their own dispatch
+        if matches!(self.mode, AppMode::Dialog(_)) {
+            self.handle_dialog_action(action);
+            return;
+        }
+        if matches!(self.mode, AppMode::MkdirDialog(_)) {
+            self.handle_mkdir_dialog_action(action);
+            return;
+        }
         if matches!(self.mode, AppMode::CopyDialog(_)) {
             self.handle_copy_dialog_action(action);
             return;
@@ -467,7 +1186,39 @@ impl App {
         }
 
         match action {
-            Action::None | Action::Tick => {}
+            Action::None => {}
+            Action::Tick => {
+                // Poll all CI panels for async results and downloads
+                for ci in self.ci_panels.iter_mut().flatten() {
+                    ci.poll();
+                    if let Some(result) = ci.poll_download() {
+                        match result {
+                            Ok(path) => {
+                                self.ci_focused = None;
+                                self.mode = AppMode::Editing(
+                                    crate::editor::EditorState::open(path),
+                                );
+                                return;
+                            }
+                            Err(e) => {
+                                self.status_message =
+                                    Some(format!("Download failed: {}", e));
+                            }
+                        }
+                    }
+                }
+                // Poll for async PR query results
+                if self.git_cache.poll_pending() {
+                    self.panels[0].refresh_git(&mut self.git_cache);
+                    self.panels[1].refresh_git(&mut self.git_cache);
+                }
+                // Check for filesystem changes (kqueue/inotify — zero cost if idle)
+                if let Some(ref w) = self.dir_watcher {
+                    if w.has_changes() {
+                        self.reload_panels();
+                    }
+                }
+            }
             Action::Quit => self.should_quit = true,
             Action::Resize(_, _) => {}
             Action::Toggle => self.handle_toggle_viewer(),
@@ -498,7 +1249,18 @@ impl App {
             | Action::SelectPageUp
             | Action::SelectPageDown
             | Action::SelectAll
-            | Action::CopySelection => {}
+            | Action::CopySelection
+            | Action::WordLeft
+            | Action::WordRight
+            | Action::EditorUndo
+            | Action::EditorRedo
+            | Action::SearchPrompt
+            | Action::FindNext => {}
+
+            // Panel multi-file selection
+            Action::ToggleSelect => self.active_panel_mut().toggle_select_current(),
+            Action::SelectMoveUp => self.active_panel_mut().select_move_up(),
+            Action::SelectMoveDown => self.active_panel_mut().select_move_down(),
 
             // Navigation
             Action::MoveUp => self.handle_move_up(),
@@ -525,6 +1287,41 @@ impl App {
                 self.active_panel_mut().cycle_sort();
             }
 
+            // CI / GitHub
+            Action::ToggleCi => {
+                let side = self.active_panel;
+                if self.ci_panels[side].is_some() {
+                    if self.ci_panels[side]
+                        .as_ref()
+                        .map(|ci| ci.download.is_some())
+                        .unwrap_or(false)
+                    {
+                        self.status_message =
+                            Some("Download in progress — wait for it to complete".to_string());
+                    } else {
+                        self.ci_panels[side] = None;
+                        if self.ci_focused == Some(side) {
+                            self.ci_focused = None;
+                        }
+                    }
+                } else if let Some(ref gi) = self.active_panel().git_info {
+                    let dir = self.active_panel().current_dir.clone();
+                    self.ci_panels[side] = Some(CiPanel::for_branch(&dir, &gi.branch));
+                    self.ci_focused = Some(side);
+                } else {
+                    self.status_message = Some("Not in a git repository".to_string());
+                }
+            }
+            Action::OpenPr => {
+                if let Some(ref gi) = self.active_panel().git_info {
+                    if let Some(ref pr) = gi.pr {
+                        crate::panel::github::open_url(&pr.url);
+                    } else {
+                        self.status_message = Some("No PR for this branch".to_string());
+                    }
+                }
+            }
+
             // Mouse
             Action::MouseClick(col, row) => self.handle_mouse_click(col, row),
             Action::MouseDoubleClick(col, row) => self.handle_mouse_double_click(col, row),
@@ -535,11 +1332,10 @@ impl App {
             Action::QuickSearch(c) => self.handle_quick_search(c),
             Action::QuickSearchClear => self.handle_quick_search_clear(),
 
-            // Dialog
-            Action::DialogConfirm => self.handle_dialog_confirm(),
+            // These can still fire from non-dialog modes (viewer cancel, quick search backspace)
             Action::DialogCancel => self.handle_dialog_cancel(),
-            Action::DialogInput(c) => self.handle_dialog_input(c),
             Action::DialogBackspace => self.handle_dialog_backspace(),
+            Action::DialogConfirm | Action::DialogInput(_) => {}
         }
     }
 
@@ -616,6 +1412,9 @@ impl App {
         if let Some(entry) = panel.selected_entry().cloned() {
             if entry.is_dir {
                 panel.navigate_into();
+                self.panels[self.active_panel].refresh_git(&mut self.git_cache);
+                self.update_watched_dirs();
+                self.check_ci_panels();
             } else {
                 self.open_file(entry.path);
             }
@@ -624,10 +1423,42 @@ impl App {
 
     fn handle_go_up(&mut self) {
         self.active_panel_mut().navigate_up();
+        self.panels[self.active_panel].refresh_git(&mut self.git_cache);
+        self.update_watched_dirs();
+        self.check_ci_panels();
     }
 
     fn handle_switch_panel(&mut self) {
-        self.active_panel = 1 - self.active_panel;
+        let has_left_ci = self.ci_panels[0].is_some();
+        let has_right_ci = self.ci_panels[1].is_some();
+
+        if !has_left_ci && !has_right_ci {
+            self.active_panel = 1 - self.active_panel;
+            return;
+        }
+
+        // Tab order: left, left_ci?, right, right_ci?
+        let mut order: Vec<(usize, bool)> = Vec::with_capacity(4);
+        order.push((0, false));
+        if has_left_ci { order.push((0, true)); }
+        order.push((1, false));
+        if has_right_ci { order.push((1, true)); }
+
+        let current = if let Some(ci_side) = self.ci_focused {
+            order.iter().position(|&(s, ci)| s == ci_side && ci)
+        } else {
+            order.iter().position(|&(s, ci)| s == self.active_panel && !ci)
+        };
+
+        let next = current.map(|i| (i + 1) % order.len()).unwrap_or(0);
+        let (side, is_ci) = order[next];
+
+        if is_ci {
+            self.ci_focused = Some(side);
+        } else {
+            self.ci_focused = None;
+            self.active_panel = side;
+        }
     }
 
     fn handle_goto_line_action(&mut self, action: Action) {
@@ -711,6 +1542,8 @@ impl App {
                 | Action::CursorRight
                 | Action::CursorLineStart
                 | Action::CursorLineEnd
+                | Action::WordLeft
+                | Action::WordRight
                 | Action::MoveToTop
                 | Action::MoveToBottom
                 | Action::PageUp
@@ -729,13 +1562,25 @@ impl App {
 
         match action {
             Action::None | Action::Tick | Action::Resize(_, _) => {}
-            Action::Quit => self.should_quit = true,
+            Action::Quit => {
+                let modified = matches!(self.mode, AppMode::Editing(ref e) if e.modified);
+                if modified {
+                    self.unsaved_dialog = Some(UnsavedDialogField::ButtonSave);
+                } else {
+                    self.should_quit = true;
+                }
+            }
             Action::GotoLinePrompt => {
                 self.goto_line_input = Some(String::new());
             }
             Action::DialogCancel => {
-                self.mode = AppMode::Normal;
-                self.needs_clear = true;
+                let modified = matches!(self.mode, AppMode::Editing(ref e) if e.modified);
+                if modified {
+                    self.unsaved_dialog = Some(UnsavedDialogField::ButtonSave);
+                } else {
+                    self.mode = AppMode::Normal;
+                    self.needs_clear = true;
+                }
             }
 
             // Selection
@@ -821,6 +1666,16 @@ impl App {
                     e.cursor_line_end();
                 }
             }
+            Action::WordLeft => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.word_left();
+                }
+            }
+            Action::WordRight => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.word_right();
+                }
+            }
             Action::MoveToTop => {
                 if let AppMode::Editing(ref mut e) = self.mode {
                     e.goto_top();
@@ -873,6 +1728,16 @@ impl App {
                     e.delete_line();
                 }
             }
+            Action::EditorUndo => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.undo();
+                }
+            }
+            Action::EditorRedo => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.redo();
+                }
+            }
             Action::EditorSave => {
                 if let AppMode::Editing(ref mut e) = self.mode {
                     match e.save() {
@@ -881,9 +1746,80 @@ impl App {
                     }
                 }
                 // Reload panels after save
-                self.panels[0].reload();
-                self.panels[1].reload();
+                self.reload_panels();
             }
+
+            // Search
+            Action::SearchPrompt => {
+                let (query, cursor, direction, case_sensitive) =
+                    if let AppMode::Editing(ref e) = self.mode {
+                        if let Some(ref p) = e.last_search {
+                            (
+                                p.query.clone(),
+                                p.query.chars().count(),
+                                p.direction,
+                                p.case_sensitive,
+                            )
+                        } else if !self.persisted.search_query.is_empty() {
+                            // Restore from persisted state
+                            let dir = if self.persisted.search_direction_forward {
+                                SearchDirection::Forward
+                            } else {
+                                SearchDirection::Backward
+                            };
+                            (
+                                self.persisted.search_query.clone(),
+                                self.persisted.search_query.chars().count(),
+                                dir,
+                                self.persisted.search_case_sensitive,
+                            )
+                        } else {
+                            (String::new(), 0, SearchDirection::Forward, false)
+                        }
+                    } else {
+                        (String::new(), 0, SearchDirection::Forward, false)
+                    };
+                self.search_dialog = Some(SearchDialogState {
+                    query,
+                    cursor,
+                    direction,
+                    case_sensitive,
+                    focused: SearchDialogField::Query,
+                });
+            }
+            Action::FindNext => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    if let Some(params) = e.last_search.clone() {
+                        if !e.find(&params) {
+                            e.status_msg = Some(format!("'{}' not found", params.query));
+                        }
+                    } else {
+                        e.status_msg = Some("No previous search".to_string());
+                    }
+                }
+            }
+
+            // Mouse
+            Action::MouseClick(col, row) => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.click_at(col, row);
+                }
+            }
+            Action::MouseScrollUp(_, _) => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.cursor_up();
+                    e.cursor_up();
+                    e.cursor_up();
+                }
+            }
+            Action::MouseScrollDown(_, _) => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.cursor_down();
+                    e.cursor_down();
+                    e.cursor_down();
+                }
+            }
+
             _ => {}
         }
     }
@@ -913,39 +1849,51 @@ impl App {
     // --- File operation handlers ---
 
     fn handle_copy(&mut self) {
-        if let Some(entry) = self.active_panel().selected_entry() {
-            if entry.name == ".." {
-                return;
-            }
-            let mut dest = self
-                .inactive_panel()
-                .current_dir
-                .to_string_lossy()
-                .to_string();
-            if !dest.ends_with('/') {
-                dest.push('/');
-            }
-            let name = entry.name.clone();
-            self.mode = AppMode::CopyDialog(CopyDialogState::new(name, dest, false));
+        let paths = self.active_panel().effective_selection_paths();
+        if paths.is_empty() {
+            return;
         }
+        let mut dest = self
+            .inactive_panel()
+            .current_dir
+            .to_string_lossy()
+            .to_string();
+        if !dest.ends_with('/') {
+            dest.push('/');
+        }
+        let display_name = if paths.len() == 1 {
+            paths[0]
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            format!("{} items", paths.len())
+        };
+        self.mode = AppMode::CopyDialog(CopyDialogState::new(display_name, paths, dest, false));
     }
 
     fn handle_move(&mut self) {
-        if let Some(entry) = self.active_panel().selected_entry() {
-            if entry.name == ".." {
-                return;
-            }
-            let mut dest = self
-                .inactive_panel()
-                .current_dir
-                .to_string_lossy()
-                .to_string();
-            if !dest.ends_with('/') {
-                dest.push('/');
-            }
-            let name = entry.name.clone();
-            self.mode = AppMode::CopyDialog(CopyDialogState::new(name, dest, true));
+        let paths = self.active_panel().effective_selection_paths();
+        if paths.is_empty() {
+            return;
         }
+        let mut dest = self
+            .inactive_panel()
+            .current_dir
+            .to_string_lossy()
+            .to_string();
+        if !dest.ends_with('/') {
+            dest.push('/');
+        }
+        let display_name = if paths.len() == 1 {
+            paths[0]
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            format!("{} items", paths.len())
+        };
+        self.mode = AppMode::CopyDialog(CopyDialogState::new(display_name, paths, dest, true));
     }
 
     fn handle_rename(&mut self) {
@@ -954,41 +1902,51 @@ impl App {
                 return;
             }
             let name = entry.name.clone();
+            let cursor = name.chars().count();
             self.mode = AppMode::Dialog(DialogState {
                 kind: DialogKind::InputRename,
                 title: "Rename".to_string(),
                 message: format!("Rename '{}':", name),
                 input: name,
+                cursor,
                 has_input: true,
+                focused: DialogField::Input,
             });
         }
     }
 
     fn handle_create_dir(&mut self) {
-        self.mode = AppMode::Dialog(DialogState {
-            kind: DialogKind::InputMkdir,
-            title: "Create Directory".to_string(),
-            message: "Enter directory name:".to_string(),
-            input: String::new(),
-            has_input: true,
-        });
+        self.mode = AppMode::MkdirDialog(MkdirDialogState::new());
     }
 
     fn handle_delete(&mut self) {
-        if let Some(entry) = self.active_panel().selected_entry() {
-            if entry.name == ".." {
-                return;
-            }
-            let name = entry.name.clone();
-            let kind = if entry.is_dir { "directory" } else { "file" };
-            self.mode = AppMode::Dialog(DialogState {
-                kind: DialogKind::ConfirmDelete,
-                title: "Delete".to_string(),
-                message: format!("Delete {} '{}'?", kind, name),
-                input: String::new(),
-                has_input: false,
-            });
+        let paths = self.active_panel().effective_selection_paths();
+        if paths.is_empty() {
+            return;
         }
+        let message = if paths.len() == 1 {
+            let name = paths[0]
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let kind = if paths[0].is_dir() {
+                "directory"
+            } else {
+                "file"
+            };
+            format!("Delete {} '{}'?", kind, name)
+        } else {
+            format!("Delete {} items?", paths.len())
+        };
+        self.mode = AppMode::Dialog(DialogState {
+            kind: DialogKind::ConfirmDelete,
+            title: "Delete".to_string(),
+            message,
+            input: String::new(),
+            cursor: 0,
+            has_input: false,
+            focused: DialogField::ButtonOk,
+        });
     }
 
     fn handle_view_file(&mut self) {
@@ -1005,6 +1963,417 @@ impl App {
                 self.status_message = Some(format!("__EDIT__{}", entry.path.to_string_lossy()));
             }
         }
+    }
+
+    // --- Search dialog handler ---
+
+    fn handle_search_dialog_action(&mut self, action: Action) {
+        match action {
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
+            Action::Quit => self.should_quit = true,
+            Action::DialogCancel => {
+                self.search_dialog = None;
+            }
+            Action::DialogConfirm => {
+                let is_cancel = self
+                    .search_dialog
+                    .as_ref()
+                    .map(|s| s.focused == SearchDialogField::ButtonCancel)
+                    .unwrap_or(false);
+                if is_cancel {
+                    self.search_dialog = None;
+                } else {
+                    self.confirm_search_dialog();
+                }
+            }
+            Action::MoveUp => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.focused = s.focused.prev();
+                }
+            }
+            Action::MoveDown => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.focused = s.focused.next();
+                }
+            }
+            Action::Toggle => {
+                if let Some(ref mut s) = self.search_dialog {
+                    match s.focused {
+                        SearchDialogField::Direction => {
+                            s.direction = match s.direction {
+                                SearchDirection::Forward => SearchDirection::Backward,
+                                SearchDirection::Backward => SearchDirection::Forward,
+                            };
+                        }
+                        SearchDialogField::CaseSensitive => {
+                            s.case_sensitive = !s.case_sensitive;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Action::DialogInput(c) => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.insert_char(c);
+                }
+            }
+            Action::DialogBackspace => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.delete_char_backward();
+                }
+            }
+            Action::CursorLeft => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.cursor_left();
+                }
+            }
+            Action::CursorRight => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.cursor_right();
+                }
+            }
+            Action::CursorLineStart => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.cursor_home();
+                }
+            }
+            Action::CursorLineEnd => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.cursor_end();
+                }
+            }
+            Action::SwitchPanel => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.focused = match s.focused {
+                        SearchDialogField::ButtonFind => SearchDialogField::ButtonCancel,
+                        SearchDialogField::ButtonCancel => SearchDialogField::ButtonFind,
+                        other => other,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn confirm_search_dialog(&mut self) {
+        let state = match self.search_dialog.take() {
+            Some(s) => s,
+            None => return,
+        };
+
+        if state.query.is_empty() {
+            return;
+        }
+
+        use crate::editor::SearchParams;
+        let params = SearchParams {
+            query: state.query,
+            direction: state.direction,
+            case_sensitive: state.case_sensitive,
+        };
+
+        // Persist search parameters
+        self.persisted.search_query = params.query.clone();
+        self.persisted.search_direction_forward =
+            matches!(params.direction, SearchDirection::Forward);
+        self.persisted.search_case_sensitive = params.case_sensitive;
+
+        if let AppMode::Editing(ref mut e) = self.mode {
+            e.last_search = Some(params.clone());
+            if !e.find(&params) {
+                e.status_msg = Some(format!("'{}' not found", params.query));
+            }
+        }
+    }
+
+    // --- CI panel handler ---
+
+    fn handle_ci_action(&mut self, action: Action) {
+        let side = match self.ci_focused {
+            Some(s) => s,
+            None => return,
+        };
+
+        match action {
+            Action::None | Action::Tick | Action::Resize(_, _) => {
+                // Poll all CI panels and check downloads
+                for ci in self.ci_panels.iter_mut() {
+                    if let Some(ref mut ci) = ci {
+                        ci.poll();
+                        if let Some(result) = ci.poll_download() {
+                            match result {
+                                Ok(path) => {
+                                    // Open downloaded log in editor
+                                    self.ci_focused = None;
+                                    self.mode = AppMode::Editing(
+                                        crate::editor::EditorState::open(path),
+                                    );
+                                    return;
+                                }
+                                Err(e) => {
+                                    self.status_message = Some(format!("Download failed: {}", e));
+                                }
+                            }
+                        }
+                    }
+                }
+                if let Some(ref w) = self.dir_watcher {
+                    if w.has_changes() {
+                        self.reload_panels();
+                    }
+                }
+                if self.git_cache.poll_pending() {
+                    self.panels[0].refresh_git(&mut self.git_cache);
+                    self.panels[1].refresh_git(&mut self.git_cache);
+                }
+            }
+            Action::MoveUp => {
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.move_up();
+                }
+            }
+            Action::MoveDown => {
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.move_down();
+                }
+            }
+            Action::Enter => {
+                // enter() returns Some if a step was selected for log viewing
+                let log_info = self.ci_panels[side]
+                    .as_mut()
+                    .and_then(|ci| ci.enter());
+                if let Some((run_id, step)) = log_info {
+                    self.start_ci_log_download(side, run_id, &step);
+                }
+            }
+            Action::CursorRight => {
+                // Right: expand only (don't download on steps)
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.enter(); // returns Some for steps but we ignore it
+                }
+            }
+            Action::GoUp => {
+                // Left: collapse expanded check, or jump to parent check from step
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.collapse_or_parent();
+                }
+            }
+            Action::SwitchPanel => {
+                self.handle_switch_panel();
+            }
+            Action::ToggleCi => {
+                if self.ci_panels[side]
+                    .as_ref()
+                    .map(|ci| ci.download.is_some())
+                    .unwrap_or(false)
+                {
+                    self.status_message =
+                        Some("Download in progress — wait for it to complete".to_string());
+                } else {
+                    self.ci_panels[side] = None;
+                    self.ci_focused = None;
+                }
+            }
+            Action::OpenPr => {
+                if let Some(ref ci) = self.ci_panels[side] {
+                    if let Some(url) = ci.selected_url() {
+                        crate::panel::github::open_url(url);
+                    }
+                }
+            }
+            // Let mouse events through to the normal handler
+            Action::MouseClick(col, row) => self.handle_mouse_click(col, row),
+            Action::MouseDoubleClick(col, row) => self.handle_mouse_double_click(col, row),
+            Action::MouseScrollUp(col, row) => self.handle_mouse_scroll(col, row, -3),
+            Action::MouseScrollDown(col, row) => self.handle_mouse_scroll(col, row, 3),
+            _ => {}
+        }
+    }
+
+    fn start_ci_log_download(&mut self, side: usize, run_id: u64, step: &crate::ci::CiStep) {
+        let ci = match &mut self.ci_panels[side] {
+            Some(ci) => ci,
+            None => return,
+        };
+
+        if ci.download.is_some() {
+            return; // already downloading
+        }
+
+        // Build output filename in the active panel's current directory
+        let safe_name: String = step
+            .name
+            .chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+            .collect();
+        let output_path = self.panels[self.active_panel]
+            .current_dir
+            .join(format!("{}.log", safe_name));
+
+        if let Some(ref url) = step.log_url {
+            // Azure: direct URL download
+            ci.download = Some(crate::ci::LogDownload::start(
+                url,
+                output_path,
+                step.name.clone(),
+            ));
+        } else if run_id > 0 {
+            // GitHub Actions: per-job log download (plain text, fast)
+            let repo = ci.repo.clone();
+            // Find the job_id for this check
+            let job_id = self.ci_panels[side]
+                .as_ref()
+                .and_then(|ci| {
+                    if let crate::ci::CiView::Tree { items, selected, .. } = &ci.view {
+                        // Walk back from selected to find the parent check
+                        for i in (0..=*selected).rev() {
+                            if let crate::ci::TreeItem::Check { check, .. } = &items[i] {
+                                return Some(check.job_id);
+                            }
+                        }
+                    }
+                    None
+                })
+                .unwrap_or(0);
+
+            if job_id > 0 {
+                let ci = self.ci_panels[side].as_mut().unwrap();
+                ci.download = Some(crate::ci::LogDownload::start_github(
+                    &repo,
+                    run_id,
+                    step.number,
+                    &step.name,
+                    output_path,
+                    job_id,
+                ));
+            } else {
+                self.status_message = Some("Cannot download: no job ID found".to_string());
+            }
+            return;
+        } else {
+            self.status_message = Some("Cannot download logs: no run ID found".to_string());
+        }
+    }
+
+    // --- Mkdir dialog handler ---
+
+    fn handle_mkdir_dialog_action(&mut self, action: Action) {
+        match action {
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
+            Action::Quit => self.should_quit = true,
+            Action::DialogCancel => {
+                self.mode = AppMode::Normal;
+            }
+            Action::DialogConfirm => {
+                let is_cancel = matches!(
+                    self.mode,
+                    AppMode::MkdirDialog(MkdirDialogState {
+                        focused: MkdirDialogField::ButtonCancel,
+                        ..
+                    })
+                );
+                if is_cancel {
+                    self.mode = AppMode::Normal;
+                } else {
+                    self.confirm_mkdir_dialog();
+                }
+            }
+            Action::MoveUp => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.focused = state.focused.prev();
+                }
+            }
+            Action::MoveDown => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.focused = state.focused.next();
+                }
+            }
+            Action::Toggle => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.process_multiple = !state.process_multiple;
+                }
+            }
+            Action::DialogInput(c) => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    if state.focused == MkdirDialogField::Input {
+                        state.insert_char(c);
+                    }
+                }
+            }
+            Action::DialogBackspace => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    if state.focused == MkdirDialogField::Input {
+                        state.delete_char_backward();
+                    }
+                }
+            }
+            Action::CursorLeft => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.cursor_left();
+                }
+            }
+            Action::CursorRight => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.cursor_right();
+                }
+            }
+            Action::CursorLineStart => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.cursor_home();
+                }
+            }
+            Action::CursorLineEnd => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.cursor_end();
+                }
+            }
+            Action::SwitchPanel => {
+                // Swap between OK and Cancel buttons
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.focused = match state.focused {
+                        MkdirDialogField::ButtonOk => MkdirDialogField::ButtonCancel,
+                        MkdirDialogField::ButtonCancel => MkdirDialogField::ButtonOk,
+                        other => other,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn confirm_mkdir_dialog(&mut self) {
+        let (input, process_multiple) = match &self.mode {
+            AppMode::MkdirDialog(s) => (s.input.clone(), s.process_multiple),
+            _ => return,
+        };
+
+        if input.is_empty() {
+            self.mode = AppMode::Normal;
+            return;
+        }
+
+        let dir = self.active_panel().current_dir.clone();
+        let names: Vec<&str> = if process_multiple {
+            input.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+        } else {
+            vec![input.trim()]
+        };
+
+        let mut first_err: Option<anyhow::Error> = None;
+        for name in names {
+            if let Err(e) = fs_ops::create_directory(&dir, name) {
+                first_err = Some(e);
+                break;
+            }
+        }
+
+        match first_err {
+            None => self.status_message = None,
+            Some(e) => self.status_message = Some(format!("Error: {}", e)),
+        }
+
+        self.mode = AppMode::Normal;
+        self.reload_panels();
     }
 
     // --- Copy dialog handler ---
@@ -1048,15 +2417,44 @@ impl App {
             Action::DialogInput(c) => {
                 if let AppMode::CopyDialog(ref mut state) = self.mode {
                     if state.focused == CopyDialogField::Destination {
-                        state.destination.push(c);
+                        state.insert_char(c);
                     }
                 }
             }
             Action::DialogBackspace => {
                 if let AppMode::CopyDialog(ref mut state) = self.mode {
                     if state.focused == CopyDialogField::Destination {
-                        state.destination.pop();
+                        state.delete_char_backward();
                     }
+                }
+            }
+            Action::CursorLeft => {
+                if let AppMode::CopyDialog(ref mut state) = self.mode {
+                    state.cursor_left();
+                }
+            }
+            Action::CursorRight => {
+                if let AppMode::CopyDialog(ref mut state) = self.mode {
+                    state.cursor_right();
+                }
+            }
+            Action::CursorLineStart => {
+                if let AppMode::CopyDialog(ref mut state) = self.mode {
+                    state.cursor_home();
+                }
+            }
+            Action::CursorLineEnd => {
+                if let AppMode::CopyDialog(ref mut state) = self.mode {
+                    state.cursor_end();
+                }
+            }
+            Action::SwitchPanel => {
+                if let AppMode::CopyDialog(ref mut state) = self.mode {
+                    state.focused = match state.focused {
+                        CopyDialogField::ButtonCopy => CopyDialogField::ButtonCancel,
+                        CopyDialogField::ButtonCancel => CopyDialogField::ButtonCopy,
+                        other => other,
+                    };
                 }
             }
             _ => {}
@@ -1064,37 +2462,42 @@ impl App {
     }
 
     fn confirm_copy_dialog(&mut self) {
-        let (source_path, dest, is_move) = {
+        let (source_paths, dest, is_move) = {
             let state = match &self.mode {
                 AppMode::CopyDialog(s) => s,
                 _ => return,
             };
-            let source = self.active_panel().selected_entry().map(|e| e.path.clone());
-            if source.is_none() {
+            if state.source_paths.is_empty() {
                 self.mode = AppMode::Normal;
                 return;
             }
             (
-                source.unwrap(),
+                state.source_paths.clone(),
                 PathBuf::from(&state.destination),
                 state.is_move,
             )
         };
 
-        let result = if is_move {
-            fs_ops::move_entry(&source_path, &dest)
-        } else {
-            fs_ops::copy_entry(&source_path, &dest)
-        };
+        let mut first_err: Option<anyhow::Error> = None;
+        for source_path in &source_paths {
+            let result = if is_move {
+                fs_ops::move_entry(source_path, &dest)
+            } else {
+                fs_ops::copy_entry(source_path, &dest)
+            };
+            if let Err(e) = result {
+                first_err = Some(e);
+                break;
+            }
+        }
 
-        match result {
-            Ok(()) => self.status_message = None,
-            Err(e) => self.status_message = Some(format!("Error: {}", e)),
+        match first_err {
+            None => self.status_message = None,
+            Some(e) => self.status_message = Some(format!("Error: {}", e)),
         }
 
         self.mode = AppMode::Normal;
-        self.panels[0].reload();
-        self.panels[1].reload();
+        self.reload_panels();
     }
 
     // --- Mouse handlers ---
@@ -1127,17 +2530,62 @@ impl App {
     }
 
     fn handle_mouse_click(&mut self, col: u16, row: u16) {
+        if let AppMode::Editing(ref mut e) = self.mode {
+            e.click_at(col, row);
+            return;
+        }
         if matches!(
             self.mode,
-            AppMode::Viewing(_) | AppMode::HexViewing(_) | AppMode::Editing(_)
+            AppMode::Viewing(_) | AppMode::HexViewing(_)
         ) {
             return;
         }
-        if matches!(self.mode, AppMode::Dialog(_) | AppMode::CopyDialog(_)) {
+        if matches!(
+            self.mode,
+            AppMode::Dialog(_) | AppMode::MkdirDialog(_) | AppMode::CopyDialog(_)
+        ) {
             return;
         }
 
+        // Check if click is in a CI panel
+        for side in 0..2 {
+            if let Some(ci_area) = self.ci_panel_areas[side] {
+                if col >= ci_area.x
+                    && col < ci_area.x + ci_area.width
+                    && row >= ci_area.y
+                    && row < ci_area.y + ci_area.height
+                {
+                    self.ci_focused = Some(side);
+                    // Compute which item was clicked
+                    if let Some(ref mut ci) = self.ci_panels[side] {
+                        // Account for border (1 row for top border)
+                        let inner_y = ci_area.y + 1;
+                        if row >= inner_y {
+                            let click_offset = (row - inner_y) as usize;
+                            let scroll = match &ci.view {
+                                crate::ci::CiView::Tree { scroll, .. } => *scroll,
+                                _ => 0,
+                            };
+                            let target = scroll + click_offset;
+                            let item_count = match &ci.view {
+                                crate::ci::CiView::Tree { items, .. } => items.len(),
+                                _ => 0,
+                            };
+                            if target < item_count {
+                                if let crate::ci::CiView::Tree { selected, .. } = &mut ci.view {
+                                    *selected = target;
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
+        // Click on a file panel — unfocus CI
         if let Some(panel_idx) = self.panel_at(col, row) {
+            self.ci_focused = None;
             self.active_panel = panel_idx;
             if let Some(entry_idx) = self.row_to_entry_index(panel_idx, row) {
                 self.panels[panel_idx].table_state.select(Some(entry_idx));
@@ -1168,7 +2616,7 @@ impl App {
                 }
                 return;
             }
-            AppMode::Dialog(_) | AppMode::CopyDialog(_) => return,
+            AppMode::Dialog(_) | AppMode::MkdirDialog(_) | AppMode::CopyDialog(_) => return,
             _ => {}
         }
 
@@ -1204,9 +2652,87 @@ impl App {
         self.mode = AppMode::Normal;
     }
 
-    // --- Simple dialog handlers ---
+    // --- Dialog handler (delete, rename) ---
 
-    fn handle_dialog_confirm(&mut self) {
+    fn handle_dialog_action(&mut self, action: Action) {
+        match action {
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
+            Action::Quit => self.should_quit = true,
+            Action::DialogCancel => {
+                self.mode = AppMode::Normal;
+            }
+            Action::DialogConfirm => {
+                let is_cancel = matches!(
+                    self.mode,
+                    AppMode::Dialog(DialogState {
+                        focused: DialogField::ButtonCancel,
+                        ..
+                    })
+                );
+                if is_cancel {
+                    self.mode = AppMode::Normal;
+                } else {
+                    self.confirm_dialog();
+                }
+            }
+            Action::MoveUp => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.focused = state.focused.prev(state.has_input);
+                }
+            }
+            Action::MoveDown => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.focused = state.focused.next(state.has_input);
+                }
+            }
+            Action::DialogInput(c) => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    if state.focused == DialogField::Input {
+                        state.insert_char(c);
+                    }
+                }
+            }
+            Action::DialogBackspace => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    if state.focused == DialogField::Input {
+                        state.delete_char_backward();
+                    }
+                }
+            }
+            Action::CursorLeft => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.cursor_left();
+                }
+            }
+            Action::CursorRight => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.cursor_right();
+                }
+            }
+            Action::CursorLineStart => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.cursor_home();
+                }
+            }
+            Action::CursorLineEnd => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.cursor_end();
+                }
+            }
+            Action::SwitchPanel => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.focused = match state.focused {
+                        DialogField::ButtonOk => DialogField::ButtonCancel,
+                        DialogField::ButtonCancel => DialogField::ButtonOk,
+                        other => other,
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn confirm_dialog(&mut self) {
         let dialog = match &self.mode {
             AppMode::Dialog(d) => d.clone(),
             _ => return,
@@ -1214,18 +2740,17 @@ impl App {
 
         let result = match dialog.kind {
             DialogKind::ConfirmDelete => {
-                if let Some(entry) = self.active_panel().selected_entry() {
-                    fs_ops::delete_entry(&entry.path)
-                } else {
-                    Ok(())
+                let paths = self.active_panel().effective_selection_paths();
+                let mut first_err: Option<anyhow::Error> = None;
+                for path in &paths {
+                    if let Err(e) = fs_ops::delete_entry(path) {
+                        first_err = Some(e);
+                        break;
+                    }
                 }
-            }
-            DialogKind::InputMkdir => {
-                if dialog.input.is_empty() {
-                    Ok(())
-                } else {
-                    let dir = self.active_panel().current_dir.clone();
-                    fs_ops::create_directory(&dir, &dialog.input)
+                match first_err {
+                    Some(e) => Err(e),
+                    None => Ok(()),
                 }
             }
             DialogKind::InputRename => {
@@ -1245,8 +2770,7 @@ impl App {
         }
 
         self.mode = AppMode::Normal;
-        self.panels[0].reload();
-        self.panels[1].reload();
+        self.reload_panels();
     }
 
     fn handle_dialog_cancel(&mut self) {
@@ -1255,42 +2779,23 @@ impl App {
                 self.mode = AppMode::Normal;
                 self.needs_clear = true;
             }
-            AppMode::Dialog(_) => {
-                self.mode = AppMode::Normal;
-            }
             _ => {}
-        }
-    }
-
-    fn handle_dialog_input(&mut self, c: char) {
-        if let AppMode::Dialog(ref mut dialog) = self.mode {
-            if dialog.has_input {
-                dialog.input.push(c);
-            }
         }
     }
 
     fn handle_dialog_backspace(&mut self) {
-        match &mut self.mode {
-            AppMode::Dialog(ref mut dialog) => {
-                if dialog.has_input {
-                    dialog.input.pop();
+        if let AppMode::QuickSearch = &self.mode {
+            let panel = &mut self.panels[self.active_panel];
+            if let Some(ref mut query) = panel.quick_search {
+                query.pop();
+                if query.is_empty() {
+                    panel.quick_search = None;
+                    self.mode = AppMode::Normal;
+                } else {
+                    let q = query.clone();
+                    panel.jump_to_match(&q);
                 }
             }
-            AppMode::QuickSearch => {
-                let panel = &mut self.panels[self.active_panel];
-                if let Some(ref mut query) = panel.quick_search {
-                    query.pop();
-                    if query.is_empty() {
-                        panel.quick_search = None;
-                        self.mode = AppMode::Normal;
-                    } else {
-                        let q = query.clone();
-                        panel.jump_to_match(&q);
-                    }
-                }
-            }
-            _ => {}
         }
     }
 }

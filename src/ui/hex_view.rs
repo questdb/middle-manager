@@ -32,14 +32,45 @@ pub fn render(frame: &mut Frame, area: Rect, hex: &mut HexViewerState) {
 
     let rows_data = hex.visible_rows_data();
 
+    let inner_width = inner.width as usize;
+    let bg_style = Style::default().bg(t.bg);
+
     let mut lines: Vec<Line> = Vec::with_capacity(hex.visible_rows + 1);
 
     // Header row
-    lines.push(build_header(t.bg));
+    let mut header = build_header(t.bg);
+    let used: usize = header.spans.iter().map(|s| s.width()).sum();
+    if used < inner_width {
+        header.spans.push(Span::styled(" ".repeat(inner_width - used), bg_style));
+    }
+    lines.push(header);
 
     // Data rows
     for (offset, bytes) in &rows_data {
-        lines.push(build_data_row(*offset, bytes, t.bg));
+        let mut row = build_data_row(*offset, bytes, t.bg);
+        let used: usize = row.spans.iter().map(|s| s.width()).sum();
+        if used < inner_width {
+            row.spans.push(Span::styled(" ".repeat(inner_width - used), bg_style));
+        }
+        lines.push(row);
+    }
+
+    // Fill empty lines below content
+    while lines.len() < (hex.visible_rows + 1) {
+        lines.push(Line::from(Span::styled(" ".repeat(inner_width), bg_style)));
+    }
+
+    // Fill every cell to prevent artifacts
+    {
+        let buf = frame.buffer_mut();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_symbol(" ");
+                    cell.set_style(bg_style);
+                }
+            }
+        }
     }
 
     let paragraph = Paragraph::new(lines).block(block);

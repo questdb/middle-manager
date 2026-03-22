@@ -1,78 +1,78 @@
-use ratatui::layout::{Constraint, Layout, Rect};
-use ratatui::style::{Modifier, Style};
+use ratatui::layout::Rect;
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use ratatui::Frame;
 
-use crate::app::DialogState;
+use crate::app::{DialogField, DialogState};
 use crate::theme::theme;
+
+use super::dialog_helpers::{self as dh};
 
 pub fn render(frame: &mut Frame, dialog: &DialogState) -> Rect {
     let t = theme();
-    let area = centered_rect(50, 7, frame.area());
+    let dbg = t.dialog_bg;
+    let dialog_h: u16 = if dialog.has_input { 9 } else { 7 };
+    let layout = dh::render_dialog_frame(frame, &format!(" {} ", dialog.title), 56, dialog_h);
+    let (normal, highlight, input_normal) = dh::dialog_styles();
 
-    frame.render_widget(Clear, area);
-
-    let block = Block::default()
-        .title(Span::styled(
-            format!(" {} ", dialog.title),
-            t.dialog_title_style(),
-        ))
-        .borders(Borders::ALL)
-        .border_style(t.dialog_border_style())
-        .style(t.dialog_bg_style());
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-        Constraint::Length(1),
-    ])
-    .split(inner);
-
-    frame.render_widget(
-        Paragraph::new(dialog.message.as_str())
-            .style(t.dialog_text_style())
-            .wrap(Wrap { trim: true }),
-        chunks[0],
+    // y=1: message
+    dh::render_line(
+        frame,
+        layout.content,
+        1,
+        Line::from(Span::styled(
+            format!("{:<width$}", dialog.message, width = layout.cw),
+            normal,
+        )),
     );
+
+    let buttons_y;
 
     if dialog.has_input {
-        let input_line = Line::from(vec![
-            Span::styled(
-                "> ",
-                Style::default().fg(t.dialog_prompt_fg).bg(t.dialog_bg),
-            ),
-            Span::styled(
-                &dialog.input,
-                Style::default()
-                    .fg(t.dialog_input_fg)
-                    .bg(t.dialog_bg)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled("_", Style::default().fg(t.dialog_cursor_fg).bg(t.dialog_bg)),
-        ]);
-        frame.render_widget(Paragraph::new(input_line), chunks[2]);
+        // y=2: input field
+        let input_focused = dialog.focused == DialogField::Input;
+        let input_style = if input_focused { highlight } else { input_normal };
+        let input_text = format!("{:<width$}", dialog.input, width = layout.cw);
+        dh::render_line(
+            frame,
+            layout.content,
+            2,
+            Line::from(Span::styled(input_text, input_style)),
+        );
+
+        // y=4: separator
+        dh::render_separator(frame, layout.area, layout.inner.y + 4, t.dialog_border_style());
+        buttons_y = 5;
+
+        if input_focused {
+            let cursor_x = layout.content.x + dialog.cursor as u16;
+            let cursor_y = layout.content.y + 2;
+            if cursor_x < layout.content.x + layout.content.width {
+                frame.set_cursor_position((cursor_x, cursor_y));
+            }
+        }
+    } else {
+        // y=3: separator
+        dh::render_separator(frame, layout.area, layout.inner.y + 3, t.dialog_border_style());
+        buttons_y = 4;
     }
 
-    let hints = if dialog.has_input {
-        "Enter: Confirm  |  Esc: Cancel"
+    let (ok_label, cancel_label) = if dialog.has_input {
+        ("{ OK }", "[ Cancel ]")
     } else {
-        "Enter: Yes  |  Esc: No"
+        ("{ Yes }", "[ No ]")
     };
-    frame.render_widget(
-        Paragraph::new(hints).style(Style::default().fg(t.dialog_hint_fg).bg(t.dialog_bg)),
-        chunks[3],
+    dh::render_buttons(
+        frame,
+        layout.content,
+        buttons_y,
+        &[
+            (ok_label, dialog.focused == DialogField::ButtonOk),
+            (cancel_label, dialog.focused == DialogField::ButtonCancel),
+        ],
+        Style::default().fg(t.dialog_text_fg).bg(dbg),
+        highlight,
     );
 
-    area
-}
-
-fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    Rect::new(x, y, width.min(area.width), height.min(area.height))
+    layout.outer
 }

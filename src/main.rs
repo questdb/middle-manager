@@ -1,13 +1,17 @@
 mod action;
 mod app;
+mod ci;
 mod editor;
 mod event;
 mod fs_ops;
 mod hex_viewer;
 mod panel;
+mod state;
+mod syntax;
 mod theme;
 mod ui;
 mod viewer;
+mod watcher;
 
 use std::io;
 use std::process::Command;
@@ -31,7 +35,12 @@ fn main() -> Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
+        let _ = execute!(
+            io::stdout(),
+            LeaveAlternateScreen,
+            DisableMouseCapture,
+            crossterm::cursor::SetCursorStyle::DefaultUserShape
+        );
         original_hook(panic_info);
     }));
 
@@ -49,9 +58,13 @@ fn main() -> Result<()> {
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
-        DisableMouseCapture
+        DisableMouseCapture,
+        crossterm::cursor::SetCursorStyle::DefaultUserShape
     )?;
     terminal.show_cursor()?;
+    // Flush to ensure all escape sequences are fully written before the shell takes over
+    use std::io::Write;
+    let _ = io::stdout().flush();
 
     if let Err(e) = result {
         eprintln!("Error: {}", e);
@@ -62,7 +75,7 @@ fn main() -> Result<()> {
 
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::new();
-    let events = EventHandler::new(Duration::from_millis(250));
+    let mut events = EventHandler::new(Duration::from_millis(250));
 
     loop {
         // Clear if needed (e.g. after leaving a full-screen mode)
@@ -97,8 +110,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
             events.drain();
 
             // Reload panels
-            app.panels[0].reload();
-            app.panels[1].reload();
+            app.reload_panels();
             continue;
         }
 
@@ -124,6 +136,10 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
             break;
         }
     }
+
+    // Save state and stop event thread before returning
+    app.save_state();
+    events.stop();
 
     Ok(())
 }

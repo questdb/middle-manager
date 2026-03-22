@@ -1,8 +1,9 @@
 use ratatui::layout::Rect;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
 
 use crate::theme::theme;
 use crate::viewer::ViewerState;
@@ -29,25 +30,48 @@ pub fn render(frame: &mut Frame, area: Rect, viewer: &mut ViewerState) {
 
     let visible = viewer.visible_line_iter();
 
-    let lines: Vec<Line> = visible
-        .iter()
-        .map(|(line_num, text)| {
-            Line::from(vec![
-                Span::styled(
-                    format!("{:>6} ", line_num + 1),
-                    Style::default().fg(t.viewer_line_num_fg).bg(t.bg),
-                ),
-                Span::styled(
-                    text.as_str(),
-                    Style::default().fg(t.viewer_text_fg).bg(t.bg),
-                ),
-            ])
-        })
-        .collect();
+    let inner_width = inner.width as usize;
+    let bg_style = Style::default().bg(t.bg);
+    let line_num_style = Style::default().fg(t.viewer_line_num_fg).bg(t.bg);
+    let text_style = Style::default().fg(t.viewer_text_fg).bg(t.bg);
 
-    let paragraph = Paragraph::new(lines)
-        .block(block)
-        .wrap(Wrap { trim: false });
+    let line_num_width: usize = 7; // "{:>6} " = 7 chars
+    let text_width = inner_width.saturating_sub(line_num_width);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(viewer.visible_lines);
+    for (line_num, text) in visible.iter() {
+        let num_span = Span::styled(format!("{:>6} ", line_num + 1), line_num_style);
+        let display_text = sanitize_and_truncate(text, text_width);
+        let text_span = Span::styled(display_text, text_style);
+
+        let mut spans = vec![num_span, text_span];
+
+        let used: usize = spans.iter().map(|s| s.width()).sum();
+        if used < inner_width {
+            spans.push(Span::styled(" ".repeat(inner_width - used), bg_style));
+        }
+
+        lines.push(Line::from(spans));
+    }
+
+    while lines.len() < viewer.visible_lines {
+        lines.push(Line::from(Span::styled(" ".repeat(inner_width), bg_style)));
+    }
+
+    // Fill every cell to prevent artifacts
+    {
+        let buf = frame.buffer_mut();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if let Some(cell) = buf.cell_mut((x, y)) {
+                    cell.set_symbol(" ");
+                    cell.set_style(bg_style);
+                }
+            }
+        }
+    }
+
+    let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, area);
 
     let hint = " Scroll: Arrows/PgUp/Dn | Home/End | g: Go to | F4/Tab: Hex | q/Esc: Close ";
@@ -64,4 +88,32 @@ pub fn render(frame: &mut Frame, area: Rect, viewer: &mut ViewerState) {
         )),
         hint_area,
     );
+}
+
+/// Expand tabs to spaces, strip control characters, and truncate to `max_width` display cells.
+fn sanitize_and_truncate(text: &str, max_width: usize) -> String {
+    let mut result = String::new();
+    let mut width = 0;
+    for ch in text.chars() {
+        if ch == '\t' {
+            let spaces = 4 - (width % 4);
+            for _ in 0..spaces {
+                if width >= max_width {
+                    break;
+                }
+                result.push(' ');
+                width += 1;
+            }
+        } else if ch.is_control() {
+            continue;
+        } else {
+            let ch_width = UnicodeWidthChar::width(ch).unwrap_or(1);
+            if width + ch_width > max_width {
+                break;
+            }
+            result.push(ch);
+            width += ch_width;
+        }
+    }
+    result
 }
