@@ -44,6 +44,16 @@ impl Panel {
     }
 
     pub fn reload(&mut self) {
+        // Preserve selection across reload by remembering selected paths
+        let selected_paths: std::collections::HashSet<std::path::PathBuf> = self
+            .selected_indices
+            .iter()
+            .filter_map(|&i| self.entries.get(i).map(|e| e.path.clone()))
+            .collect();
+
+        // Preserve the cursor position by name
+        let cursor_name = self.selected_entry().map(|e| e.name.clone());
+
         self.entries.clear();
         self.selected_indices.clear();
         self.error = None;
@@ -70,6 +80,22 @@ impl Panel {
         }
 
         self.apply_sort();
+
+        // Restore selection
+        if !selected_paths.is_empty() {
+            for (i, entry) in self.entries.iter().enumerate() {
+                if selected_paths.contains(&entry.path) {
+                    self.selected_indices.insert(i);
+                }
+            }
+        }
+
+        // Restore cursor position
+        if let Some(name) = cursor_name {
+            if let Some(idx) = self.entries.iter().position(|e| e.name == name) {
+                self.table_state.select(Some(idx));
+            }
+        }
     }
 
     /// Refresh git info using the shared cache.
@@ -196,10 +222,11 @@ impl Panel {
     /// Toggle selection on the current entry and move cursor down.
     pub fn toggle_select_current(&mut self) {
         let idx = self.selected_index();
-        if idx < self.entries.len() && self.entries[idx].name != ".." {
-            if !self.selected_indices.remove(&idx) {
-                self.selected_indices.insert(idx);
-            }
+        if idx < self.entries.len()
+            && self.entries[idx].name != ".."
+            && !self.selected_indices.remove(&idx)
+        {
+            self.selected_indices.insert(idx);
         }
         self.move_selection(1);
     }

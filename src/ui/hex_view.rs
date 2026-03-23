@@ -41,7 +41,9 @@ pub fn render(frame: &mut Frame, area: Rect, hex: &mut HexViewerState) {
     let mut header = build_header(t.bg);
     let used: usize = header.spans.iter().map(|s| s.width()).sum();
     if used < inner_width {
-        header.spans.push(Span::styled(" ".repeat(inner_width - used), bg_style));
+        header
+            .spans
+            .push(Span::styled(" ".repeat(inner_width - used), bg_style));
     }
     lines.push(header);
 
@@ -50,7 +52,8 @@ pub fn render(frame: &mut Frame, area: Rect, hex: &mut HexViewerState) {
         let mut row = build_data_row(*offset, bytes, t.bg);
         let used: usize = row.spans.iter().map(|s| s.width()).sum();
         if used < inner_width {
-            row.spans.push(Span::styled(" ".repeat(inner_width - used), bg_style));
+            row.spans
+                .push(Span::styled(" ".repeat(inner_width - used), bg_style));
         }
         lines.push(row);
     }
@@ -152,7 +155,7 @@ fn build_data_row(offset: u64, bytes: &[u8], bg: ratatui::style::Color) -> Line<
     for i in 0..BYTES_PER_ROW {
         if i < bytes.len() {
             let b = bytes[i];
-            if b >= 0x20 && b <= 0x7E {
+            if (0x20..=0x7E).contains(&b) {
                 spans.push(Span::styled(String::from(b as char), ascii_printable));
             } else {
                 spans.push(Span::styled(".", ascii_dot));

@@ -12,6 +12,11 @@ pub enum Action {
     Enter,
     GoUp,
     SwitchPanel,
+    SwitchPanelReverse,
+    CopyName,
+    CopyPath,
+    GotoPathPrompt,
+    FuzzySearchPrompt,
 
     // Panel multi-file selection
     ToggleSelect,
@@ -90,6 +95,11 @@ pub enum Action {
     // GitHub / CI
     OpenPr,
     ToggleCi,
+
+    // Terminal
+    ToggleTerminal,
+    TerminalInput(Vec<u8>),
+    TerminalOpenFile,
 
     // Application
     Quit,

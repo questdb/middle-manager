@@ -1,13 +1,279 @@
-use ratatui::layout::{Constraint, Rect};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Row, Table};
 use ratatui::Frame;
 
+use crate::app::{FuzzySearchState, GotoPathState};
 use crate::panel::github::PrCheckStatus;
 use crate::panel::sort::SortField;
 use crate::panel::Panel;
 use crate::theme::{theme, Theme};
+
+pub fn render_with_overlays(
+    frame: &mut Frame,
+    area: Rect,
+    panel: &mut Panel,
+    is_active: bool,
+    goto_path: Option<&GotoPathState>,
+    fuzzy_search: Option<&FuzzySearchState>,
+) {
+    // Determine which overlay is active (at most one at a time)
+    let has_overlay = goto_path.is_some() || fuzzy_search.is_some();
+
+    if has_overlay {
+        let [input_area, panel_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
+
+        render(frame, panel_area, panel, is_active);
+
+        if let Some(state) = goto_path {
+            render_goto_path_input(frame, input_area, state);
+            // Render completions as an overlay on top of the panel
+            if state.completions.len() > 1 {
+                let comp_rows = (state.completions.len() as u16).min(8);
+                let available_h = panel_area.height.saturating_sub(2);
+                let inner_rows = comp_rows.min(available_h);
+                let comp_area = Rect::new(
+                    area.x,
+                    input_area.y + input_area.height,
+                    area.width,
+                    inner_rows,
+                );
+                render_completions(frame, comp_area, state);
+            }
+        } else if let Some(state) = fuzzy_search {
+            render_fuzzy_input(frame, input_area, state);
+            if !state.results.is_empty() {
+                let result_rows = (state.results.len() as u16).min(8);
+                let available_h = panel_area.height.saturating_sub(2);
+                let inner_rows = result_rows.min(available_h);
+                let comp_area = Rect::new(
+                    area.x,
+                    input_area.y + input_area.height,
+                    area.width,
+                    inner_rows,
+                );
+                render_fuzzy_results(frame, comp_area, state);
+            }
+        }
+    } else {
+        render(frame, area, panel, is_active);
+    }
+}
+
+fn render_goto_path_input(frame: &mut Frame, area: Rect, state: &GotoPathState) {
+    let t = theme();
+
+    let prompt_style = Style::default()
+        .fg(t.dialog_title_fg)
+        .bg(t.dialog_bg)
+        .add_modifier(Modifier::BOLD);
+    let input_style = Style::default().fg(t.dialog_text_fg).bg(t.dialog_bg);
+    let cursor_style = Style::default().fg(t.dialog_bg).bg(t.dialog_text_fg);
+
+    let before = &state.input[..state.cursor];
+    let cursor_char = state.input[state.cursor..].chars().next();
+    let after_start = state.cursor + cursor_char.map(|c| c.len_utf8()).unwrap_or(0);
+    let after = &state.input[after_start..];
+
+    // Scroll the input so the cursor is visible
+    let prompt_prefix = " Go: ";
+    let available = area.width as usize - prompt_prefix.len();
+    let before_chars = before.chars().count();
+    let visible_before = if before_chars > available {
+        // Skip enough characters from the start to fit in available width
+        let skip = before_chars - available + 1;
+        before
+            .char_indices()
+            .nth(skip)
+            .map(|(i, _)| &before[i..])
+            .unwrap_or("")
+    } else {
+        before
+    };
+
+    let mut spans = vec![
+        Span::styled(prompt_prefix, prompt_style),
+        Span::styled(visible_before.to_string(), input_style),
+    ];
+    if let Some(c) = cursor_char {
+        spans.push(Span::styled(c.to_string(), cursor_style));
+    } else {
+        spans.push(Span::styled(" ", cursor_style));
+    }
+    if !after.is_empty() {
+        spans.push(Span::styled(after.to_string(), input_style));
+    }
+
+    let line = Line::from(spans);
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(line).style(Style::default().bg(t.dialog_bg)),
+        area,
+    );
+}
+
+fn render_completions(frame: &mut Frame, area: Rect, state: &GotoPathState) {
+    let t = theme();
+    let normal = Style::default().fg(t.dialog_text_fg).bg(t.dialog_bg);
+    let highlight = Style::default()
+        .fg(t.dialog_input_fg_focused)
+        .bg(t.dialog_input_bg)
+        .add_modifier(Modifier::BOLD);
+    let border_style = Style::default().fg(t.dialog_border_fg).bg(t.dialog_bg);
+
+    // Add 2 rows for top/bottom border
+    let total_h = area.height + 2;
+    let bordered_area = Rect::new(
+        area.x,
+        area.y,
+        area.width,
+        total_h.min(area.y + area.height + 2 - area.y),
+    );
+
+    frame.render_widget(Clear, bordered_area);
+
+    let block = Block::default()
+        .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+        .border_style(border_style)
+        .style(Style::default().bg(t.dialog_bg));
+
+    let inner = block.inner(bordered_area);
+    frame.render_widget(block, bordered_area);
+
+    // Scroll the list so the selected item is visible
+    let max_visible = inner.height as usize;
+    let selected = state.comp_index.unwrap_or(0);
+    let scroll = if selected >= max_visible {
+        selected - max_visible + 1
+    } else {
+        0
+    };
+
+    for i in 0..max_visible {
+        let idx = scroll + i;
+        let y = inner.y + i as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let row_area = Rect::new(inner.x, y, inner.width, 1);
+
+        if idx < state.completions.len() {
+            let name = &state.completions[idx];
+            let style = if state.comp_index == Some(idx) {
+                highlight
+            } else {
+                normal
+            };
+            let display = format!(" /{}", name);
+            let line = Line::from(Span::styled(display, style));
+            let p = ratatui::widgets::Paragraph::new(line).style(style);
+            frame.render_widget(p, row_area);
+        }
+    }
+}
+
+fn render_fuzzy_input(frame: &mut Frame, area: Rect, state: &FuzzySearchState) {
+    let t = theme();
+    let prompt_style = Style::default()
+        .fg(t.dialog_title_fg)
+        .bg(t.dialog_bg)
+        .add_modifier(Modifier::BOLD);
+    let input_style = Style::default().fg(t.dialog_text_fg).bg(t.dialog_bg);
+    let cursor_style = Style::default().fg(t.dialog_bg).bg(t.dialog_text_fg);
+
+    let before = &state.input[..state.cursor];
+    let cursor_char = state.input[state.cursor..].chars().next();
+    let after_start = state.cursor + cursor_char.map(|c| c.len_utf8()).unwrap_or(0);
+    let after = &state.input[after_start..];
+
+    let prompt_prefix = " Find: ";
+    let available = area.width as usize - prompt_prefix.len();
+    let before_chars = before.chars().count();
+    let visible_before = if before_chars > available {
+        let skip = before_chars - available + 1;
+        before
+            .char_indices()
+            .nth(skip)
+            .map(|(i, _)| &before[i..])
+            .unwrap_or("")
+    } else {
+        before
+    };
+
+    let mut spans = vec![
+        Span::styled(prompt_prefix, prompt_style),
+        Span::styled(visible_before.to_string(), input_style),
+    ];
+    if let Some(c) = cursor_char {
+        spans.push(Span::styled(c.to_string(), cursor_style));
+    } else {
+        spans.push(Span::styled(" ", cursor_style));
+    }
+    if !after.is_empty() {
+        spans.push(Span::styled(after.to_string(), input_style));
+    }
+
+    let count = state.results.len();
+    let count_str = format!(" {}", count);
+    spans.push(Span::styled(
+        count_str,
+        Style::default().fg(t.dialog_title_fg).bg(t.dialog_bg),
+    ));
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(Line::from(spans)).style(Style::default().bg(t.dialog_bg)),
+        area,
+    );
+}
+
+fn render_fuzzy_results(frame: &mut Frame, area: Rect, state: &FuzzySearchState) {
+    let t = theme();
+    let normal = Style::default().fg(t.dialog_text_fg).bg(t.dialog_bg);
+    let highlight = Style::default()
+        .fg(t.dialog_input_fg_focused)
+        .bg(t.dialog_input_bg)
+        .add_modifier(Modifier::BOLD);
+    let border_style = Style::default().fg(t.dialog_border_fg).bg(t.dialog_bg);
+
+    let total_h = area.height + 2;
+    let bordered_area = Rect::new(area.x, area.y, area.width, total_h);
+
+    frame.render_widget(Clear, bordered_area);
+
+    let block = Block::default()
+        .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+        .border_style(border_style)
+        .style(Style::default().bg(t.dialog_bg));
+
+    let inner = block.inner(bordered_area);
+    frame.render_widget(block, bordered_area);
+
+    let max_visible = inner.height as usize;
+
+    for i in 0..max_visible {
+        let y = inner.y + i as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let row_area = Rect::new(inner.x, y, inner.width, 1);
+
+        if let Some(&(path_idx, _score)) = state.results.get(i) {
+            let path = &state.all_paths[path_idx];
+            let style = if state.selected == i {
+                highlight
+            } else {
+                normal
+            };
+            let display = format!(" {}", path);
+            let line = Line::from(Span::styled(display, style));
+            let p = ratatui::widgets::Paragraph::new(line).style(style);
+            frame.render_widget(p, row_area);
+        }
+    }
+}
 
 pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool) {
     let t = theme();
@@ -47,10 +313,7 @@ pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool)
 
     // Build rows
     let has_git = panel.git_info.is_some();
-    let git_statuses = panel
-        .git_info
-        .as_ref()
-        .map(|gi| &gi.statuses);
+    let git_statuses = panel.git_info.as_ref().map(|gi| &gi.statuses);
 
     let rows: Vec<Row> = panel
         .entries
@@ -58,9 +321,7 @@ pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool)
         .enumerate()
         .map(|(idx, entry)| {
             let is_selected = panel.selected_indices.contains(&idx);
-            let git_status = git_statuses
-                .and_then(|s| s.get(&entry.name))
-                .copied();
+            let git_status = git_statuses.and_then(|s| s.get(&entry.name)).copied();
 
             let name_style = if is_selected {
                 t.selected_style()
@@ -116,11 +377,13 @@ pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool)
             } else {
                 Style::default().fg(t.date_fg).bg(t.bg)
             }));
-            cells.push(Cell::from(entry.formatted_permissions()).style(if is_selected {
-                t.selected_style()
-            } else {
-                Style::default().fg(t.perm_fg).bg(t.bg)
-            }));
+            cells.push(
+                Cell::from(entry.formatted_permissions()).style(if is_selected {
+                    t.selected_style()
+                } else {
+                    Style::default().fg(t.perm_fg).bg(t.bg)
+                }),
+            );
 
             Row::new(cells)
         })
@@ -198,7 +461,12 @@ pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool)
 }
 
 /// Build the panel border title: " /path  ⎇ branch  ● 6 ? 1 "
-fn build_panel_title(panel: &Panel, t: &Theme, is_active: bool, panel_width: usize) -> Vec<Span<'static>> {
+fn build_panel_title(
+    panel: &Panel,
+    t: &Theme,
+    is_active: bool,
+    panel_width: usize,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::with_capacity(12);
     let title_style = if is_active {
         Style::default()
@@ -288,22 +556,38 @@ fn build_git_suffix(panel: &Panel, t: &Theme) -> Vec<Span<'static>> {
 
     // PR status
     if let Some(ref pr) = gi.pr {
-        let (pr_color, check_marker) = match pr.checks {
-            PrCheckStatus::Pass => (t.git_added_fg, pr.checks.marker()),
-            PrCheckStatus::Fail => (t.git_deleted_fg, pr.checks.marker()),
-            PrCheckStatus::Pending => (ratatui::style::Color::Yellow, pr.checks.marker()),
-            PrCheckStatus::None => (t.git_branch_fg, ""),
-        };
         spans.push(Span::styled("  ", sep));
-        spans.push(Span::styled(
-            format!("PR #{}", pr.number),
-            Style::default().fg(t.git_branch_fg).bg(t.bg),
-        ));
-        if !check_marker.is_empty() {
+
+        if pr.state == "MERGED" {
+            // Merged PR — show ● in magenta, ignore check status
             spans.push(Span::styled(
-                format!(" {}", check_marker),
-                Style::default().fg(pr_color).bg(t.bg),
+                format!("PR #{} \u{25cf}", pr.number),
+                Style::default().fg(ratatui::style::Color::Magenta).bg(t.bg),
             ));
+        } else if pr.state == "CLOSED" {
+            // Closed without merge
+            spans.push(Span::styled(
+                format!("PR #{} \u{2718}", pr.number),
+                Style::default().fg(t.git_deleted_fg).bg(t.bg),
+            ));
+        } else {
+            // Open PR — show check status
+            let (pr_color, check_marker) = match pr.checks {
+                PrCheckStatus::Pass => (t.git_added_fg, pr.checks.marker()),
+                PrCheckStatus::Fail => (t.git_deleted_fg, pr.checks.marker()),
+                PrCheckStatus::Pending => (ratatui::style::Color::Yellow, pr.checks.marker()),
+                PrCheckStatus::None => (t.git_branch_fg, ""),
+            };
+            spans.push(Span::styled(
+                format!("PR #{}", pr.number),
+                Style::default().fg(t.git_branch_fg).bg(t.bg),
+            ));
+            if !check_marker.is_empty() {
+                spans.push(Span::styled(
+                    format!(" {}", check_marker),
+                    Style::default().fg(pr_color).bg(t.bg),
+                ));
+            }
         }
     }
 

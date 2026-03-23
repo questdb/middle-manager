@@ -7,14 +7,15 @@ use std::time::Instant;
 const DOUBLE_CLICK_MS: u128 = 400;
 
 use crate::action::Action;
+use crate::ci::CiPanel;
 use crate::editor::EditorState;
 use crate::fs_ops;
 use crate::hex_viewer::HexViewerState;
-use crate::ci::CiPanel;
 use crate::panel::git::GitCache;
 use crate::panel::sort::SortField;
 use crate::panel::Panel;
 use crate::state::AppState;
+use crate::terminal::TerminalPanel;
 use crate::watcher::DirWatcher;
 
 fn sort_field_from_u8(v: u8) -> SortField {
@@ -63,6 +64,211 @@ pub struct App {
     pub ci_panels: [Option<CiPanel>; 2],
     /// Which CI panel has focus (None = file panel has focus).
     pub ci_focused: Option<usize>,
+    /// Go-to-path input per panel side. When Some, a path editor is shown at the top of the panel.
+    pub goto_path: [Option<GotoPathState>; 2],
+    /// Fuzzy file search per panel side.
+    pub fuzzy_search: [Option<FuzzySearchState>; 2],
+    /// Embedded terminal panel (runs `claude`).
+    pub terminal_panel: Option<TerminalPanel>,
+    /// Which panel side the terminal occupies (0=left, 1=right).
+    pub terminal_side: usize,
+    /// Whether the terminal panel has focus.
+    pub terminal_focused: bool,
+    /// Wakeup sender for the event loop (given to terminal reader threads).
+    wakeup_sender: Option<crate::event::WakeupSender>,
+}
+
+pub struct GotoPathState {
+    pub input: String,
+    pub cursor: usize,
+    /// Tab-completion candidates (directory names).
+    pub completions: Vec<String>,
+    /// Currently highlighted completion index.
+    pub comp_index: Option<usize>,
+    /// The prefix that was being completed (used to detect when input changes).
+    pub comp_base: Option<String>,
+}
+
+/// Pre-computed data for each file path to avoid per-keystroke allocation.
+struct FileEntry {
+    /// Original relative path.
+    path: String,
+    /// Lowercase chars (pre-computed once).
+    lower_chars: Vec<char>,
+    /// Original chars (for word boundary checks).
+    chars: Vec<char>,
+    /// Char index where the filename starts (after last '/').
+    filename_start: usize,
+}
+
+pub struct FuzzySearchState {
+    pub input: String,
+    pub cursor: usize,
+    /// Pre-computed file entries.
+    entries: Vec<FileEntry>,
+    /// Filtered + ranked results: (index into entries, score).
+    pub results: Vec<(usize, i64)>,
+    /// Currently highlighted result index.
+    pub selected: usize,
+    /// Public access to paths for rendering.
+    pub all_paths: Vec<String>,
+}
+
+impl FuzzySearchState {
+    fn new(paths: Vec<String>) -> Self {
+        let entries: Vec<FileEntry> = paths
+            .iter()
+            .map(|p| {
+                let chars: Vec<char> = p.chars().collect();
+                let lower_chars: Vec<char> = p.to_lowercase().chars().collect();
+                let filename_start = chars
+                    .iter()
+                    .rposition(|&c| c == '/')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
+                FileEntry {
+                    path: p.clone(),
+                    lower_chars,
+                    chars,
+                    filename_start,
+                }
+            })
+            .collect();
+
+        let mut state = Self {
+            input: String::new(),
+            cursor: 0,
+            entries,
+            results: Vec::new(),
+            selected: 0,
+            all_paths: paths,
+        };
+        state.update_results();
+        state
+    }
+
+    fn update_results(&mut self) {
+        self.results.clear();
+        if self.input.is_empty() {
+            self.results = (0..self.entries.len().min(100)).map(|i| (i, 0)).collect();
+        } else {
+            // Pre-compute query chars once
+            let query_chars: Vec<char> = self.input.to_lowercase().chars().collect();
+            for (i, entry) in self.entries.iter().enumerate() {
+                if let Some(score) = fuzzy_score_precomputed(&query_chars, entry) {
+                    self.results.push((i, score));
+                }
+            }
+            self.results.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            self.results.truncate(100);
+        }
+        self.selected = 0;
+    }
+}
+
+/// Fuzzy match against pre-computed entry data. Zero allocation.
+fn fuzzy_score_precomputed(query_chars: &[char], entry: &FileEntry) -> Option<i64> {
+    if query_chars.is_empty() {
+        return Some(0);
+    }
+    // Quick reject: query longer than candidate
+    if query_chars.len() > entry.lower_chars.len() {
+        return None;
+    }
+
+    let mut score: i64 = 0;
+    let mut qi = 0;
+    let mut prev_match: Option<usize> = None;
+
+    for (ci, &cc) in entry.lower_chars.iter().enumerate() {
+        if qi < query_chars.len() && cc == query_chars[qi] {
+            score += 1;
+
+            // Consecutive match bonus
+            if let Some(prev) = prev_match {
+                if ci == prev + 1 {
+                    score += 5;
+                }
+            }
+
+            // Word boundary bonus
+            if ci == 0
+                || ci == entry.filename_start
+                || matches!(
+                    entry.chars.get(ci.wrapping_sub(1)),
+                    Some('/' | '.' | '_' | '-' | ' ')
+                )
+            {
+                score += 10;
+            }
+
+            // Filename match bonus
+            if ci >= entry.filename_start {
+                score += 3;
+            }
+
+            prev_match = Some(ci);
+            qi += 1;
+        }
+    }
+
+    if qi == query_chars.len() {
+        score -= (entry.path.len() as i64) / 10;
+        Some(score)
+    } else {
+        None
+    }
+}
+
+fn collect_files_recursive(
+    root: &std::path::Path,
+    max_files: usize,
+    max_depth: usize,
+) -> Vec<String> {
+    const SKIP_DIRS: &[&str] = &[
+        ".git",
+        "node_modules",
+        "target",
+        ".hg",
+        "__pycache__",
+        ".DS_Store",
+        ".idea",
+        ".vscode",
+    ];
+    let mut result = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > max_depth || result.len() >= max_files {
+            break;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            if result.len() >= max_files {
+                break;
+            }
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                if !SKIP_DIRS.contains(&name_str.as_ref()) {
+                    stack.push((entry.path(), depth + 1));
+                }
+            } else if file_type.is_file() {
+                if let Ok(rel) = entry.path().strip_prefix(root) {
+                    result.push(rel.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    result.sort_unstable();
+    result
 }
 
 pub enum AppMode {
@@ -71,9 +277,9 @@ pub enum AppMode {
     Dialog(DialogState),
     MkdirDialog(MkdirDialogState),
     CopyDialog(CopyDialogState),
-    Viewing(ViewerState),
-    HexViewing(HexViewerState),
-    Editing(EditorState),
+    Viewing(Box<ViewerState>),
+    HexViewing(Box<HexViewerState>),
+    Editing(Box<EditorState>),
 }
 
 // --- Simple dialog (delete, mkdir, rename) ---
@@ -357,24 +563,24 @@ impl SearchDialogField {
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum UnsavedDialogField {
-    ButtonSave,
-    ButtonDiscard,
-    ButtonCancel,
+    Save,
+    Discard,
+    Cancel,
 }
 
 impl UnsavedDialogField {
     pub fn next(self) -> Self {
         match self {
-            Self::ButtonSave => Self::ButtonDiscard,
-            Self::ButtonDiscard => Self::ButtonCancel,
-            Self::ButtonCancel => Self::ButtonSave,
+            Self::Save => Self::Discard,
+            Self::Discard => Self::Cancel,
+            Self::Cancel => Self::Save,
         }
     }
     pub fn prev(self) -> Self {
         match self {
-            Self::ButtonSave => Self::ButtonCancel,
-            Self::ButtonDiscard => Self::ButtonSave,
-            Self::ButtonCancel => Self::ButtonDiscard,
+            Self::Save => Self::Cancel,
+            Self::Discard => Self::Save,
+            Self::Cancel => Self::Discard,
         }
     }
 }
@@ -654,7 +860,18 @@ impl App {
             ci_panels: [None, None],
             ci_focused: None,
             quit_confirm: None,
+            goto_path: [None, None],
+            fuzzy_search: [None, None],
+            terminal_panel: None,
+            terminal_side: 1,
+            terminal_focused: false,
+            wakeup_sender: None,
         }
+    }
+
+    /// Set the wakeup sender (called from main after creating the event handler).
+    pub fn set_wakeup_sender(&mut self, sender: crate::event::WakeupSender) {
+        self.wakeup_sender = Some(sender);
     }
 
     /// Save current state to disk.
@@ -768,12 +985,48 @@ impl App {
             };
         }
 
+        // Go-to-path input intercepts keys
+        if self.goto_path[self.active_panel].is_some() {
+            return match key.code {
+                KeyCode::Esc => Action::DialogCancel,
+                KeyCode::Enter => Action::DialogConfirm,
+                KeyCode::Backspace => Action::DialogBackspace,
+                KeyCode::Left => Action::CursorLeft,
+                KeyCode::Right => Action::CursorRight,
+                KeyCode::Home => Action::CursorLineStart,
+                KeyCode::End => Action::CursorLineEnd,
+                KeyCode::Tab | KeyCode::Down => Action::MoveDown, // next completion
+                KeyCode::BackTab | KeyCode::Up => Action::MoveUp, // prev completion
+                KeyCode::Char(c) => Action::DialogInput(c),
+                _ => Action::None,
+            };
+        }
+
+        // Fuzzy file search input intercepts keys
+        if self.fuzzy_search[self.active_panel].is_some() {
+            return match key.code {
+                KeyCode::Esc => Action::DialogCancel,
+                KeyCode::Enter => Action::DialogConfirm,
+                KeyCode::Backspace => Action::DialogBackspace,
+                KeyCode::Left => Action::CursorLeft,
+                KeyCode::Right => Action::CursorRight,
+                KeyCode::Home => Action::CursorLineStart,
+                KeyCode::End => Action::CursorLineEnd,
+                KeyCode::Tab | KeyCode::Down => Action::MoveDown,
+                KeyCode::BackTab | KeyCode::Up => Action::MoveUp,
+                KeyCode::Char(c) => Action::DialogInput(c),
+                _ => Action::None,
+            };
+        }
+
         // Quit confirmation intercepts keys
         if self.quit_confirm.is_some() {
             return match key.code {
                 KeyCode::Enter => Action::DialogConfirm,
                 KeyCode::Esc => Action::DialogCancel,
-                KeyCode::Tab | KeyCode::Left | KeyCode::Right => Action::SwitchPanel,
+                KeyCode::Tab | KeyCode::Left | KeyCode::Right | KeyCode::BackTab => {
+                    Action::SwitchPanel
+                }
                 _ => Action::None,
             };
         }
@@ -789,16 +1042,35 @@ impl App {
             };
         }
 
+        // Terminal panel intercepts keys when focused
+        if self.terminal_focused && self.terminal_panel.is_some() {
+            return match key.code {
+                // These keys are reserved for middle-manager
+                KeyCode::F(5) => Action::TerminalOpenFile,
+                KeyCode::F(12) => Action::ToggleTerminal,
+                KeyCode::F(10) => Action::Quit,
+                // F1 switches focus away from terminal (Tab forwarded to claude)
+                KeyCode::F(1) => Action::SwitchPanel,
+                // Everything else (including Tab) is forwarded to the terminal
+                _ => Action::TerminalInput(crate::terminal::encode_key_event(key)),
+            };
+        }
+
         // CI panel intercepts keys when focused
         if self.ci_focused.is_some() {
             return match key.code {
                 KeyCode::Up => Action::MoveUp,
                 KeyCode::Down => Action::MoveDown,
+                KeyCode::PageUp => Action::PageUp,
+                KeyCode::PageDown => Action::PageDown,
+                KeyCode::Home => Action::MoveToTop,
+                KeyCode::End => Action::MoveToBottom,
                 KeyCode::Enter => Action::Enter,
                 KeyCode::Right => Action::CursorRight,
                 KeyCode::Left => Action::GoUp,
                 KeyCode::Char('o') => Action::OpenPr,
                 KeyCode::Tab => Action::SwitchPanel,
+                KeyCode::BackTab => Action::SwitchPanelReverse,
                 KeyCode::F(2) => Action::ToggleCi,
                 KeyCode::F(10) => Action::Quit,
                 _ => Action::None,
@@ -835,6 +1107,7 @@ impl App {
             KeyCode::Enter => Action::Enter,
             KeyCode::Backspace => Action::GoUp,
             KeyCode::Tab => Action::SwitchPanel,
+            KeyCode::BackTab => Action::SwitchPanelReverse,
             KeyCode::F(3) => Action::ViewFile,
             KeyCode::F(4) => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -857,7 +1130,16 @@ impl App {
             KeyCode::F(10) => Action::Quit,
             KeyCode::F(2) => Action::ToggleCi,
             KeyCode::F(11) => Action::OpenPr,
+            KeyCode::F(12) => Action::ToggleTerminal,
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
+            KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::CopyName,
+            KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::CopyPath,
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::GotoPathPrompt
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::FuzzySearchPrompt
+            }
             KeyCode::Char(c) if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' => {
                 Action::QuickSearch(c)
             }
@@ -1014,7 +1296,7 @@ impl App {
                 KeyCode::Char('z') => Action::EditorUndo,
                 KeyCode::Char('g') => Action::GotoLinePrompt,
                 KeyCode::Char('q') => Action::DialogCancel,
-                KeyCode::Left => Action::WordLeft,   // Ctrl+Left (Linux)
+                KeyCode::Left => Action::WordLeft, // Ctrl+Left (Linux)
                 KeyCode::Right => Action::WordRight, // Ctrl+Right (Linux)
                 KeyCode::Home | KeyCode::Up => Action::MoveToTop,
                 KeyCode::End | KeyCode::Down => Action::MoveToBottom,
@@ -1068,6 +1350,18 @@ impl App {
             return;
         }
 
+        // Go-to-path input intercepts all input when active
+        if self.goto_path[self.active_panel].is_some() {
+            self.handle_goto_path_action(action);
+            return;
+        }
+
+        // Fuzzy file search intercepts all input when active
+        if self.fuzzy_search[self.active_panel].is_some() {
+            self.handle_fuzzy_search_action(action);
+            return;
+        }
+
         // F10 Quit — always confirm, works from any panel/mode
         if matches!(action, Action::Quit)
             && self.unsaved_dialog.is_none()
@@ -1075,7 +1369,7 @@ impl App {
         {
             let has_unsaved = matches!(self.mode, AppMode::Editing(ref e) if e.modified);
             if has_unsaved {
-                self.unsaved_dialog = Some(UnsavedDialogField::ButtonSave);
+                self.unsaved_dialog = Some(UnsavedDialogField::Save);
             } else {
                 self.quit_confirm = Some(true); // Quit button focused
             }
@@ -1095,7 +1389,7 @@ impl App {
                 Action::DialogCancel => {
                     self.quit_confirm = None;
                 }
-                Action::SwitchPanel => {
+                Action::SwitchPanel | Action::SwitchPanelReverse => {
                     self.quit_confirm = Some(!self.quit_confirm.unwrap_or(true));
                 }
                 Action::None | Action::Tick | Action::Resize(_, _) => {}
@@ -1110,7 +1404,7 @@ impl App {
                 Action::DialogConfirm => {
                     let focused = self.unsaved_dialog.unwrap();
                     match focused {
-                        UnsavedDialogField::ButtonSave => {
+                        UnsavedDialogField::Save => {
                             if let AppMode::Editing(ref mut e) = self.mode {
                                 match e.save() {
                                     Ok(()) => {}
@@ -1126,12 +1420,12 @@ impl App {
                             self.needs_clear = true;
                             self.reload_panels();
                         }
-                        UnsavedDialogField::ButtonDiscard => {
+                        UnsavedDialogField::Discard => {
                             self.unsaved_dialog = None;
                             self.mode = AppMode::Normal;
                             self.needs_clear = true;
                         }
-                        UnsavedDialogField::ButtonCancel => {
+                        UnsavedDialogField::Cancel => {
                             self.unsaved_dialog = None;
                         }
                     }
@@ -1167,6 +1461,12 @@ impl App {
             return;
         }
 
+        // Terminal panel intercepts when focused
+        if self.terminal_focused && self.terminal_panel.is_some() {
+            self.handle_terminal_action(action);
+            return;
+        }
+
         // Dialog, mkdir dialog, copy dialog, and editor have their own dispatch
         if matches!(self.mode, AppMode::Dialog(_)) {
             self.handle_dialog_action(action);
@@ -1195,16 +1495,23 @@ impl App {
                         match result {
                             Ok(path) => {
                                 self.ci_focused = None;
-                                self.mode = AppMode::Editing(
+                                self.mode = AppMode::Editing(Box::new(
                                     crate::editor::EditorState::open(path),
-                                );
+                                ));
                                 return;
                             }
                             Err(e) => {
-                                self.status_message =
-                                    Some(format!("Download failed: {}", e));
+                                self.status_message = Some(format!("Download failed: {}", e));
                             }
                         }
+                    }
+                }
+                // Poll terminal panel
+                if let Some(ref mut tp) = self.terminal_panel {
+                    tp.poll();
+                    if tp.exited {
+                        self.terminal_panel = None;
+                        self.terminal_focused = false;
                     }
                 }
                 // Poll for async PR query results
@@ -1220,7 +1527,9 @@ impl App {
                 }
             }
             Action::Quit => self.should_quit = true,
-            Action::Resize(_, _) => {}
+            Action::Resize(_, _) => {
+                self.resize_terminal();
+            }
             Action::Toggle => self.handle_toggle_viewer(),
             Action::GotoLinePrompt => {
                 // Only works in viewer/hex/editor modes
@@ -1272,6 +1581,7 @@ impl App {
             Action::Enter => self.handle_enter(),
             Action::GoUp => self.handle_go_up(),
             Action::SwitchPanel => self.handle_switch_panel(),
+            Action::SwitchPanelReverse => self.handle_switch_panel_reverse(),
 
             // File operations
             Action::Copy => self.handle_copy(),
@@ -1281,6 +1591,46 @@ impl App {
             Action::Delete => self.handle_delete(),
             Action::ViewFile => self.handle_view_file(),
             Action::EditFile => self.handle_edit_file(),
+
+            // Clipboard
+            Action::CopyName => {
+                if let Some(entry) = self.active_panel().selected_entry() {
+                    let name = entry.name.clone();
+                    crate::editor::osc52_copy(&name);
+                    self.status_message = Some(format!("Copied: {}", name));
+                }
+            }
+            Action::CopyPath => {
+                if let Some(entry) = self.active_panel().selected_entry() {
+                    let path = entry.path.display().to_string();
+                    crate::editor::osc52_copy(&path);
+                    self.status_message = Some(format!("Copied: {}", path));
+                }
+            }
+
+            // Go-to-path
+            Action::GotoPathPrompt => {
+                let path = self
+                    .active_panel()
+                    .current_dir
+                    .to_string_lossy()
+                    .to_string();
+                let cursor = path.len();
+                self.goto_path[self.active_panel] = Some(GotoPathState {
+                    input: path,
+                    cursor,
+                    completions: Vec::new(),
+                    comp_index: None,
+                    comp_base: None,
+                });
+            }
+
+            // Fuzzy file search
+            Action::FuzzySearchPrompt => {
+                let root = self.active_panel().current_dir.clone();
+                let paths = collect_files_recursive(&root, 10_000, 20);
+                self.fuzzy_search[self.active_panel] = Some(FuzzySearchState::new(paths));
+            }
 
             // Sorting
             Action::CycleSort => {
@@ -1322,6 +1672,33 @@ impl App {
                 }
             }
 
+            // Terminal
+            Action::ToggleTerminal => {
+                if self.terminal_panel.is_some() {
+                    self.terminal_panel = None;
+                    self.terminal_focused = false;
+                } else if let Some(ref wakeup) = self.wakeup_sender {
+                    let spawn_side = 1 - self.active_panel;
+                    let dir = self.panels[self.active_panel].current_dir.clone();
+                    let area = self.panel_areas[spawn_side];
+                    let cols = area.width.saturating_sub(2).max(1);
+                    let rows = area.height.saturating_sub(2).max(1);
+                    match TerminalPanel::spawn(&dir, cols, rows, wakeup.clone()) {
+                        Ok(tp) => {
+                            self.terminal_panel = Some(tp);
+                            self.terminal_side = spawn_side;
+                            self.terminal_focused = true;
+                            self.ci_focused = None;
+                        }
+                        Err(e) => {
+                            self.status_message = Some(format!("Failed to start terminal: {}", e));
+                        }
+                    }
+                } else {
+                    self.status_message = Some("Event loop not ready".to_string());
+                }
+            }
+
             // Mouse
             Action::MouseClick(col, row) => self.handle_mouse_click(col, row),
             Action::MouseDoubleClick(col, row) => self.handle_mouse_double_click(col, row),
@@ -1336,6 +1713,7 @@ impl App {
             Action::DialogCancel => self.handle_dialog_cancel(),
             Action::DialogBackspace => self.handle_dialog_backspace(),
             Action::DialogConfirm | Action::DialogInput(_) => {}
+            Action::TerminalInput(_) | Action::TerminalOpenFile => {} // handled by intercepts above
         }
     }
 
@@ -1429,35 +1807,100 @@ impl App {
     }
 
     fn handle_switch_panel(&mut self) {
-        let has_left_ci = self.ci_panels[0].is_some();
-        let has_right_ci = self.ci_panels[1].is_some();
+        self.handle_switch_panel_dir(false);
+    }
 
-        if !has_left_ci && !has_right_ci {
-            self.active_panel = 1 - self.active_panel;
+    fn handle_switch_panel_reverse(&mut self) {
+        self.handle_switch_panel_dir(true);
+    }
+
+    fn handle_switch_panel_dir(&mut self, reverse: bool) {
+        // Focus targets: Panel(side), Ci(side), Terminal
+        #[derive(PartialEq)]
+        enum Target {
+            Panel(usize),
+            Ci(usize),
+            Terminal,
+        }
+
+        let has_terminal = self.terminal_panel.is_some();
+
+        // Build tab order: left, left_ci?, terminal?(if left side), right, right_ci?, terminal?(if right side)
+        let mut order: Vec<Target> = Vec::with_capacity(6);
+
+        // Left side: skip file panel if terminal occupies it
+        if !(has_terminal && self.terminal_side == 0) {
+            order.push(Target::Panel(0));
+        }
+        if self.ci_panels[0].is_some() {
+            order.push(Target::Ci(0));
+        }
+        if has_terminal && self.terminal_side == 0 {
+            order.push(Target::Terminal);
+        }
+
+        // Right side
+        if !(has_terminal && self.terminal_side == 1) {
+            order.push(Target::Panel(1));
+        }
+        if self.ci_panels[1].is_some() {
+            order.push(Target::Ci(1));
+        }
+        if has_terminal && self.terminal_side == 1 {
+            order.push(Target::Terminal);
+        }
+
+        if order.is_empty() {
             return;
         }
 
-        // Tab order: left, left_ci?, right, right_ci?
-        let mut order: Vec<(usize, bool)> = Vec::with_capacity(4);
-        order.push((0, false));
-        if has_left_ci { order.push((0, true)); }
-        order.push((1, false));
-        if has_right_ci { order.push((1, true)); }
+        // Simple case: only two file panels, no CI, no terminal
+        if order.len() == 2
+            && matches!(order[0], Target::Panel(_))
+            && matches!(order[1], Target::Panel(_))
+        {
+            self.active_panel = 1 - self.active_panel;
+            self.ci_focused = None;
+            self.terminal_focused = false;
+            return;
+        }
 
-        let current = if let Some(ci_side) = self.ci_focused {
-            order.iter().position(|&(s, ci)| s == ci_side && ci)
+        // Find current position
+        let current = if self.terminal_focused {
+            order.iter().position(|t| *t == Target::Terminal)
+        } else if let Some(ci_side) = self.ci_focused {
+            order.iter().position(|t| *t == Target::Ci(ci_side))
         } else {
-            order.iter().position(|&(s, ci)| s == self.active_panel && !ci)
+            order
+                .iter()
+                .position(|t| *t == Target::Panel(self.active_panel))
         };
 
-        let next = current.map(|i| (i + 1) % order.len()).unwrap_or(0);
-        let (side, is_ci) = order[next];
+        let len = order.len();
+        let next = current
+            .map(|i| {
+                if reverse {
+                    (i + len - 1) % len
+                } else {
+                    (i + 1) % len
+                }
+            })
+            .unwrap_or(0);
 
-        if is_ci {
-            self.ci_focused = Some(side);
-        } else {
-            self.ci_focused = None;
-            self.active_panel = side;
+        match &order[next] {
+            Target::Panel(side) => {
+                self.active_panel = *side;
+                self.ci_focused = None;
+                self.terminal_focused = false;
+            }
+            Target::Ci(side) => {
+                self.ci_focused = Some(*side);
+                self.terminal_focused = false;
+            }
+            Target::Terminal => {
+                self.terminal_focused = true;
+                self.ci_focused = None;
+            }
         }
     }
 
@@ -1479,6 +1922,367 @@ impl App {
             Action::DialogBackspace => {
                 if let Some(ref mut input) = self.goto_line_input {
                     input.pop();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_goto_path_action(&mut self, action: Action) {
+        let side = self.active_panel;
+        match action {
+            Action::DialogCancel => {
+                self.goto_path[side] = None;
+            }
+            Action::DialogConfirm => {
+                // If completions are visible and one is selected, apply it
+                if let Some(ref mut state) = self.goto_path[side] {
+                    if let Some(idx) = state.comp_index {
+                        if let Some(completion) = state.completions.get(idx).cloned() {
+                            Self::apply_completion(state, &completion);
+                            return;
+                        }
+                    }
+                }
+                if let Some(state) = self.goto_path[side].take() {
+                    self.goto_path_navigate(side, &state.input);
+                }
+            }
+            Action::DialogInput(c) => {
+                if let Some(ref mut state) = self.goto_path[side] {
+                    state.input.insert(state.cursor, c);
+                    state.cursor += c.len_utf8();
+                    state.completions.clear();
+                    state.comp_index = None;
+                    state.comp_base = None;
+                }
+            }
+            Action::DialogBackspace => {
+                if let Some(ref mut state) = self.goto_path[side] {
+                    if state.cursor > 0 {
+                        let prev = state.input[..state.cursor]
+                            .char_indices()
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        state.input.remove(prev);
+                        state.cursor = prev;
+                        state.completions.clear();
+                        state.comp_index = None;
+                        state.comp_base = None;
+                    }
+                }
+            }
+            Action::MoveDown => {
+                // Tab: trigger or cycle completion
+                if let Some(ref mut state) = self.goto_path[side] {
+                    if state.completions.is_empty() {
+                        Self::populate_completions(state);
+                        if state.completions.len() == 1 {
+                            let completion = state.completions[0].clone();
+                            Self::apply_completion(state, &completion);
+                        } else if !state.completions.is_empty() {
+                            // Fill common prefix first
+                            let applied = Self::apply_common_prefix(state);
+                            if !applied {
+                                state.comp_index = Some(0);
+                            }
+                        }
+                    } else {
+                        // Cycle forward
+                        let len = state.completions.len();
+                        state.comp_index = Some(match state.comp_index {
+                            Some(i) => (i + 1) % len,
+                            None => 0,
+                        });
+                    }
+                }
+            }
+            Action::MoveUp => {
+                // Shift+Tab: cycle backward
+                if let Some(ref mut state) = self.goto_path[side] {
+                    if !state.completions.is_empty() {
+                        let len = state.completions.len();
+                        state.comp_index = Some(match state.comp_index {
+                            Some(i) => (i + len - 1) % len,
+                            None => len - 1,
+                        });
+                    }
+                }
+            }
+            Action::CursorLeft => {
+                if let Some(ref mut state) = self.goto_path[side] {
+                    if state.cursor > 0 {
+                        state.cursor = state.input[..state.cursor]
+                            .char_indices()
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                    }
+                    state.completions.clear();
+                    state.comp_index = None;
+                    state.comp_base = None;
+                }
+            }
+            Action::CursorRight => {
+                if let Some(ref mut state) = self.goto_path[side] {
+                    if state.cursor < state.input.len() {
+                        state.cursor += state.input[state.cursor..]
+                            .chars()
+                            .next()
+                            .map(|c| c.len_utf8())
+                            .unwrap_or(0);
+                    }
+                    state.completions.clear();
+                    state.comp_index = None;
+                    state.comp_base = None;
+                }
+            }
+            Action::CursorLineStart => {
+                if let Some(ref mut state) = self.goto_path[side] {
+                    state.cursor = 0;
+                    state.completions.clear();
+                    state.comp_index = None;
+                    state.comp_base = None;
+                }
+            }
+            Action::CursorLineEnd => {
+                if let Some(ref mut state) = self.goto_path[side] {
+                    state.cursor = state.input.len();
+                    state.completions.clear();
+                    state.comp_index = None;
+                    state.comp_base = None;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Expand ~ and split the input into (parent_dir, prefix_to_match).
+    fn expand_goto_input(input: &str) -> (PathBuf, String) {
+        let expanded = if let Some(rest) = input.strip_prefix('~') {
+            if let Some(home) = std::env::var_os("HOME") {
+                format!("{}{}", home.to_string_lossy(), rest)
+            } else {
+                input.to_string()
+            }
+        } else {
+            input.to_string()
+        };
+
+        let path = PathBuf::from(&expanded);
+        if expanded.ends_with('/') || expanded.is_empty() {
+            // Completing inside a directory
+            (path, String::new())
+        } else {
+            // Completing a partial name
+            let parent = path.parent().unwrap_or(&path).to_path_buf();
+            let prefix = path
+                .file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default();
+            (parent, prefix)
+        }
+    }
+
+    fn populate_completions(state: &mut GotoPathState) {
+        let (dir, prefix) = Self::expand_goto_input(&state.input);
+        let prefix_lower = prefix.to_lowercase();
+
+        state.comp_base = Some(state.input.clone());
+        state.comp_index = None;
+        state.completions.clear();
+
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            let mut matches: Vec<String> = entries
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let is_dir = e.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
+                    if !is_dir {
+                        return None;
+                    }
+                    if name.to_lowercase().starts_with(&prefix_lower) {
+                        Some(name)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            matches.sort_by_key(|a| a.to_lowercase());
+            state.completions = matches;
+        }
+    }
+
+    /// Apply the longest common prefix of all completions. Returns true if the
+    /// input was actually extended (i.e. there was a common prefix beyond what
+    /// was already typed).
+    fn apply_common_prefix(state: &mut GotoPathState) -> bool {
+        if state.completions.is_empty() {
+            return false;
+        }
+
+        let (_, prefix) = Self::expand_goto_input(&state.input);
+
+        // Find longest common prefix among completions
+        let first = &state.completions[0];
+        let mut common_len = first.len();
+        for candidate in &state.completions[1..] {
+            common_len = common_len.min(
+                first
+                    .chars()
+                    .zip(candidate.chars())
+                    .take_while(|(a, b)| a.to_lowercase().eq(b.to_lowercase()))
+                    .count(),
+            );
+        }
+
+        let common: String = first.chars().take(common_len).collect();
+        let common_chars = common.chars().count();
+        let prefix_chars = prefix.chars().count();
+        if common_chars > prefix_chars {
+            // Append the characters beyond what was already typed
+            let suffix: String = common.chars().skip(prefix_chars).collect();
+            state.input.insert_str(state.cursor, &suffix);
+            state.cursor += suffix.len();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn apply_completion(state: &mut GotoPathState, name: &str) {
+        let (_, prefix) = Self::expand_goto_input(&state.input);
+
+        // Append the characters beyond the typed prefix + trailing /
+        let prefix_chars = prefix.chars().count();
+        let suffix: String = name
+            .chars()
+            .skip(prefix_chars)
+            .chain(std::iter::once('/'))
+            .collect();
+        state.input.insert_str(state.cursor, &suffix);
+        state.cursor += suffix.len();
+        state.completions.clear();
+        state.comp_index = None;
+        state.comp_base = None;
+    }
+
+    fn goto_path_navigate(&mut self, side: usize, input: &str) {
+        let expanded = if let Some(rest) = input.strip_prefix('~') {
+            if let Some(home) = std::env::var_os("HOME") {
+                let home = home.to_string_lossy();
+                format!("{}{}", home, rest)
+            } else {
+                input.to_string()
+            }
+        } else {
+            input.to_string()
+        };
+
+        let path = PathBuf::from(&expanded);
+        if path.is_dir() {
+            self.panels[side].current_dir = path;
+            self.panels[side].reload();
+            self.panels[side].table_state.select(Some(0));
+            self.panels[side].refresh_git(&mut self.git_cache);
+            if let Some(ref mut w) = self.dir_watcher {
+                w.watch_dirs([&self.panels[0].current_dir, &self.panels[1].current_dir]);
+            }
+        } else {
+            self.status_message = Some(format!("Not a directory: {}", expanded));
+        }
+    }
+
+    fn handle_fuzzy_search_action(&mut self, action: Action) {
+        let side = self.active_panel;
+        match action {
+            Action::DialogCancel => {
+                self.fuzzy_search[side] = None;
+            }
+            Action::DialogConfirm => {
+                if let Some(ref state) = self.fuzzy_search[side] {
+                    if let Some(&(path_idx, _)) = state.results.get(state.selected) {
+                        let rel_path = &state.all_paths[path_idx];
+                        let full_path = self.panels[side].current_dir.join(rel_path);
+                        if full_path.is_file() {
+                            self.fuzzy_search[side] = None;
+                            self.mode = AppMode::Editing(Box::new(
+                                crate::editor::EditorState::open(full_path),
+                            ));
+                            return;
+                        }
+                    }
+                }
+                self.fuzzy_search[side] = None;
+            }
+            Action::DialogInput(c) => {
+                if let Some(ref mut state) = self.fuzzy_search[side] {
+                    state.input.insert(state.cursor, c);
+                    state.cursor += c.len_utf8();
+                    state.update_results();
+                }
+            }
+            Action::DialogBackspace => {
+                if let Some(ref mut state) = self.fuzzy_search[side] {
+                    if state.cursor > 0 {
+                        let prev = state.input[..state.cursor]
+                            .char_indices()
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        state.input.remove(prev);
+                        state.cursor = prev;
+                        state.update_results();
+                    }
+                }
+            }
+            Action::MoveDown => {
+                if let Some(ref mut state) = self.fuzzy_search[side] {
+                    let len = state.results.len().min(8);
+                    if len > 0 {
+                        state.selected = (state.selected + 1) % len;
+                    }
+                }
+            }
+            Action::MoveUp => {
+                if let Some(ref mut state) = self.fuzzy_search[side] {
+                    let len = state.results.len().min(8);
+                    if len > 0 {
+                        state.selected = (state.selected + len - 1) % len;
+                    }
+                }
+            }
+            Action::CursorLeft => {
+                if let Some(ref mut state) = self.fuzzy_search[side] {
+                    if state.cursor > 0 {
+                        state.cursor = state.input[..state.cursor]
+                            .char_indices()
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                    }
+                }
+            }
+            Action::CursorRight => {
+                if let Some(ref mut state) = self.fuzzy_search[side] {
+                    if state.cursor < state.input.len() {
+                        state.cursor += state.input[state.cursor..]
+                            .chars()
+                            .next()
+                            .map(|c| c.len_utf8())
+                            .unwrap_or(0);
+                    }
+                }
+            }
+            Action::CursorLineStart => {
+                if let Some(ref mut state) = self.fuzzy_search[side] {
+                    state.cursor = 0;
+                }
+            }
+            Action::CursorLineEnd => {
+                if let Some(ref mut state) = self.fuzzy_search[side] {
+                    state.cursor = state.input.len();
                 }
             }
             _ => {}
@@ -1527,7 +2331,7 @@ impl App {
     fn handle_edit_builtin(&mut self) {
         if let Some(entry) = self.active_panel().selected_entry().cloned() {
             if !entry.is_dir {
-                self.mode = AppMode::Editing(EditorState::open(entry.path));
+                self.mode = AppMode::Editing(Box::new(EditorState::open(entry.path)));
             }
         }
     }
@@ -1565,7 +2369,7 @@ impl App {
             Action::Quit => {
                 let modified = matches!(self.mode, AppMode::Editing(ref e) if e.modified);
                 if modified {
-                    self.unsaved_dialog = Some(UnsavedDialogField::ButtonSave);
+                    self.unsaved_dialog = Some(UnsavedDialogField::Save);
                 } else {
                     self.should_quit = true;
                 }
@@ -1576,7 +2380,7 @@ impl App {
             Action::DialogCancel => {
                 let modified = matches!(self.mode, AppMode::Editing(ref e) if e.modified);
                 if modified {
-                    self.unsaved_dialog = Some(UnsavedDialogField::ButtonSave);
+                    self.unsaved_dialog = Some(UnsavedDialogField::Save);
                 } else {
                     self.mode = AppMode::Normal;
                     self.needs_clear = true;
@@ -1828,11 +2632,11 @@ impl App {
         match &self.mode {
             AppMode::Viewing(v) => {
                 let path = v.path.clone();
-                self.mode = AppMode::HexViewing(HexViewerState::open(path));
+                self.mode = AppMode::HexViewing(Box::new(HexViewerState::open(path)));
             }
             AppMode::HexViewing(h) => {
                 let path = h.path.clone();
-                self.mode = AppMode::Viewing(ViewerState::open(path));
+                self.mode = AppMode::Viewing(Box::new(ViewerState::open(path)));
             }
             _ => {}
         }
@@ -1840,9 +2644,9 @@ impl App {
 
     fn open_file(&mut self, path: PathBuf) {
         if HexViewerState::is_binary(&path) {
-            self.mode = AppMode::HexViewing(HexViewerState::open(path));
+            self.mode = AppMode::HexViewing(Box::new(HexViewerState::open(path)));
         } else {
-            self.mode = AppMode::Viewing(ViewerState::open(path));
+            self.mode = AppMode::Viewing(Box::new(ViewerState::open(path)));
         }
     }
 
@@ -2042,7 +2846,7 @@ impl App {
                     s.cursor_end();
                 }
             }
-            Action::SwitchPanel => {
+            Action::SwitchPanel | Action::SwitchPanelReverse => {
                 if let Some(ref mut s) = self.search_dialog {
                     s.focused = match s.focused {
                         SearchDialogField::ButtonFind => SearchDialogField::ButtonCancel,
@@ -2097,22 +2901,20 @@ impl App {
         match action {
             Action::None | Action::Tick | Action::Resize(_, _) => {
                 // Poll all CI panels and check downloads
-                for ci in self.ci_panels.iter_mut() {
-                    if let Some(ref mut ci) = ci {
-                        ci.poll();
-                        if let Some(result) = ci.poll_download() {
-                            match result {
-                                Ok(path) => {
-                                    // Open downloaded log in editor
-                                    self.ci_focused = None;
-                                    self.mode = AppMode::Editing(
-                                        crate::editor::EditorState::open(path),
-                                    );
-                                    return;
-                                }
-                                Err(e) => {
-                                    self.status_message = Some(format!("Download failed: {}", e));
-                                }
+                for ci in self.ci_panels.iter_mut().flatten() {
+                    ci.poll();
+                    if let Some(result) = ci.poll_download() {
+                        match result {
+                            Ok(path) => {
+                                // Open downloaded log in editor
+                                self.ci_focused = None;
+                                self.mode = AppMode::Editing(Box::new(
+                                    crate::editor::EditorState::open(path),
+                                ));
+                                return;
+                            }
+                            Err(e) => {
+                                self.status_message = Some(format!("Download failed: {}", e));
                             }
                         }
                     }
@@ -2137,11 +2939,29 @@ impl App {
                     ci.move_down();
                 }
             }
+            Action::PageUp => {
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.page_up();
+                }
+            }
+            Action::PageDown => {
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.page_down();
+                }
+            }
+            Action::MoveToTop => {
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.move_to_top();
+                }
+            }
+            Action::MoveToBottom => {
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.move_to_bottom();
+                }
+            }
             Action::Enter => {
                 // enter() returns Some if a step was selected for log viewing
-                let log_info = self.ci_panels[side]
-                    .as_mut()
-                    .and_then(|ci| ci.enter());
+                let log_info = self.ci_panels[side].as_mut().and_then(|ci| ci.enter());
                 if let Some((run_id, step)) = log_info {
                     self.start_ci_log_download(side, run_id, &step);
                 }
@@ -2160,6 +2980,9 @@ impl App {
             }
             Action::SwitchPanel => {
                 self.handle_switch_panel();
+            }
+            Action::SwitchPanelReverse => {
+                self.handle_switch_panel_reverse();
             }
             Action::ToggleCi => {
                 if self.ci_panels[side]
@@ -2190,6 +3013,129 @@ impl App {
         }
     }
 
+    fn handle_terminal_action(&mut self, action: Action) {
+        match action {
+            Action::None => {}
+            Action::Tick | Action::Resize(_, _) => {
+                // Poll terminal output
+                if let Some(ref mut tp) = self.terminal_panel {
+                    tp.poll();
+                    if tp.exited {
+                        self.terminal_panel = None;
+                        self.terminal_focused = false;
+                    }
+                }
+                // Resize terminal to match panel area
+                if matches!(action, Action::Resize(_, _)) {
+                    self.resize_terminal();
+                }
+                // Also poll CI, watchers, git
+                for ci in self.ci_panels.iter_mut().flatten() {
+                    ci.poll();
+                }
+                if let Some(ref w) = self.dir_watcher {
+                    if w.has_changes() {
+                        self.reload_panels();
+                    }
+                }
+                if self.git_cache.poll_pending() {
+                    self.panels[0].refresh_git(&mut self.git_cache);
+                    self.panels[1].refresh_git(&mut self.git_cache);
+                }
+            }
+            Action::TerminalInput(bytes) => {
+                if let Some(ref mut tp) = self.terminal_panel {
+                    // Auto-scroll to bottom when user types
+                    tp.scroll_to_bottom();
+                    tp.write_bytes(&bytes);
+                }
+            }
+            Action::SwitchPanel => self.handle_switch_panel(),
+            Action::SwitchPanelReverse => self.handle_switch_panel_reverse(),
+            Action::ToggleTerminal => {
+                self.terminal_panel = None;
+                self.terminal_focused = false;
+            }
+            Action::TerminalOpenFile => self.handle_terminal_open_file(),
+            Action::Quit => {
+                self.quit_confirm = Some(true);
+            }
+            Action::MouseClick(col, row) => {
+                if self.click_in_terminal(col, row) {
+                    // Click inside terminal — stay focused
+                } else {
+                    self.terminal_focused = false;
+                    self.handle_mouse_click(col, row);
+                }
+            }
+            Action::MouseDoubleClick(col, row) => {
+                if self.click_in_terminal(col, row) {
+                    // Double-click inside terminal — absorb
+                } else {
+                    self.terminal_focused = false;
+                    self.handle_mouse_double_click(col, row);
+                }
+            }
+            Action::MouseScrollUp(col, row) => {
+                self.forward_mouse_scroll_to_terminal(col, row, true);
+            }
+            Action::MouseScrollDown(col, row) => {
+                self.forward_mouse_scroll_to_terminal(col, row, false);
+            }
+            _ => {}
+        }
+    }
+
+    fn click_in_terminal(&self, col: u16, row: u16) -> bool {
+        let area = self.panel_areas[self.terminal_side];
+        col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
+    }
+
+    fn forward_mouse_scroll_to_terminal(&mut self, _col: u16, _row: u16, up: bool) {
+        if let Some(ref mut tp) = self.terminal_panel {
+            if up {
+                tp.scroll_up(3);
+            } else {
+                tp.scroll_down(3);
+            }
+        }
+    }
+
+    fn handle_terminal_open_file(&mut self) {
+        let (path, line, col) = match self.terminal_panel {
+            Some(ref tp) => match tp.find_file_reference() {
+                Some(r) => r,
+                None => {
+                    self.status_message = Some("No file:line reference found".to_string());
+                    return;
+                }
+            },
+            None => return,
+        };
+
+        let mut editor = crate::editor::EditorState::open(path);
+        let target_line = line.saturating_sub(1); // convert to 0-based
+        let target_col = col.saturating_sub(1);
+        // Ensure the editor has scanned far enough
+        if !editor.scan_complete {
+            editor.scan_to_line(target_line + 100);
+        }
+        editor.cursor_line = target_line;
+        editor.cursor_col = target_col;
+        editor.desired_col = target_col;
+        editor.scroll_to_cursor();
+        self.mode = AppMode::Editing(Box::new(editor));
+    }
+
+    fn resize_terminal(&mut self) {
+        if let Some(ref mut tp) = self.terminal_panel {
+            let area = self.panel_areas[self.terminal_side];
+            let cols = area.width.saturating_sub(2).max(1);
+            let rows = area.height.saturating_sub(2).max(1);
+            tp.resize(cols, rows);
+        }
+    }
+
     fn start_ci_log_download(&mut self, side: usize, run_id: u64, step: &crate::ci::CiStep) {
         let ci = match &mut self.ci_panels[side] {
             Some(ci) => ci,
@@ -2204,7 +3150,13 @@ impl App {
         let safe_name: String = step
             .name
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let output_path = self.panels[self.active_panel]
             .current_dir
@@ -2224,7 +3176,10 @@ impl App {
             let job_id = self.ci_panels[side]
                 .as_ref()
                 .and_then(|ci| {
-                    if let crate::ci::CiView::Tree { items, selected, .. } = &ci.view {
+                    if let crate::ci::CiView::Tree {
+                        items, selected, ..
+                    } = &ci.view
+                    {
                         // Walk back from selected to find the parent check
                         for i in (0..=*selected).rev() {
                             if let crate::ci::TreeItem::Check { check, .. } = &items[i] {
@@ -2249,7 +3204,6 @@ impl App {
             } else {
                 self.status_message = Some("Cannot download: no job ID found".to_string());
             }
-            return;
         } else {
             self.status_message = Some("Cannot download logs: no run ID found".to_string());
         }
@@ -2327,7 +3281,7 @@ impl App {
                     state.cursor_end();
                 }
             }
-            Action::SwitchPanel => {
+            Action::SwitchPanel | Action::SwitchPanelReverse => {
                 // Swap between OK and Cancel buttons
                 if let AppMode::MkdirDialog(ref mut state) = self.mode {
                     state.focused = match state.focused {
@@ -2354,7 +3308,11 @@ impl App {
 
         let dir = self.active_panel().current_dir.clone();
         let names: Vec<&str> = if process_multiple {
-            input.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+            input
+                .split(';')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect()
         } else {
             vec![input.trim()]
         };
@@ -2448,7 +3406,7 @@ impl App {
                     state.cursor_end();
                 }
             }
-            Action::SwitchPanel => {
+            Action::SwitchPanel | Action::SwitchPanelReverse => {
                 if let AppMode::CopyDialog(ref mut state) = self.mode {
                     state.focused = match state.focused {
                         CopyDialogField::ButtonCopy => CopyDialogField::ButtonCancel,
@@ -2534,10 +3492,7 @@ impl App {
             e.click_at(col, row);
             return;
         }
-        if matches!(
-            self.mode,
-            AppMode::Viewing(_) | AppMode::HexViewing(_)
-        ) {
+        if matches!(self.mode, AppMode::Viewing(_) | AppMode::HexViewing(_)) {
             return;
         }
         if matches!(
@@ -2583,9 +3538,24 @@ impl App {
             }
         }
 
-        // Click on a file panel — unfocus CI
+        // Check if click is in the terminal panel
+        if self.terminal_panel.is_some() {
+            let term_area = self.panel_areas[self.terminal_side];
+            if col >= term_area.x
+                && col < term_area.x + term_area.width
+                && row >= term_area.y
+                && row < term_area.y + term_area.height
+            {
+                self.terminal_focused = true;
+                self.ci_focused = None;
+                return;
+            }
+        }
+
+        // Click on a file panel — unfocus CI and terminal
         if let Some(panel_idx) = self.panel_at(col, row) {
             self.ci_focused = None;
+            self.terminal_focused = false;
             self.active_panel = panel_idx;
             if let Some(entry_idx) = self.row_to_entry_index(panel_idx, row) {
                 self.panels[panel_idx].table_state.select(Some(entry_idx));
@@ -2719,7 +3689,7 @@ impl App {
                     state.cursor_end();
                 }
             }
-            Action::SwitchPanel => {
+            Action::SwitchPanel | Action::SwitchPanelReverse => {
                 if let AppMode::Dialog(ref mut state) = self.mode {
                     state.focused = match state.focused {
                         DialogField::ButtonOk => DialogField::ButtonCancel,
@@ -2797,5 +3767,513 @@ impl App {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fuzzy_tests {
+    use super::*;
+
+    fn score(query: &str, candidate: &str) -> Option<i64> {
+        let query_chars: Vec<char> = query.to_lowercase().chars().collect();
+        let chars: Vec<char> = candidate.chars().collect();
+        let lower_chars: Vec<char> = candidate.to_lowercase().chars().collect();
+        let filename_start = chars
+            .iter()
+            .rposition(|&c| c == '/')
+            .map(|i| i + 1)
+            .unwrap_or(0);
+        let entry = FileEntry {
+            path: candidate.to_string(),
+            lower_chars,
+            chars,
+            filename_start,
+        };
+        fuzzy_score_precomputed(&query_chars, &entry)
+    }
+
+    #[test]
+    fn exact_match() {
+        assert!(score("main.rs", "main.rs").is_some());
+    }
+
+    #[test]
+    fn prefix_match() {
+        assert!(score("main", "main.rs").is_some());
+    }
+
+    #[test]
+    fn substring_chars_in_order() {
+        // "aprs" matches "app.rs" — a, p, r, s in order
+        assert!(score("aprs", "app.rs").is_some());
+    }
+
+    #[test]
+    fn middle_of_filename() {
+        assert!(score("view", "panel_view.rs").is_some());
+    }
+
+    #[test]
+    fn path_match() {
+        assert!(score("src/main", "src/main.rs").is_some());
+    }
+
+    #[test]
+    fn no_match_wrong_order() {
+        // "srm" — s, r, m not in order in "main.rs"
+        assert!(score("srm", "main.rs").is_none());
+    }
+
+    #[test]
+    fn no_match_missing_chars() {
+        assert!(score("xyz", "main.rs").is_none());
+    }
+
+    #[test]
+    fn case_insensitive() {
+        assert!(score("MAIN", "main.rs").is_some());
+        assert!(score("main", "Main.rs").is_some());
+    }
+
+    #[test]
+    fn empty_query_matches_all() {
+        assert!(score("", "anything.rs").is_some());
+    }
+
+    #[test]
+    fn query_longer_than_candidate_rejected() {
+        assert!(score("toolongquery", "short").is_none());
+    }
+
+    #[test]
+    fn consecutive_bonus() {
+        // "main" consecutively in "main.rs" should score higher than spread across "myappinfo.rs"
+        let s1 = score("main", "main.rs").unwrap();
+        let s2 = score("main", "myappinfo.rs").unwrap();
+        assert!(
+            s1 > s2,
+            "consecutive match ({}) should beat spread ({})",
+            s1,
+            s2
+        );
+    }
+
+    #[test]
+    fn filename_match_beats_path_match() {
+        // "mod" in filename "mod.rs" should rank higher than in path "models/x.rs"
+        let s1 = score("mod", "mod.rs").unwrap();
+        let s2 = score("mod", "some/deep/path/models/data.rs").unwrap();
+        assert!(
+            s1 > s2,
+            "filename match ({}) should beat deep path ({})",
+            s1,
+            s2
+        );
+    }
+
+    #[test]
+    fn shorter_path_preferred() {
+        let s1 = score("app", "app.rs").unwrap();
+        let s2 = score("app", "some/very/long/path/to/app.rs").unwrap();
+        assert!(
+            s1 > s2,
+            "short path ({}) should beat long path ({})",
+            s1,
+            s2
+        );
+    }
+
+    #[test]
+    fn word_boundary_bonus() {
+        // "pv" matching at word boundaries (panel_view) should beat middle matches
+        let s1 = score("pv", "panel_view.rs").unwrap();
+        let s2 = score("pv", "approve.rs").unwrap();
+        assert!(
+            s1 > s2,
+            "boundary match ({}) should beat middle ({})",
+            s1,
+            s2
+        );
+    }
+
+    #[test]
+    fn collect_files_skips_git() {
+        let dir = std::env::current_dir().unwrap();
+        let files = collect_files_recursive(&dir, 10_000, 20);
+        // Should not contain any paths starting with .git/
+        assert!(
+            !files.iter().any(|p| p.starts_with(".git/")),
+            "should skip .git directory"
+        );
+        // Should contain our own source files
+        assert!(
+            files.iter().any(|p| p.ends_with("main.rs")),
+            "should find main.rs"
+        );
+    }
+
+    #[test]
+    fn fuzzy_search_state_update_results() {
+        let paths = vec![
+            "src/main.rs".to_string(),
+            "src/app.rs".to_string(),
+            "src/editor.rs".to_string(),
+            "README.md".to_string(),
+        ];
+        let mut state = FuzzySearchState::new(paths);
+
+        // Empty query shows all
+        assert_eq!(state.results.len(), 4);
+
+        // Type "app" — should match app.rs
+        state.input = "app".to_string();
+        state.cursor = 3;
+        state.update_results();
+        assert!(!state.results.is_empty());
+        let top_path = &state.all_paths[state.results[0].0];
+        assert!(
+            top_path.contains("app"),
+            "top result should contain 'app', got: {}",
+            top_path
+        );
+
+        // Type "xyz" — should match nothing
+        state.input = "xyz".to_string();
+        state.cursor = 3;
+        state.update_results();
+        assert!(state.results.is_empty());
+    }
+
+    // --- Edge cases ---
+
+    #[test]
+    fn unicode_filenames() {
+        // Accented chars match themselves (no normalization, same as fzf)
+        assert!(score("café", "café.txt").is_some());
+        assert!(score("cafe", "café.txt").is_none()); // e ≠ é
+                                                      // CJK characters
+        assert!(score("日本", "日本語.md").is_some());
+        // Mixed ASCII and Unicode
+        assert!(score("txt", "café.txt").is_some());
+    }
+
+    #[test]
+    fn single_char_query() {
+        assert!(score("a", "app.rs").is_some());
+        assert!(score("z", "app.rs").is_none());
+    }
+
+    #[test]
+    fn query_equals_candidate() {
+        let s = score("main.rs", "main.rs").unwrap();
+        // Should be a high score (all consecutive + boundary matches)
+        assert!(s > 0, "exact match should have positive score, got {}", s);
+    }
+
+    #[test]
+    fn deeply_nested_path() {
+        assert!(score("file", "a/b/c/d/e/f/g/file.rs").is_some());
+        // Shallow should beat deep
+        let s1 = score("file", "file.rs").unwrap();
+        let s2 = score("file", "a/b/c/d/e/f/g/file.rs").unwrap();
+        assert!(s1 > s2);
+    }
+
+    #[test]
+    fn dotfiles() {
+        assert!(score("git", ".gitignore").is_some());
+        assert!(score("env", ".env").is_some());
+        assert!(score("gi", ".gitignore").is_some());
+    }
+
+    #[test]
+    fn duplicate_chars_in_query() {
+        // "ss" should match two s's in "settings.rs"
+        assert!(score("ss", "settings.rs").is_some());
+        // "tt" needs two t's — "settings" has two t's
+        assert!(score("tt", "settings.rs").is_some());
+        // "zz" needs two z's — none in "settings.rs"
+        assert!(score("zz", "settings.rs").is_none());
+    }
+
+    #[test]
+    fn special_chars_in_paths() {
+        assert!(score("my", "my file.rs").is_some());
+        assert!(score("my", "my-file.rs").is_some());
+        assert!(score("my", "my_file.rs").is_some());
+    }
+
+    #[test]
+    fn results_truncated_at_100() {
+        // Create 200 matching files
+        let paths: Vec<String> = (0..200).map(|i| format!("file{}.rs", i)).collect();
+        let mut state = FuzzySearchState::new(paths);
+        state.input = "file".to_string();
+        state.cursor = 4;
+        state.update_results();
+        assert!(
+            state.results.len() <= 100,
+            "results should be capped at 100, got {}",
+            state.results.len()
+        );
+    }
+
+    #[test]
+    fn empty_file_list() {
+        let state = FuzzySearchState::new(vec![]);
+        assert!(state.results.is_empty());
+    }
+
+    #[test]
+    fn all_files_match_no_panic() {
+        let paths = vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()];
+        let mut state = FuzzySearchState::new(paths);
+        state.input = "rs".to_string();
+        state.cursor = 2;
+        state.update_results();
+        assert_eq!(state.results.len(), 3);
+    }
+
+    #[test]
+    fn extension_only_match() {
+        // Searching for just an extension
+        assert!(score("rs", "main.rs").is_some());
+        assert!(score("md", "README.md").is_some());
+    }
+
+    #[test]
+    fn query_with_slash() {
+        // User types path separator in query
+        let s = score("src/app", "src/app.rs");
+        assert!(s.is_some());
+    }
+
+    #[test]
+    fn repeated_pattern_picks_best() {
+        // "test" appears in both path and filename
+        let s1 = score("test", "test.rs").unwrap();
+        let s2 = score("test", "test/test_helper.rs").unwrap();
+        // Direct filename match should rank higher
+        assert!(
+            s1 > s2,
+            "direct filename ({}) should beat path+filename ({})",
+            s1,
+            s2
+        );
+    }
+
+    // --- Go-to-path tests ---
+
+    #[test]
+    fn expand_tilde() {
+        let (dir, prefix) = App::expand_goto_input("~/Documents/pro");
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(dir, PathBuf::from(format!("{}/Documents", home)));
+        assert_eq!(prefix, "pro");
+    }
+
+    #[test]
+    fn expand_tilde_trailing_slash() {
+        let (dir, prefix) = App::expand_goto_input("~/Documents/");
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(dir, PathBuf::from(format!("{}/Documents/", home)));
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn expand_absolute_path() {
+        let (dir, prefix) = App::expand_goto_input("/usr/loc");
+        assert_eq!(dir, PathBuf::from("/usr"));
+        assert_eq!(prefix, "loc");
+    }
+
+    #[test]
+    fn expand_absolute_trailing_slash() {
+        let (dir, prefix) = App::expand_goto_input("/usr/local/");
+        assert_eq!(dir, PathBuf::from("/usr/local/"));
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn expand_empty_input() {
+        let (dir, prefix) = App::expand_goto_input("");
+        assert_eq!(dir, PathBuf::from(""));
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn expand_just_tilde() {
+        let (dir, prefix) = App::expand_goto_input("~");
+        let home = std::env::var("HOME").unwrap();
+        // "~" expands to home dir, no trailing slash, so it's treated as a partial name
+        // parent of /Users/foo is /Users, prefix is "foo"
+        assert!(dir.to_string_lossy().len() > 0);
+        assert!(!prefix.is_empty() || dir == PathBuf::from(&home));
+    }
+
+    #[test]
+    fn apply_completion_basic() {
+        let mut state = GotoPathState {
+            input: "/usr/lo".to_string(),
+            cursor: 7,
+            completions: vec!["local".to_string()],
+            comp_index: None,
+            comp_base: None,
+        };
+        App::apply_completion(&mut state, "local");
+        assert_eq!(state.input, "/usr/local/");
+        assert_eq!(state.cursor, 11);
+    }
+
+    #[test]
+    fn apply_completion_from_empty_prefix() {
+        let mut state = GotoPathState {
+            input: "/usr/".to_string(),
+            cursor: 5,
+            completions: vec!["local".to_string()],
+            comp_index: None,
+            comp_base: None,
+        };
+        App::apply_completion(&mut state, "local");
+        assert_eq!(state.input, "/usr/local/");
+        assert_eq!(state.cursor, 11);
+    }
+
+    #[test]
+    fn apply_common_prefix_extends() {
+        let mut state = GotoPathState {
+            input: "/usr/lo".to_string(),
+            cursor: 7,
+            completions: vec!["local".to_string(), "locale".to_string()],
+            comp_index: None,
+            comp_base: None,
+        };
+        let applied = App::apply_common_prefix(&mut state);
+        assert!(applied);
+        assert_eq!(state.input, "/usr/local");
+        assert_eq!(state.cursor, 10);
+    }
+
+    #[test]
+    fn apply_common_prefix_no_extension() {
+        let mut state = GotoPathState {
+            input: "/usr/local".to_string(),
+            cursor: 10,
+            completions: vec!["local".to_string(), "locale".to_string()],
+            comp_index: None,
+            comp_base: None,
+        };
+        // Already typed the full common prefix
+        let applied = App::apply_common_prefix(&mut state);
+        assert!(!applied);
+    }
+
+    #[test]
+    fn apply_common_prefix_empty_completions() {
+        let mut state = GotoPathState {
+            input: "/usr/xyz".to_string(),
+            cursor: 8,
+            completions: vec![],
+            comp_index: None,
+            comp_base: None,
+        };
+        let applied = App::apply_common_prefix(&mut state);
+        assert!(!applied);
+    }
+
+    #[test]
+    fn populate_completions_real_fs() {
+        // Test against /usr which should exist and have subdirs
+        let mut state = GotoPathState {
+            input: "/usr/".to_string(),
+            cursor: 5,
+            completions: vec![],
+            comp_index: None,
+            comp_base: None,
+        };
+        App::populate_completions(&mut state);
+        // /usr should have at least some subdirectories (bin, lib, etc.)
+        assert!(!state.completions.is_empty(), "should find dirs in /usr");
+        // All completions should be directory names
+        for name in &state.completions {
+            let path = PathBuf::from("/usr").join(name);
+            assert!(path.is_dir(), "{} should be a directory", name);
+        }
+    }
+
+    #[test]
+    fn populate_completions_with_prefix() {
+        let mut state = GotoPathState {
+            input: "/usr/lo".to_string(),
+            cursor: 7,
+            completions: vec![],
+            comp_index: None,
+            comp_base: None,
+        };
+        App::populate_completions(&mut state);
+        // Should match "local" if it exists
+        if PathBuf::from("/usr/local").is_dir() {
+            assert!(
+                state.completions.iter().any(|c| c == "local"),
+                "should find 'local' in /usr with prefix 'lo'"
+            );
+        }
+    }
+
+    #[test]
+    fn populate_completions_case_insensitive() {
+        let mut state = GotoPathState {
+            input: "/usr/LO".to_string(),
+            cursor: 7,
+            completions: vec![],
+            comp_index: None,
+            comp_base: None,
+        };
+        App::populate_completions(&mut state);
+        if PathBuf::from("/usr/local").is_dir() {
+            assert!(
+                state
+                    .completions
+                    .iter()
+                    .any(|c| c.to_lowercase() == "local"),
+                "case-insensitive matching should find 'local'"
+            );
+        }
+    }
+
+    #[test]
+    fn populate_completions_invalid_dir() {
+        let mut state = GotoPathState {
+            input: "/nonexistent_path_12345/".to_string(),
+            cursor: 23,
+            completions: vec![],
+            comp_index: None,
+            comp_base: None,
+        };
+        App::populate_completions(&mut state);
+        assert!(
+            state.completions.is_empty(),
+            "invalid dir should yield no completions"
+        );
+    }
+
+    #[test]
+    fn navigate_results_wraps() {
+        let paths = vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()];
+        let mut state = FuzzySearchState::new(paths);
+        assert_eq!(state.selected, 0);
+
+        // Move down wraps
+        let len = state.results.len().min(8);
+        state.selected = (state.selected + 1) % len;
+        assert_eq!(state.selected, 1);
+        state.selected = (state.selected + 1) % len;
+        assert_eq!(state.selected, 2);
+        state.selected = (state.selected + 1) % len;
+        assert_eq!(state.selected, 0); // wrapped
+
+        // Move up wraps
+        state.selected = (state.selected + len - 1) % len;
+        assert_eq!(state.selected, 2); // wrapped backward
     }
 }

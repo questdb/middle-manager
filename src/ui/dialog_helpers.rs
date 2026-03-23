@@ -6,8 +6,8 @@ use ratatui::Frame;
 
 use crate::theme::theme;
 
-const PAD: u16 = 2;      // horizontal padding inside border
-const MARGIN: u16 = 2;   // outer margin left/right
+const PAD: u16 = 2; // horizontal padding inside border
+const MARGIN: u16 = 2; // outer margin left/right
 const MARGIN_V: u16 = 1; // outer margin top/bottom
 
 pub struct DialogLayout {
@@ -82,7 +82,9 @@ pub fn dialog_styles() -> (Style, Style, Style) {
     let t = theme();
     let dbg = t.dialog_bg;
     let normal = Style::default().fg(t.dialog_text_fg).bg(dbg);
-    let highlight = Style::default().fg(t.dialog_input_fg_focused).bg(t.dialog_input_bg);
+    let highlight = Style::default()
+        .fg(t.dialog_input_fg_focused)
+        .bg(t.dialog_input_bg);
     let input_normal = Style::default()
         .fg(t.dialog_input_fg)
         .bg(dbg)
@@ -106,6 +108,7 @@ pub fn render_separator(frame: &mut Frame, outer: Rect, y: u16, style: Style) {
     frame.render_widget(Paragraph::new(Span::styled(s, style)), rect);
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn render_checkbox(
     frame: &mut Frame,
     content: Rect,
@@ -136,8 +139,8 @@ pub fn render_buttons(
     normal: Style,
     highlight: Style,
 ) {
-    let total_len: usize = buttons.iter().map(|(l, _)| l.len()).sum::<usize>()
-        + (buttons.len().saturating_sub(1)) * 4; // 4-char gap between buttons
+    let total_len: usize =
+        buttons.iter().map(|(l, _)| l.len()).sum::<usize>() + (buttons.len().saturating_sub(1)) * 4; // 4-char gap between buttons
     let cw = content.width as usize;
     let left_pad = cw.saturating_sub(total_len) / 2;
 

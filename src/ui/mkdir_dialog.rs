@@ -25,7 +25,11 @@ pub fn render(frame: &mut Frame, state: &MkdirDialogState) -> Rect {
 
     // y=2: input field
     let input_focused = state.focused == MkdirDialogField::Input;
-    let input_style = if input_focused { highlight } else { input_normal };
+    let input_style = if input_focused {
+        highlight
+    } else {
+        input_normal
+    };
     let input_text = format!("{:<width$}", state.input, width = layout.cw);
     dh::render_line(
         frame,
@@ -35,7 +39,12 @@ pub fn render(frame: &mut Frame, state: &MkdirDialogState) -> Rect {
     );
 
     // y=4: separator
-    dh::render_separator(frame, layout.area, layout.inner.y + 4, t.dialog_border_style());
+    dh::render_separator(
+        frame,
+        layout.area,
+        layout.inner.y + 4,
+        t.dialog_border_style(),
+    );
 
     // y=5: "Process multiple names" checkbox
     dh::render_checkbox(
@@ -50,7 +59,12 @@ pub fn render(frame: &mut Frame, state: &MkdirDialogState) -> Rect {
     );
 
     // y=6: separator
-    dh::render_separator(frame, layout.area, layout.inner.y + 6, t.dialog_border_style());
+    dh::render_separator(
+        frame,
+        layout.area,
+        layout.inner.y + 6,
+        t.dialog_border_style(),
+    );
 
     // y=7: buttons
     dh::render_buttons(
@@ -59,7 +73,10 @@ pub fn render(frame: &mut Frame, state: &MkdirDialogState) -> Rect {
         7,
         &[
             ("{ OK }", state.focused == MkdirDialogField::ButtonOk),
-            ("[ Cancel ]", state.focused == MkdirDialogField::ButtonCancel),
+            (
+                "[ Cancel ]",
+                state.focused == MkdirDialogField::ButtonCancel,
+            ),
         ],
         normal,
         highlight,

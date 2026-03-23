@@ -62,7 +62,18 @@ pub fn render(frame: &mut Frame, area: Rect, ci: &mut CiPanel, is_active: bool) 
             scroll,
             ..
         } => {
-            render_tree(frame, inner, t, is_active, items, *selected, *scroll, ci.spinner_tick);
+            render_tree(
+                frame,
+                inner,
+                items,
+                &TreeRenderCtx {
+                    t,
+                    is_active,
+                    selected: *selected,
+                    scroll: *scroll,
+                    spinner_tick: ci.spinner_tick,
+                },
+            );
         }
         CiView::Loading(_) => {}
         CiView::Error(msg) => {
@@ -75,34 +86,41 @@ pub fn render(frame: &mut Frame, area: Rect, ci: &mut CiPanel, is_active: bool) 
     }
 }
 
-fn render_tree(
-    frame: &mut Frame,
-    area: Rect,
-    t: &Theme,
+struct TreeRenderCtx<'a> {
+    t: &'a Theme,
     is_active: bool,
-    items: &[TreeItem],
     selected: usize,
     scroll: usize,
     spinner_tick: usize,
-) {
+}
+
+fn render_tree(frame: &mut Frame, area: Rect, items: &[TreeItem], ctx: &TreeRenderCtx) {
     let visible_height = area.height as usize;
-    let highlight = if is_active {
-        t.highlight_style()
+    let highlight = if ctx.is_active {
+        ctx.t.highlight_style()
     } else {
-        t.file_style()
+        ctx.t.file_style()
     };
 
     let mut lines: Vec<Line> = Vec::with_capacity(visible_height);
 
-    for i in scroll..items.len().min(scroll + visible_height) {
-        let is_sel = i == selected;
-        let item = &items[i];
+    for (i, item) in items
+        .iter()
+        .enumerate()
+        .skip(ctx.scroll)
+        .take(visible_height)
+    {
+        let is_sel = i == ctx.selected;
 
+        let t = ctx.t;
         let text_style = if is_sel { highlight } else { t.file_style() };
 
         match item {
             TreeItem::Check {
-                check, expanded, loading, ..
+                check,
+                expanded,
+                loading,
+                ..
             } => {
                 let arrow = if *expanded {
                     "\u{25bc}" // ▼
@@ -113,9 +131,7 @@ fn render_tree(
                 let marker_style = if is_sel {
                     highlight
                 } else {
-                    Style::default()
-                        .fg(status_color(check.status, t))
-                        .bg(t.bg)
+                    Style::default().fg(status_color(check.status, t)).bg(t.bg)
                 };
                 let arrow_style = if is_sel {
                     highlight
@@ -131,7 +147,7 @@ fn render_tree(
 
                 if *loading {
                     let braille = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-                    let c = braille[spinner_tick % braille.len()];
+                    let c = braille[ctx.spinner_tick % braille.len()];
                     let loading_style = Style::default().fg(t.header_fg).bg(t.bg);
                     spans.push(Span::styled(format!("  {} loading...", c), loading_style));
                 }
@@ -143,9 +159,7 @@ fn render_tree(
                 let marker_style = if is_sel {
                     highlight
                 } else {
-                    Style::default()
-                        .fg(status_color(step.status, t))
-                        .bg(t.bg)
+                    Style::default().fg(status_color(step.status, t)).bg(t.bg)
                 };
 
                 lines.push(Line::from(vec![
@@ -157,7 +171,7 @@ fn render_tree(
         }
     }
 
-    let fill = t.bg_style();
+    let fill = ctx.t.bg_style();
     while lines.len() < visible_height {
         lines.push(Line::from(Span::styled(" ", fill)));
     }

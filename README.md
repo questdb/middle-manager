@@ -14,6 +14,9 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Multi-file selection with Shift+Up/Down and Insert key for batch operations
 - Far Manager-style dialogs with keyboard navigation (copy, mkdir, delete, rename)
 - Quick search — just start typing to jump to a file, Enter to open
+- Go-to-path (Ctrl+G) — type a path to navigate instantly, with zsh-style tab completion (case-insensitive, overlay dropdown)
+- Fuzzy file search (Ctrl+F) — recursively finds files by partial/misspelled names, ranked by match quality, opens in editor
+- Clipboard copy — Ctrl+C copies filename, Ctrl+P copies full path (OSC 52)
 - Sort by name, size, or date (F9), persisted across restarts
 - Mouse support — click to select, double-click to open, scroll wheel to navigate
 - Filesystem watcher — panels auto-refresh on external changes (kqueue/inotify, zero-cost idle)
@@ -24,7 +27,7 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Branch name with `⎇` glyph in panel title
 - Ahead/behind remote counts (`↑N ↓M`)
 - Repo-wide status summary in panel title (`● 6 + 3 ? 7`)
-- GitHub PR status with CI check indicators (`PR #42 ✓` / `✗` / `○`)
+- GitHub PR status with CI check indicators (`PR #42 ✓` / `✗` / `○`), merged (`●` magenta) and closed (`✘` red) states
 - Shared git cache across panels, async PR queries (never blocks UI)
 - File name coloring based on git status
 
@@ -35,10 +38,22 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Download step logs and open in the built-in editor
 - Async fetching with animated spinners — never blocks the UI
 - Per-panel CI (left and right panels can each have their own CI view)
-- Tab cycles focus: file panel → CI panel → other file panel
+- Tab/Shift+Tab cycles focus forward/backward: file panel → CI panel → other file panel
+- PageUp/PageDown/Home/End for fast scrolling through long check lists
 - Mouse click support for selecting items in the tree
 - Failed checks sorted to top for quick access
 - PR number displayed in panel title
+
+**Embedded Terminal (F12)**
+- Spawns `claude` (Claude Code) in the opposite panel, using the active panel's directory
+- Full PTY emulation via `portable-pty` + `vt100` — colors, cursor, alternate screen all work
+- All keystrokes forwarded to the terminal (arrows, Ctrl combos, function keys)
+- 10,000-line scrollback buffer with trackpad/mouse scroll (like Ghostty/iTerm2)
+- F5 opens file:line references from terminal output in the built-in editor
+- Tab/Shift+Tab switches focus back to file panels, F12 closes
+- Auto-closes when the child process exits
+- Coalescing wakeup mechanism — terminal output renders immediately without flooding the event loop
+- Zero-allocation render loop (vt100 0.16 `&str` cells, reused buffers)
 
 **Text Viewer (F3 / Enter)**
 - Sliding buffer: only ~10K lines in memory at a time
@@ -116,7 +131,12 @@ cargo build --release
 | Right / End | Jump to bottom |
 | Enter | Open directory / view file |
 | Backspace | Go to parent directory |
-| Tab | Switch panel (cycles through CI panels too) |
+| Tab | Switch panel forward (cycles through CI/terminal panels) |
+| Shift+Tab | Switch panel backward |
+| Ctrl+F | Fuzzy file search (opens in editor) |
+| Ctrl+G | Go to path (with tab completion) |
+| Ctrl+C | Copy filename to clipboard |
+| Ctrl+P | Copy full path to clipboard |
 | F2 | Toggle CI panel |
 | F3 | View file |
 | F4 | Edit file (built-in) |
@@ -129,6 +149,7 @@ cargo build --release
 | F9 | Cycle sort |
 | F10 | Quit (with confirmation) |
 | F11 | Open PR in browser |
+| F12 | Toggle terminal panel (Claude Code) |
 | Type chars | Quick search |
 
 ### CI Panel
@@ -136,13 +157,27 @@ cargo build --release
 | Key | Action |
 |-----|--------|
 | Up / Down | Navigate tree |
+| PageUp / PageDown | Page through tree |
+| Home / End | Jump to top / bottom |
 | Right | Expand check (load steps) |
 | Left | Collapse check / jump to parent |
 | Enter | Expand/collapse check, or download step log |
 | o | Open check in browser |
-| Tab | Switch panel |
+| Tab / Shift+Tab | Switch panel forward / backward |
 | F2 | Close CI panel |
 | Mouse click | Select item and focus panel |
+
+### Terminal Panel
+
+| Key | Action |
+|-----|--------|
+| All keys (incl. Tab) | Forwarded to the terminal process |
+| Scroll / Trackpad | Scroll through scrollback buffer |
+| F5 | Open file:line reference in editor |
+| F1 | Switch focus to file panel |
+| Mouse click | Click on file panel to switch focus |
+| F12 | Close terminal panel |
+| F10 | Quit (with confirmation) |
 
 ### Viewer / Hex Viewer
 
@@ -187,7 +222,8 @@ src/
   main.rs           Terminal setup, event loop, panic hook
   app.rs            App state machine, action dispatch, all modes
   action.rs         Action enum (every possible user intent)
-  event.rs          Background thread event polling with graceful shutdown
+  event.rs          Background thread event polling, coalescing wakeup mechanism
+  terminal.rs       Embedded terminal: PTY lifecycle, vt100 parsing, key encoding
   ci.rs             CI panel: check/step fetching, log download, tree state
   state.rs          Persistent state (JSON, ~/.config/middle-manager/)
   syntax.rs         Tree-sitter syntax highlighting with hybrid caching
@@ -209,7 +245,8 @@ src/
     panel_view.rs   Panel table rendering with git status column and tree title
     ci_view.rs      CI panel tree rendering with expand/collapse
     header.rs       Header margin
-    footer.rs       Contextual function key hints (normal / CI mode)
+    terminal_view.rs  Terminal panel rendering (vt100 screen to ratatui spans)
+    footer.rs       Contextual function key hints (normal / CI / terminal mode)
     dialog.rs       Simple dialogs (delete, rename) with cursor navigation
     dialog_helpers.rs  Shared dialog rendering (frame, buttons, checkboxes, separators)
     mkdir_dialog.rs Far Manager-style mkdir dialog with "process multiple names"
@@ -238,7 +275,7 @@ This project is in early development. Things we're considering:
 - [ ] Configurable key bindings
 - [ ] Multiple color schemes
 - [ ] Archive browsing (tar, zip)
-- [ ] Built-in terminal panel
+- [x] Built-in terminal panel
 - [ ] FTP/SFTP support
 - [ ] Plugin system
 

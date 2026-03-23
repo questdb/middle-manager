@@ -31,7 +31,11 @@ pub fn render(frame: &mut Frame, dialog: &DialogState) -> Rect {
     if dialog.has_input {
         // y=2: input field
         let input_focused = dialog.focused == DialogField::Input;
-        let input_style = if input_focused { highlight } else { input_normal };
+        let input_style = if input_focused {
+            highlight
+        } else {
+            input_normal
+        };
         let input_text = format!("{:<width$}", dialog.input, width = layout.cw);
         dh::render_line(
             frame,
@@ -41,7 +45,12 @@ pub fn render(frame: &mut Frame, dialog: &DialogState) -> Rect {
         );
 
         // y=4: separator
-        dh::render_separator(frame, layout.area, layout.inner.y + 4, t.dialog_border_style());
+        dh::render_separator(
+            frame,
+            layout.area,
+            layout.inner.y + 4,
+            t.dialog_border_style(),
+        );
         buttons_y = 5;
 
         if input_focused {
@@ -53,7 +62,12 @@ pub fn render(frame: &mut Frame, dialog: &DialogState) -> Rect {
         }
     } else {
         // y=3: separator
-        dh::render_separator(frame, layout.area, layout.inner.y + 3, t.dialog_border_style());
+        dh::render_separator(
+            frame,
+            layout.area,
+            layout.inner.y + 3,
+            t.dialog_border_style(),
+        );
         buttons_y = 4;
     }
 

@@ -39,7 +39,7 @@ pub fn render(frame: &mut Frame, area: Rect, editor: &mut EditorState) {
 
     let num_style = Style::default().fg(Color::Yellow).bg(t.bg);
     let sep_style = Style::default().fg(Color::DarkGray).bg(t.bg);
-    let default_text_style = Style::default().fg(Color::LightCyan).bg(t.bg);
+    let default_text_style = Style::default().fg(t.editor_text_fg).bg(t.bg);
     let sel_style = Style::default().fg(Color::Black).bg(Color::LightCyan);
 
     // Build syntax-highlighted color map.
@@ -95,7 +95,10 @@ pub fn render(frame: &mut Frame, area: Rect, editor: &mut EditorState) {
         );
 
         let mut spans = vec![
-            Span::styled(format!("{:>width$} ", line_num, width = num_digits), num_style),
+            Span::styled(
+                format!("{:>width$} ", line_num, width = num_digits),
+                num_style,
+            ),
             Span::styled("\u{2502}", sep_style),
         ];
         spans.extend(text_spans);
@@ -443,12 +446,26 @@ fn build_highlighted_spans<'a>(
         Some(r) => r,
         None => {
             // No selection — just apply syntax colors
-            return build_colored_spans(display_text, orig_text, scroll_x, line_colors, default_style, bg);
+            return build_colored_spans(
+                display_text,
+                orig_text,
+                scroll_x,
+                line_colors,
+                default_style,
+                bg,
+            );
         }
     };
 
     if vline < sl || vline > el {
-        return build_colored_spans(display_text, orig_text, scroll_x, line_colors, default_style, bg);
+        return build_colored_spans(
+            display_text,
+            orig_text,
+            scroll_x,
+            line_colors,
+            default_style,
+            bg,
+        );
     }
 
     let display_chars: Vec<char> = display_text.chars().collect();
@@ -459,7 +476,14 @@ fn build_highlighted_spans<'a>(
     let sel_end = if vline == el { ec.min(len) } else { len };
 
     if sel_start >= sel_end && !continues {
-        return build_colored_spans(display_text, orig_text, scroll_x, line_colors, default_style, bg);
+        return build_colored_spans(
+            display_text,
+            orig_text,
+            scroll_x,
+            line_colors,
+            default_style,
+            bg,
+        );
     }
 
     // Build with selection overlay
@@ -468,7 +492,14 @@ fn build_highlighted_spans<'a>(
     // Before selection
     if sel_start > 0 {
         let segment: String = display_chars[..sel_start].iter().collect();
-        let sub_spans = build_colored_spans(&segment, orig_text, scroll_x, line_colors, default_style, bg);
+        let sub_spans = build_colored_spans(
+            &segment,
+            orig_text,
+            scroll_x,
+            line_colors,
+            default_style,
+            bg,
+        );
         spans.extend(sub_spans);
     }
 
@@ -495,12 +526,8 @@ fn build_highlighted_spans<'a>(
                 vec![]
             }
         });
-        let sub_spans = build_colored_spans_with_offset(
-            &segment,
-            offset_colors.as_ref(),
-            default_style,
-            bg,
-        );
+        let sub_spans =
+            build_colored_spans_with_offset(&segment, offset_colors.as_ref(), default_style, bg);
         spans.extend(sub_spans);
     }
 
@@ -605,7 +632,11 @@ fn build_colored_spans_with_offset<'a>(
     let mut current_text = String::new();
 
     for (i, ch) in text.chars().enumerate() {
-        let color = if i < colors.len() { colors[i] } else { Color::LightCyan };
+        let color = if i < colors.len() {
+            colors[i]
+        } else {
+            Color::LightCyan
+        };
         if color != current_color && !current_text.is_empty() {
             spans.push(Span::styled(
                 std::mem::take(&mut current_text),
@@ -630,8 +661,12 @@ fn build_colored_spans_with_offset<'a>(
 fn display_col_to_orig_char(text: &str, display_col: usize, scroll_x: usize) -> usize {
     let mut dcol = 0;
     for (i, ch) in text.chars().enumerate() {
-        if i < scroll_x { continue; }
-        if dcol >= display_col { return i; }
+        if i < scroll_x {
+            continue;
+        }
+        if dcol >= display_col {
+            return i;
+        }
         if ch == '\t' {
             dcol += 4 - (dcol % 4);
         } else if ch.is_control() {

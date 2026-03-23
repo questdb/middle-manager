@@ -72,8 +72,10 @@ pub fn query_pr_info(dir: &Path, branch: &str) -> Option<PrInfo> {
     // Use `gh pr view` which finds the PR for this specific branch
     let output = Command::new("gh")
         .args([
-            "pr", "view",
-            "--json", "number,title,state,statusCheckRollup,url",
+            "pr",
+            "view",
+            "--json",
+            "number,title,state,statusCheckRollup,url",
         ])
         .current_dir(dir)
         .stdout(Stdio::piped())
@@ -94,9 +96,10 @@ pub fn query_pr_info(dir: &Path, branch: &str) -> Option<PrInfo> {
         let any_fail = item.status_check_rollup.iter().any(|c| {
             c.conclusion == "FAILURE" || c.conclusion == "ERROR" || c.conclusion == "CANCELLED"
         });
-        let any_pending = item.status_check_rollup.iter().any(|c| {
-            c.status != "COMPLETED"
-        });
+        let any_pending = item
+            .status_check_rollup
+            .iter()
+            .any(|c| c.status != "COMPLETED");
         if any_fail {
             PrCheckStatus::Fail
         } else if any_pending {

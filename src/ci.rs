@@ -36,7 +36,6 @@ impl CiCheck {
     pub fn is_github_actions(&self) -> bool {
         self.details_url.contains("github.com") && self.job_id > 0
     }
-
 }
 
 /// A step within a CI job.
@@ -230,6 +229,14 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+type ChecksReceiver = std::sync::mpsc::Receiver<Result<(Option<u64>, Vec<CiCheck>), String>>;
+type PendingStepFetch = (
+    usize,
+    usize,
+    CiCheck,
+    std::sync::mpsc::Receiver<Result<Vec<CiStep>, String>>,
+);
+
 /// CI panel state.
 pub struct CiPanel {
     pub view: CiView,
@@ -237,7 +244,7 @@ pub struct CiPanel {
     pub branch: String,
     pub pr_number: Option<u64>,
     /// Receiver for async check fetches.
-    pending_checks: Option<std::sync::mpsc::Receiver<Result<(Option<u64>, Vec<CiCheck>), String>>>,
+    pending_checks: Option<ChecksReceiver>,
     /// Spinner tick counter.
     pub spinner_tick: usize,
     /// Visible height (set by renderer).
@@ -245,7 +252,7 @@ pub struct CiPanel {
     /// Active log download.
     pub download: Option<LogDownload>,
     /// Pending async step fetch: (item_index, check_idx, check, receiver)
-    pending_steps: Option<(usize, usize, CiCheck, std::sync::mpsc::Receiver<Result<Vec<CiStep>, String>>)>,
+    pending_steps: Option<PendingStepFetch>,
 }
 
 impl CiPanel {
@@ -474,19 +481,28 @@ impl CiPanel {
     /// Get the details URL for the selected item (for 'o' browser open).
     pub fn selected_url(&self) -> Option<&str> {
         match &self.view {
-            CiView::Tree { checks, items, selected, .. } => {
-                match items.get(*selected)? {
-                    TreeItem::Check { check, .. } => Some(&check.details_url),
-                    TreeItem::Step { check_idx, .. } => Some(&checks[*check_idx].details_url),
-                }
-            }
+            CiView::Tree {
+                checks,
+                items,
+                selected,
+                ..
+            } => match items.get(*selected)? {
+                TreeItem::Check { check, .. } => Some(&check.details_url),
+                TreeItem::Step { check_idx, .. } => Some(&checks[*check_idx].details_url),
+            },
             _ => None,
         }
     }
 
     /// Left arrow: collapse if on expanded check, jump to parent if on step.
     pub fn collapse_or_parent(&mut self) {
-        if let CiView::Tree { items, selected, scroll, .. } = &mut self.view {
+        if let CiView::Tree {
+            items,
+            selected,
+            scroll,
+            ..
+        } = &mut self.view
+        {
             let sel = *selected;
             match &items[sel] {
                 TreeItem::Check { expanded: true, .. } => {
@@ -510,7 +526,10 @@ impl CiPanel {
     }
 
     pub fn move_up(&mut self) {
-        if let CiView::Tree { selected, scroll, .. } = &mut self.view {
+        if let CiView::Tree {
+            selected, scroll, ..
+        } = &mut self.view
+        {
             if *selected > 0 {
                 *selected -= 1;
                 if *selected < *scroll {
@@ -522,7 +541,13 @@ impl CiPanel {
 
     pub fn move_down(&mut self) {
         let vh = self.visible_height;
-        if let CiView::Tree { selected, scroll, items, .. } = &mut self.view {
+        if let CiView::Tree {
+            selected,
+            scroll,
+            items,
+            ..
+        } = &mut self.view
+        {
             if *selected + 1 < items.len() {
                 *selected += 1;
                 if vh > 0 && *selected >= *scroll + vh {
@@ -531,12 +556,76 @@ impl CiPanel {
             }
         }
     }
+
+    pub fn page_up(&mut self) {
+        let vh = self.visible_height.max(1);
+        if let CiView::Tree {
+            selected, scroll, ..
+        } = &mut self.view
+        {
+            *selected = selected.saturating_sub(vh);
+            if *selected < *scroll {
+                *scroll = *selected;
+            }
+        }
+    }
+
+    pub fn page_down(&mut self) {
+        let vh = self.visible_height.max(1);
+        if let CiView::Tree {
+            selected,
+            scroll,
+            items,
+            ..
+        } = &mut self.view
+        {
+            let max = items.len().saturating_sub(1);
+            *selected = (*selected + vh).min(max);
+            if vh > 0 && *selected >= *scroll + vh {
+                *scroll = *selected - vh + 1;
+            }
+        }
+    }
+
+    pub fn move_to_top(&mut self) {
+        if let CiView::Tree {
+            selected, scroll, ..
+        } = &mut self.view
+        {
+            *selected = 0;
+            *scroll = 0;
+        }
+    }
+
+    pub fn move_to_bottom(&mut self) {
+        let vh = self.visible_height;
+        if let CiView::Tree {
+            selected,
+            scroll,
+            items,
+            ..
+        } = &mut self.view
+        {
+            let max = items.len().saturating_sub(1);
+            *selected = max;
+            if vh > 0 && *selected >= *scroll + vh {
+                *scroll = *selected - vh + 1;
+            }
+        }
+    }
 }
 
 /// Detect the GitHub owner/repo from the current directory.
 fn detect_repo(dir: &Path) -> Option<String> {
     let output = Command::new("gh")
-        .args(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"])
+        .args([
+            "repo",
+            "view",
+            "--json",
+            "nameWithOwner",
+            "--jq",
+            ".nameWithOwner",
+        ])
         .current_dir(dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -552,10 +641,7 @@ fn detect_repo(dir: &Path) -> Option<String> {
 /// Query check runs for a branch's latest PR or commit.
 fn query_checks(dir: &Path, _branch: &str) -> Result<(Option<u64>, Vec<CiCheck>), String> {
     let output = Command::new("gh")
-        .args([
-            "pr", "view",
-            "--json", "number,statusCheckRollup",
-        ])
+        .args(["pr", "view", "--json", "number,statusCheckRollup"])
         .current_dir(dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -590,8 +676,8 @@ fn query_checks(dir: &Path, _branch: &str) -> Result<(Option<u64>, Vec<CiCheck>)
         details_url: String,
     }
 
-    let pr: PrResponse = serde_json::from_str(&text)
-        .map_err(|e| format!("Failed to parse response: {}", e))?;
+    let pr: PrResponse =
+        serde_json::from_str(&text).map_err(|e| format!("Failed to parse response: {}", e))?;
 
     let checks = pr
         .checks
@@ -835,4 +921,3 @@ fn query_azure_steps(azure: &AzureInfo) -> Result<Vec<CiStep>, String> {
     steps.sort_by_key(|s| s.number);
     Ok(steps)
 }
-
