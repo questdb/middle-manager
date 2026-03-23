@@ -54,19 +54,17 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
         Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(panels_area);
 
     let (left_area, left_ci_area) = if app.ci_panels[0].is_some() {
-        let [top, bottom] = Layout::vertical([
-            Constraint::Percentage(60),
-            Constraint::Percentage(40),
-        ]).areas(left_col);
+        let [top, bottom] =
+            Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .areas(left_col);
         (top, Some(bottom))
     } else {
         (left_col, None)
     };
     let (right_area, right_ci_area) = if app.ci_panels[1].is_some() {
-        let [top, bottom] = Layout::vertical([
-            Constraint::Percentage(60),
-            Constraint::Percentage(40),
-        ]).areas(right_col);
+        let [top, bottom] =
+            Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
+                .areas(right_col);
         (top, Some(bottom))
     } else {
         (right_col, None)
@@ -90,16 +88,40 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
     // Left panel: render terminal or file panel
     let [left_panel, right_panel] = app.panels.each_mut();
     if has_terminal && terminal_side == 0 {
-        terminal_view::render(frame, left_area, app.terminal_panel.as_ref().unwrap(), app.terminal_focused);
+        terminal_view::render(
+            frame,
+            left_area,
+            app.terminal_panel.as_ref().unwrap(),
+            app.terminal_focused,
+        );
     } else {
-        panel_view::render_with_overlays(frame, left_area, left_panel, left_active, app.goto_path[0].as_ref(), app.fuzzy_search[0].as_ref());
+        panel_view::render_with_overlays(
+            frame,
+            left_area,
+            left_panel,
+            left_active,
+            app.goto_path[0].as_ref(),
+            app.fuzzy_search[0].as_ref(),
+        );
     }
 
     // Right panel: render terminal or file panel
     if has_terminal && terminal_side == 1 {
-        terminal_view::render(frame, right_area, app.terminal_panel.as_ref().unwrap(), app.terminal_focused);
+        terminal_view::render(
+            frame,
+            right_area,
+            app.terminal_panel.as_ref().unwrap(),
+            app.terminal_focused,
+        );
     } else {
-        panel_view::render_with_overlays(frame, right_area, right_panel, right_active, app.goto_path[1].as_ref(), app.fuzzy_search[1].as_ref());
+        panel_view::render_with_overlays(
+            frame,
+            right_area,
+            right_panel,
+            right_active,
+            app.goto_path[1].as_ref(),
+            app.fuzzy_search[1].as_ref(),
+        );
     }
 
     // Render CI panels
@@ -171,22 +193,31 @@ fn render_unsaved_dialog(frame: &mut Frame, focused: crate::app::UnsavedDialogFi
         layout.content,
         1,
         Line::from(Span::styled(
-            format!("{:<width$}", "Save changes before closing?", width = layout.cw),
+            format!(
+                "{:<width$}",
+                "Save changes before closing?",
+                width = layout.cw
+            ),
             normal,
         )),
     );
 
     let t = theme();
-    dialog_helpers::render_separator(frame, layout.area, layout.inner.y + 3, t.dialog_border_style());
+    dialog_helpers::render_separator(
+        frame,
+        layout.area,
+        layout.inner.y + 3,
+        t.dialog_border_style(),
+    );
 
     dialog_helpers::render_buttons(
         frame,
         layout.content,
         4,
         &[
-            ("{ Save }", focused == UnsavedDialogField::ButtonSave),
-            ("[ Don't Save ]", focused == UnsavedDialogField::ButtonDiscard),
-            ("[ Cancel ]", focused == UnsavedDialogField::ButtonCancel),
+            ("{ Save }", focused == UnsavedDialogField::Save),
+            ("[ Don't Save ]", focused == UnsavedDialogField::Discard),
+            ("[ Cancel ]", focused == UnsavedDialogField::Cancel),
         ],
         normal,
         highlight,

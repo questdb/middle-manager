@@ -58,10 +58,7 @@ pub fn render_ci(frame: &mut Frame, area: Rect, view: &CiView) {
             ("Tab", "Switch"),
             ("F2", "Close"),
         ],
-        _ => &[
-            ("Tab", "Switch"),
-            ("F2", "Close"),
-        ],
+        _ => &[("Tab", "Switch"), ("F2", "Close")],
     };
 
     let mut spans = Vec::with_capacity(items.len() * 3);

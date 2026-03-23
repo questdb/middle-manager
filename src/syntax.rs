@@ -7,30 +7,30 @@ use crate::theme::theme;
 /// Highlight capture names recognized by the theme.
 /// Order matters — index into this array maps to a theme color.
 const HIGHLIGHT_NAMES: &[&str] = &[
-    "keyword",           // 0
-    "function",          // 1
-    "function.method",   // 2
-    "type",              // 3
-    "type.builtin",      // 4
-    "string",            // 5
-    "string.special",    // 6
-    "number",            // 7
-    "comment",           // 8
-    "variable",          // 9
-    "variable.builtin",  // 10
-    "variable.parameter",// 11
-    "constant",          // 12
-    "constant.builtin",  // 13
-    "operator",          // 14
-    "punctuation",       // 15
-    "punctuation.bracket",// 16
-    "punctuation.delimiter",// 17
-    "attribute",         // 18
-    "tag",               // 19
-    "property",          // 20
-    "label",             // 21
-    "escape",            // 22
-    "constructor",       // 23
+    "keyword",               // 0
+    "function",              // 1
+    "function.method",       // 2
+    "type",                  // 3
+    "type.builtin",          // 4
+    "string",                // 5
+    "string.special",        // 6
+    "number",                // 7
+    "comment",               // 8
+    "variable",              // 9
+    "variable.builtin",      // 10
+    "variable.parameter",    // 11
+    "constant",              // 12
+    "constant.builtin",      // 13
+    "operator",              // 14
+    "punctuation",           // 15
+    "punctuation.bracket",   // 16
+    "punctuation.delimiter", // 17
+    "attribute",             // 18
+    "tag",                   // 19
+    "property",              // 20
+    "label",                 // 21
+    "escape",                // 22
+    "constructor",           // 23
 ];
 
 /// Map highlight capture index to a theme color.
@@ -43,10 +43,10 @@ fn highlight_color(idx: usize) -> Color {
         5 | 6 => t.syn_string,
         7 => t.syn_number,
         8 => t.syn_comment,
-        9 | 10 | 11 => t.syn_variable,
+        9..=11 => t.syn_variable,
         12 | 13 => t.syn_constant,
         14 => t.syn_operator,
-        15 | 16 | 17 => t.syn_punctuation,
+        15..=17 => t.syn_punctuation,
         18 => t.syn_attribute,
         19 => t.syn_tag,
         20 => t.syn_property,
@@ -94,7 +94,12 @@ impl SyntaxHighlighter {
             if let Ok(text) = std::fs::read_to_string(path) {
                 let hash = simple_hash(&text);
                 let mut highlighter = Highlighter::new();
-                let spans = run_highlight(&mut highlighter, config.as_ref().unwrap(), &text, default_color);
+                let spans = run_highlight(
+                    &mut highlighter,
+                    config.as_ref().unwrap(),
+                    &text,
+                    default_color,
+                );
                 let offsets = build_line_offsets(&text);
                 (Some(spans), offsets, hash)
             } else {

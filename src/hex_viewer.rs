@@ -40,11 +40,11 @@ impl HexViewerState {
         };
         let mut buf = vec![0u8; BINARY_CHECK_BYTES];
         let n = file.read(&mut buf).unwrap_or(0);
-        buf[..n].iter().any(|&b| b == 0)
+        buf[..n].contains(&0)
     }
 
     pub fn total_rows(&self) -> usize {
-        ((self.file_size as usize) + BYTES_PER_ROW - 1) / BYTES_PER_ROW
+        (self.file_size as usize).div_ceil(BYTES_PER_ROW)
     }
 
     fn max_scroll(&self) -> usize {

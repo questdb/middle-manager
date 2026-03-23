@@ -81,25 +81,16 @@ enum UndoOp {
         text: String,
     },
     /// Split line at (line, col) into two lines. Inverse: join.
-    SplitLine {
-        line: usize,
-        col: usize,
-    },
+    SplitLine { line: usize, col: usize },
     /// Join line with the next line at (line). Inverse: split.
     JoinLine {
         line: usize,
         col: usize, // column where the join happened (= length of first line before join)
     },
     /// Delete an entire line. Inverse: re-insert.
-    DeleteLine {
-        line: usize,
-        text: String,
-    },
+    DeleteLine { line: usize, text: String },
     /// Clear a line (single-line file). Inverse: restore text.
-    ClearLine {
-        line: usize,
-        text: String,
-    },
+    ClearLine { line: usize, text: String },
 }
 
 #[derive(Clone, Debug)]
@@ -267,11 +258,19 @@ impl EditorState {
                     match (&mut top.op, &entry.op) {
                         // Merge consecutive inserts on same line
                         (
-                            UndoOp::Insert { line: l1, text: t1, .. },
-                            UndoOp::Insert { line: l2, text: t2, .. },
+                            UndoOp::Insert {
+                                line: l1, text: t1, ..
+                            },
+                            UndoOp::Insert {
+                                line: l2, text: t2, ..
+                            },
                         ) if l1 == l2 => {
                             // Break on whitespace
-                            let last_was_ws = t1.chars().last().map(|c| c.is_whitespace()).unwrap_or(false);
+                            let last_was_ws = t1
+                                .chars()
+                                .last()
+                                .map(|c| c.is_whitespace())
+                                .unwrap_or(false);
                             let new_is_ws = t2.chars().any(|c| c.is_whitespace());
                             if !last_was_ws && !new_is_ws {
                                 t1.push_str(t2);
@@ -281,8 +280,16 @@ impl EditorState {
                         }
                         // Merge consecutive backward deletes on same line
                         (
-                            UndoOp::Delete { line: l1, col: c1, text: t1 },
-                            UndoOp::Delete { line: l2, col: c2, text: t2 },
+                            UndoOp::Delete {
+                                line: l1,
+                                col: c1,
+                                text: t1,
+                            },
+                            UndoOp::Delete {
+                                line: l2,
+                                col: c2,
+                                text: t2,
+                            },
                         ) if l1 == l2 => {
                             // Backward delete: new col is one less, prepend
                             if *c2 + t2.len() == *c1 {
@@ -953,8 +960,12 @@ impl EditorState {
             params.query.to_lowercase().into_bytes()
         };
         match params.direction {
-            SearchDirection::Forward => self.find_streaming(&query_bytes, params.case_sensitive, false),
-            SearchDirection::Backward => self.find_streaming(&query_bytes, params.case_sensitive, true),
+            SearchDirection::Forward => {
+                self.find_streaming(&query_bytes, params.case_sensitive, false)
+            }
+            SearchDirection::Backward => {
+                self.find_streaming(&query_bytes, params.case_sensitive, true)
+            }
         }
     }
 
@@ -989,12 +1000,7 @@ impl EditorState {
     /// Uses two passes for correct wrap-around:
     ///   Forward:  pass 1 = cursor→end, pass 2 = beginning→cursor
     ///   Backward: pass 1 = cursor→beginning, pass 2 = end→cursor
-    fn find_streaming(
-        &mut self,
-        query: &[u8],
-        case_sensitive: bool,
-        reverse: bool,
-    ) -> bool {
+    fn find_streaming(&mut self, query: &[u8], case_sensitive: bool, reverse: bool) -> bool {
         let plan = self.build_search_plan();
         if plan.is_empty() {
             return false;
@@ -1021,9 +1027,15 @@ impl EditorState {
             // Forward: skip past anchor_col (match end) in pass 0, limit at cursor_col in pass 1
             // Reverse: limit at cursor_col (match start) in pass 0, skip past anchor_col in pass 1
             let col_for_pass = if reverse {
-                if pass == 0 { cursor_col } else { anchor_col }
+                if pass == 0 {
+                    cursor_col
+                } else {
+                    anchor_col
+                }
+            } else if pass == 0 {
+                anchor_col
             } else {
-                if pass == 0 { anchor_col } else { cursor_col }
+                cursor_col
             };
             let result = self.find_streaming_pass(
                 &plan,
@@ -1095,10 +1107,10 @@ impl EditorState {
             // limit_to: stop searching before this position (forward wrap, backward pass 0)
             let (use_skip, use_limit) = if at_cursor_seg {
                 match (reverse, pass) {
-                    (false, 0) => (true, false),  // forward from cursor
-                    (false, 1) => (false, true),  // forward wrap: start to cursor
-                    (true, 0)  => (false, true),  // backward: start to cursor (find last)
-                    (true, 1)  => (true, false),  // backward wrap: cursor to end (find last)
+                    (false, 0) => (true, false), // forward from cursor
+                    (false, 1) => (false, true), // forward wrap: start to cursor
+                    (true, 0) => (false, true),  // backward: start to cursor (find last)
+                    (true, 1) => (true, false),  // backward wrap: cursor to end (find last)
                     _ => (false, false),
                 }
             } else {
@@ -1117,8 +1129,16 @@ impl EditorState {
                     query,
                     case_sensitive,
                     reverse,
-                    if use_skip { Some((skip_lines_in_seg, skip_col)) } else { None },
-                    if use_limit { Some((skip_lines_in_seg, skip_col)) } else { None },
+                    if use_skip {
+                        Some((skip_lines_in_seg, skip_col))
+                    } else {
+                        None
+                    },
+                    if use_limit {
+                        Some((skip_lines_in_seg, skip_col))
+                    } else {
+                        None
+                    },
                 )
             } else if let Segment::Buffer { lines } = &self.segments[seg_idx] {
                 search_buffer_segment(
@@ -1127,8 +1147,16 @@ impl EditorState {
                     query,
                     case_sensitive,
                     reverse,
-                    if use_skip { Some((skip_lines_in_seg, skip_col)) } else { None },
-                    if use_limit { Some((skip_lines_in_seg, skip_col)) } else { None },
+                    if use_skip {
+                        Some((skip_lines_in_seg, skip_col))
+                    } else {
+                        None
+                    },
+                    if use_limit {
+                        Some((skip_lines_in_seg, skip_col))
+                    } else {
+                        None
+                    },
                 )
             } else {
                 None
@@ -1211,13 +1239,28 @@ impl EditorState {
 
         if reverse {
             self.search_original_reverse(
-                read_start_byte, effective_end_byte, start_line_offset, vline_start,
-                orig_start_line, query, search_fn, match_char_len, skip_to, limit_to,
+                read_start_byte,
+                effective_end_byte,
+                start_line_offset,
+                vline_start,
+                orig_start_line,
+                query,
+                search_fn,
+                match_char_len,
+                skip_to,
+                limit_to,
             )
         } else {
             self.search_original_forward(
-                read_start_byte, effective_end_byte, start_line_offset, vline_start,
-                query, search_fn, match_char_len, skip_to, limit_to,
+                read_start_byte,
+                effective_end_byte,
+                start_line_offset,
+                vline_start,
+                query,
+                search_fn,
+                match_char_len,
+                skip_to,
+                limit_to,
             )
         }
     }
@@ -1251,7 +1294,9 @@ impl EditorState {
         while bytes_left > 0 {
             let to_read = buf.len().min(bytes_left);
             let n = reader.read(&mut buf[..to_read]).ok()?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             bytes_left -= n;
 
             let chunk = if carry.is_empty() {
@@ -1264,14 +1309,22 @@ impl EditorState {
             let search_start = if let Some((sl, sc)) = skip_to {
                 if current_line <= sl {
                     line_col_to_byte_pos(chunk, sl - current_line, sc)
-                } else { 0 }
-            } else { 0 };
+                } else {
+                    0
+                }
+            } else {
+                0
+            };
 
             let search_end = if let Some((ll, lc)) = limit_to {
                 if current_line <= ll {
                     line_col_to_byte_pos(chunk, ll - current_line, lc).min(chunk.len())
-                } else { 0 }
-            } else { chunk.len() };
+                } else {
+                    0
+                }
+            } else {
+                chunk.len()
+            };
 
             if search_start < search_end {
                 if let Some(found) = search_fn(&chunk[search_start..search_end], query) {
@@ -1314,7 +1367,9 @@ impl EditorState {
         limit_to: Option<(usize, usize)>,
     ) -> Option<(usize, usize, usize)> {
         let total_bytes = (effective_end_byte - read_start_byte) as usize;
-        if total_bytes == 0 { return None; }
+        if total_bytes == 0 {
+            return None;
+        }
 
         const CHUNK_SIZE: usize = 4 * 1024 * 1024;
         let overlap = query.len().saturating_sub(1);
@@ -1330,7 +1385,9 @@ impl EditorState {
             let mut reader = BufReader::new(&file);
             reader.seek(SeekFrom::Start(chunk_start_byte)).ok()?;
             let n = reader.read(&mut buf[..chunk_size]).ok()?;
-            if n == 0 { break; }
+            if n == 0 {
+                break;
+            }
             let chunk = &buf[..n];
 
             // Compute segment-relative line at chunk start via the sparse index.
@@ -1345,7 +1402,9 @@ impl EditorState {
                 } else {
                     0
                 }
-            } else { 0 };
+            } else {
+                0
+            };
 
             let search_end = if let Some((ll, lc)) = limit_to {
                 if seg_relative_line <= ll {
@@ -1353,14 +1412,15 @@ impl EditorState {
                 } else {
                     0
                 }
-            } else { n };
+            } else {
+                n
+            };
 
             if search_start < search_end {
                 let slice = &chunk[search_start..search_end];
                 if let Some(found) = rfind_with(slice, query, search_fn) {
                     let abs_pos = search_start + found;
-                    let (line_at, col_at) =
-                        byte_pos_to_line_col(chunk, abs_pos, seg_relative_line);
+                    let (line_at, col_at) = byte_pos_to_line_col(chunk, abs_pos, seg_relative_line);
                     return Some((vline_start + line_at, col_at, match_char_len));
                 }
             }
@@ -1718,7 +1778,7 @@ impl EditorState {
                 Ok(n) => {
                     self.scan_byte_offset += n as u64;
                     self.lines_scanned += 1;
-                    if self.lines_scanned % INDEX_INTERVAL == 0 {
+                    if self.lines_scanned.is_multiple_of(INDEX_INTERVAL) {
                         self.line_index.push(self.scan_byte_offset);
                     }
                 }
@@ -1774,7 +1834,11 @@ fn search_buffer_segment(
         // Determine byte bounds on this line
         let start_byte = if let Some((sl, sc)) = skip_to {
             if offset < sl {
-                if !reverse { continue } else { 0 }
+                if !reverse {
+                    continue;
+                } else {
+                    0
+                }
             } else if offset == sl {
                 char_to_byte(&search_text, sc)
             } else {
@@ -1786,7 +1850,11 @@ fn search_buffer_segment(
 
         let end_byte = if let Some((ll, lc)) = limit_to {
             if offset > ll {
-                if reverse { continue } else { break }
+                if reverse {
+                    continue;
+                } else {
+                    break;
+                }
             } else if offset == ll {
                 char_to_byte(&search_text, lc)
             } else {
@@ -1853,7 +1921,10 @@ fn find_bytes_insensitive(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     let first_lower = needle[0];
     let mut i = 0;
     while i + needle.len() <= haystack.len() {
-        match haystack[i..].iter().position(|b| b.to_ascii_lowercase() == first_lower) {
+        match haystack[i..]
+            .iter()
+            .position(|b| b.to_ascii_lowercase() == first_lower)
+        {
             Some(pos) => {
                 let start = i + pos;
                 if start + needle.len() > haystack.len() {
@@ -2000,7 +2071,7 @@ pub(crate) fn osc52_copy(text: &str) {
 // Exposed for tests
 pub fn base64_encode(data: &[u8]) -> String {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::with_capacity((data.len() + 2) / 3 * 4);
+    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
     for chunk in data.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
@@ -2032,11 +2103,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir();
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!(
-            "mm_test_{}_{}.txt",
-            std::process::id(),
-            id,
-        ));
+        let path = dir.join(format!("mm_test_{}_{}.txt", std::process::id(), id,));
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         drop(f);
@@ -3209,11 +3276,7 @@ mod tests {
         static LARGE_COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir();
         let id = LARGE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!(
-            "mm_large_test_{}_{}.txt",
-            std::process::id(),
-            id,
-        ));
+        let path = dir.join(format!("mm_large_test_{}_{}.txt", std::process::id(), id,));
         let mut f = std::fs::File::create(&path).unwrap();
         for i in 0..total_lines {
             if i == needle_line {
@@ -3305,11 +3368,7 @@ mod tests {
         static LARGE2_COUNTER: AtomicU64 = AtomicU64::new(0);
         let dir = std::env::temp_dir();
         let id = LARGE2_COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = dir.join(format!(
-            "mm_large2_{}_{}.txt",
-            std::process::id(),
-            id,
-        ));
+        let path = dir.join(format!("mm_large2_{}_{}.txt", std::process::id(), id,));
         let mut f = std::fs::File::create(&path).unwrap();
         let total = 80_000;
         let needle1 = 20_000;

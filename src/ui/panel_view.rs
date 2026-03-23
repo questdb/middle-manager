@@ -22,10 +22,8 @@ pub fn render_with_overlays(
     let has_overlay = goto_path.is_some() || fuzzy_search.is_some();
 
     if has_overlay {
-        let [input_area, panel_area] = Layout::vertical([
-            Constraint::Length(1),
-            Constraint::Fill(1),
-        ]).areas(area);
+        let [input_area, panel_area] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(area);
 
         render(frame, panel_area, panel, is_active);
 
@@ -71,12 +69,8 @@ fn render_goto_path_input(frame: &mut Frame, area: Rect, state: &GotoPathState) 
         .fg(t.dialog_title_fg)
         .bg(t.dialog_bg)
         .add_modifier(Modifier::BOLD);
-    let input_style = Style::default()
-        .fg(t.dialog_text_fg)
-        .bg(t.dialog_bg);
-    let cursor_style = Style::default()
-        .fg(t.dialog_bg)
-        .bg(t.dialog_text_fg);
+    let input_style = Style::default().fg(t.dialog_text_fg).bg(t.dialog_bg);
+    let cursor_style = Style::default().fg(t.dialog_bg).bg(t.dialog_text_fg);
 
     let before = &state.input[..state.cursor];
     let cursor_char = state.input[state.cursor..].chars().next();
@@ -90,7 +84,11 @@ fn render_goto_path_input(frame: &mut Frame, area: Rect, state: &GotoPathState) 
     let visible_before = if before_chars > available {
         // Skip enough characters from the start to fit in available width
         let skip = before_chars - available + 1;
-        before.char_indices().nth(skip).map(|(i, _)| &before[i..]).unwrap_or("")
+        before
+            .char_indices()
+            .nth(skip)
+            .map(|(i, _)| &before[i..])
+            .unwrap_or("")
     } else {
         before
     };
@@ -163,7 +161,11 @@ fn render_completions(frame: &mut Frame, area: Rect, state: &GotoPathState) {
 
         if idx < state.completions.len() {
             let name = &state.completions[idx];
-            let style = if state.comp_index == Some(idx) { highlight } else { normal };
+            let style = if state.comp_index == Some(idx) {
+                highlight
+            } else {
+                normal
+            };
             let display = format!(" /{}", name);
             let line = Line::from(Span::styled(display, style));
             let p = ratatui::widgets::Paragraph::new(line).style(style);
@@ -191,7 +193,11 @@ fn render_fuzzy_input(frame: &mut Frame, area: Rect, state: &FuzzySearchState) {
     let before_chars = before.chars().count();
     let visible_before = if before_chars > available {
         let skip = before_chars - available + 1;
-        before.char_indices().nth(skip).map(|(i, _)| &before[i..]).unwrap_or("")
+        before
+            .char_indices()
+            .nth(skip)
+            .map(|(i, _)| &before[i..])
+            .unwrap_or("")
     } else {
         before
     };
@@ -211,7 +217,10 @@ fn render_fuzzy_input(frame: &mut Frame, area: Rect, state: &FuzzySearchState) {
 
     let count = state.results.len();
     let count_str = format!(" {}", count);
-    spans.push(Span::styled(count_str, Style::default().fg(t.dialog_title_fg).bg(t.dialog_bg)));
+    spans.push(Span::styled(
+        count_str,
+        Style::default().fg(t.dialog_title_fg).bg(t.dialog_bg),
+    ));
 
     frame.render_widget(Clear, area);
     frame.render_widget(
@@ -253,7 +262,11 @@ fn render_fuzzy_results(frame: &mut Frame, area: Rect, state: &FuzzySearchState)
 
         if let Some(&(path_idx, _score)) = state.results.get(i) {
             let path = &state.all_paths[path_idx];
-            let style = if state.selected == i { highlight } else { normal };
+            let style = if state.selected == i {
+                highlight
+            } else {
+                normal
+            };
             let display = format!(" {}", path);
             let line = Line::from(Span::styled(display, style));
             let p = ratatui::widgets::Paragraph::new(line).style(style);
@@ -300,10 +313,7 @@ pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool)
 
     // Build rows
     let has_git = panel.git_info.is_some();
-    let git_statuses = panel
-        .git_info
-        .as_ref()
-        .map(|gi| &gi.statuses);
+    let git_statuses = panel.git_info.as_ref().map(|gi| &gi.statuses);
 
     let rows: Vec<Row> = panel
         .entries
@@ -311,9 +321,7 @@ pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool)
         .enumerate()
         .map(|(idx, entry)| {
             let is_selected = panel.selected_indices.contains(&idx);
-            let git_status = git_statuses
-                .and_then(|s| s.get(&entry.name))
-                .copied();
+            let git_status = git_statuses.and_then(|s| s.get(&entry.name)).copied();
 
             let name_style = if is_selected {
                 t.selected_style()
@@ -369,11 +377,13 @@ pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool)
             } else {
                 Style::default().fg(t.date_fg).bg(t.bg)
             }));
-            cells.push(Cell::from(entry.formatted_permissions()).style(if is_selected {
-                t.selected_style()
-            } else {
-                Style::default().fg(t.perm_fg).bg(t.bg)
-            }));
+            cells.push(
+                Cell::from(entry.formatted_permissions()).style(if is_selected {
+                    t.selected_style()
+                } else {
+                    Style::default().fg(t.perm_fg).bg(t.bg)
+                }),
+            );
 
             Row::new(cells)
         })
@@ -451,7 +461,12 @@ pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool)
 }
 
 /// Build the panel border title: " /path  ⎇ branch  ● 6 ? 1 "
-fn build_panel_title(panel: &Panel, t: &Theme, is_active: bool, panel_width: usize) -> Vec<Span<'static>> {
+fn build_panel_title(
+    panel: &Panel,
+    t: &Theme,
+    is_active: bool,
+    panel_width: usize,
+) -> Vec<Span<'static>> {
     let mut spans = Vec::with_capacity(12);
     let title_style = if is_active {
         Style::default()

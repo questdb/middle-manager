@@ -27,7 +27,11 @@ pub fn render(frame: &mut Frame, state: &SearchDialogState) -> Rect {
 
     // y=2: query input
     let query_focused = state.focused == SearchDialogField::Query;
-    let query_style = if query_focused { highlight } else { input_normal };
+    let query_style = if query_focused {
+        highlight
+    } else {
+        input_normal
+    };
     let query_text = format!("{:<width$}", state.query, width = layout.cw);
     dh::render_line(
         frame,
@@ -37,7 +41,12 @@ pub fn render(frame: &mut Frame, state: &SearchDialogState) -> Rect {
     );
 
     // y=4: separator
-    dh::render_separator(frame, layout.area, layout.inner.y + 4, t.dialog_border_style());
+    dh::render_separator(
+        frame,
+        layout.area,
+        layout.inner.y + 4,
+        t.dialog_border_style(),
+    );
 
     // y=5: direction toggle
     let dir_focused = state.focused == SearchDialogField::Direction;
@@ -55,7 +64,9 @@ pub fn render(frame: &mut Frame, state: &SearchDialogState) -> Rect {
             Span::styled(dir_prefix, normal),
             Span::styled(
                 format!("{}{}", dir_label, " ".repeat(dir_pad)),
-                if dir_focused { highlight } else {
+                if dir_focused {
+                    highlight
+                } else {
                     Style::default()
                         .fg(t.dialog_input_fg)
                         .bg(dbg)
@@ -78,7 +89,12 @@ pub fn render(frame: &mut Frame, state: &SearchDialogState) -> Rect {
     );
 
     // y=7: separator
-    dh::render_separator(frame, layout.area, layout.inner.y + 7, t.dialog_border_style());
+    dh::render_separator(
+        frame,
+        layout.area,
+        layout.inner.y + 7,
+        t.dialog_border_style(),
+    );
 
     // y=8: buttons
     dh::render_buttons(

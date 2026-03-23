@@ -233,7 +233,7 @@ impl ViewerState {
                     self.lines_scanned += 1;
 
                     // Record sparse index checkpoint.
-                    if self.lines_scanned % INDEX_INTERVAL == 0 {
+                    if self.lines_scanned.is_multiple_of(INDEX_INTERVAL) {
                         self.line_index.push(self.scan_byte_offset);
                     }
                 }
@@ -268,7 +268,7 @@ impl ViewerState {
                 Ok(n) => {
                     self.scan_byte_offset += n as u64;
                     self.lines_scanned += 1;
-                    if self.lines_scanned % INDEX_INTERVAL == 0 {
+                    if self.lines_scanned.is_multiple_of(INDEX_INTERVAL) {
                         self.line_index.push(self.scan_byte_offset);
                     }
                 }

@@ -138,7 +138,9 @@ impl TerminalPanel {
     /// Scroll down (toward current output). Stops at 0 (live view).
     pub fn scroll_down(&mut self, lines: usize) {
         let current = self.parser.screen().scrollback();
-        self.parser.screen_mut().set_scrollback(current.saturating_sub(lines));
+        self.parser
+            .screen_mut()
+            .set_scrollback(current.saturating_sub(lines));
     }
 
     /// Jump back to live output (scroll offset 0).
@@ -170,7 +172,7 @@ impl TerminalPanel {
                     if contents.is_empty() {
                         text.push(' ');
                     } else {
-                        text.push_str(&contents);
+                        text.push_str(contents);
                     }
                 } else {
                     text.push(' ');
@@ -206,7 +208,10 @@ fn parse_file_reference(text: &str, base_dir: &Path) -> Option<(PathBuf, usize, 
         let col_start = i + 1 + digits.len();
         let col = if text.get(col_start..col_start + 1) == Some(":") {
             let after_col = &text[col_start + 1..];
-            let col_digits: String = after_col.chars().take_while(|c| c.is_ascii_digit()).collect();
+            let col_digits: String = after_col
+                .chars()
+                .take_while(|c| c.is_ascii_digit())
+                .collect();
             col_digits.parse::<usize>().unwrap_or(1)
         } else {
             1
@@ -218,7 +223,11 @@ fn parse_file_reference(text: &str, base_dir: &Path) -> Option<(PathBuf, usize, 
             .rfind(|c: char| c.is_whitespace() || c == '(' || c == '\'' || c == '"' || c == '`')
             .map(|pos| {
                 // Advance past the matched character (which may be multi-byte)
-                pos + before[pos..].chars().next().map(|c| c.len_utf8()).unwrap_or(1)
+                pos + before[pos..]
+                    .chars()
+                    .next()
+                    .map(|c| c.len_utf8())
+                    .unwrap_or(1)
             })
             .unwrap_or(0);
         let path_str = &before[path_start..];
@@ -259,7 +268,9 @@ pub fn encode_key_event(key: KeyEvent) -> Vec<u8> {
     let mut bytes = match key.code {
         KeyCode::Char(c) if ctrl => {
             // Ctrl+A = 0x01, Ctrl+B = 0x02, ... Ctrl+Z = 0x1a
-            let b = (c.to_ascii_lowercase() as u8).wrapping_sub(b'a').wrapping_add(1);
+            let b = (c.to_ascii_lowercase() as u8)
+                .wrapping_sub(b'a')
+                .wrapping_add(1);
             vec![b]
         }
         KeyCode::Char(c) => {
@@ -304,4 +315,128 @@ pub fn encode_key_event(key: KeyEvent) -> Vec<u8> {
         bytes.insert(0, 0x1b);
     }
     bytes
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    /// Helper: parse_file_reference with a known base dir (this project's root)
+    fn parse(text: &str) -> Option<(PathBuf, usize, usize)> {
+        let base = std::env::current_dir().unwrap();
+        parse_file_reference(text, &base)
+    }
+
+    #[test]
+    fn parse_simple_file_line() {
+        let result = parse("error at src/main.rs:42");
+        assert!(result.is_some());
+        let (path, line, col) = result.unwrap();
+        assert!(path.ends_with("src/main.rs"));
+        assert_eq!(line, 42);
+        assert_eq!(col, 1);
+    }
+
+    #[test]
+    fn parse_file_line_col() {
+        let result = parse("src/app.rs:100:15 something");
+        assert!(result.is_some());
+        let (path, line, col) = result.unwrap();
+        assert!(path.ends_with("src/app.rs"));
+        assert_eq!(line, 100);
+        assert_eq!(col, 15);
+    }
+
+    #[test]
+    fn parse_in_parens() {
+        let result = parse("see (src/main.rs:1) for details");
+        assert!(result.is_some());
+        let (path, line, _) = result.unwrap();
+        assert!(path.ends_with("src/main.rs"));
+        assert_eq!(line, 1);
+    }
+
+    #[test]
+    fn parse_in_quotes() {
+        let result = parse("file \"src/main.rs:10\" is relevant");
+        assert!(result.is_some());
+        let (_, line, _) = result.unwrap();
+        assert_eq!(line, 10);
+    }
+
+    #[test]
+    fn parse_no_file_ref() {
+        assert!(parse("no file references here").is_none());
+    }
+
+    #[test]
+    fn parse_colon_but_no_digits() {
+        assert!(parse("key: value").is_none());
+    }
+
+    #[test]
+    fn parse_nonexistent_file() {
+        // File doesn't exist — should return None
+        assert!(parse("nonexistent_file.xyz:42").is_none());
+    }
+
+    #[test]
+    fn parse_line_zero_rejected() {
+        // Line 0 is invalid (we require > 0)
+        assert!(parse("src/main.rs:0").is_none());
+    }
+
+    #[test]
+    fn parse_just_extension_no_path() {
+        // ".rs:42" — has a dot, but .rs is not a real file
+        assert!(parse(".rs:42").is_none());
+    }
+
+    #[test]
+    fn encode_basic_keys() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+        let enter = encode_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(enter, vec![b'\r']);
+
+        let esc = encode_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert_eq!(esc, vec![0x1b]);
+
+        let tab = encode_key_event(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert_eq!(tab, vec![b'\t']);
+
+        let up = encode_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        assert_eq!(up, b"\x1b[A".to_vec());
+    }
+
+    #[test]
+    fn encode_ctrl_c() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let ctrl_c = encode_key_event(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL));
+        assert_eq!(ctrl_c, vec![3]); // ETX
+    }
+
+    #[test]
+    fn encode_alt_prefix() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let alt_a = encode_key_event(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::ALT));
+        assert_eq!(alt_a, vec![0x1b, b'a']);
+    }
+
+    #[test]
+    fn encode_unicode_char() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let result = encode_key_event(KeyEvent::new(KeyCode::Char('é'), KeyModifiers::NONE));
+        assert_eq!(result, "é".as_bytes().to_vec());
+    }
+
+    #[test]
+    fn encode_function_keys() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let f1 = encode_key_event(KeyEvent::new(KeyCode::F(1), KeyModifiers::NONE));
+        assert_eq!(f1, b"\x1bOP".to_vec());
+        let f12 = encode_key_event(KeyEvent::new(KeyCode::F(12), KeyModifiers::NONE));
+        assert_eq!(f12, b"\x1b[24~".to_vec());
+    }
 }

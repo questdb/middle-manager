@@ -83,10 +83,18 @@ pub fn render(frame: &mut Frame, area: Rect, tp: &TerminalPanel, is_active: bool
 
 fn vt100_cell_style(cell: &vt100::Cell) -> Style {
     let mut mods = Modifier::empty();
-    if cell.bold() { mods |= Modifier::BOLD; }
-    if cell.italic() { mods |= Modifier::ITALIC; }
-    if cell.underline() { mods |= Modifier::UNDERLINED; }
-    if cell.inverse() { mods |= Modifier::REVERSED; }
+    if cell.bold() {
+        mods |= Modifier::BOLD;
+    }
+    if cell.italic() {
+        mods |= Modifier::ITALIC;
+    }
+    if cell.underline() {
+        mods |= Modifier::UNDERLINED;
+    }
+    if cell.inverse() {
+        mods |= Modifier::REVERSED;
+    }
 
     Style::default()
         .fg(vt100_color(cell.fgcolor()))

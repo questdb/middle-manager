@@ -16,10 +16,10 @@ pub enum GitFileStatus {
 impl GitFileStatus {
     pub fn marker(self) -> &'static str {
         match self {
-            Self::Modified => "\u{25CF}",  // ●
+            Self::Modified => "\u{25CF}", // ●
             Self::Added => "+",
             Self::Deleted => "-",
-            Self::Renamed => "\u{2192}",  // →
+            Self::Renamed => "\u{2192}", // →
             Self::Untracked => "?",
             Self::Conflict => "!",
         }
@@ -273,7 +273,12 @@ fn query_ahead_behind(dir: &Path, branch: &str) -> Option<(usize, usize)> {
     // Try origin/<branch> as the remote ref
     let remote_ref = format!("origin/{}", branch);
     let output = Command::new("git")
-        .args(["rev-list", "--left-right", "--count", &format!("{}...{}", branch, remote_ref)])
+        .args([
+            "rev-list",
+            "--left-right",
+            "--count",
+            &format!("{}...{}", branch, remote_ref),
+        ])
         .current_dir(dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -348,7 +353,11 @@ fn query_repo(dir: &Path, _repo_root: &Path) -> Option<CacheEntry> {
             .ok()
             .map(|o| {
                 let s = String::from_utf8_lossy(&o.stdout).trim().to_string();
-                if s.is_empty() { "HEAD".to_string() } else { s }
+                if s.is_empty() {
+                    "HEAD".to_string()
+                } else {
+                    s
+                }
             })
             .unwrap_or_else(|| "HEAD".to_string())
     } else {
@@ -362,14 +371,22 @@ fn query_repo(dir: &Path, _repo_root: &Path) -> Option<CacheEntry> {
         let bracket_content = &header[bracket_start..];
         if let Some(n) = bracket_content
             .find("ahead ")
-            .and_then(|i| bracket_content[i + 6..].split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|i| {
+                bracket_content[i + 6..]
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()
+            })
             .and_then(|s| s.parse::<usize>().ok())
         {
             ahead = n;
         }
         if let Some(n) = bracket_content
             .find("behind ")
-            .and_then(|i| bracket_content[i + 7..].split(|c: char| !c.is_ascii_digit()).next())
+            .and_then(|i| {
+                bracket_content[i + 7..]
+                    .split(|c: char| !c.is_ascii_digit())
+                    .next()
+            })
             .and_then(|s| s.parse::<usize>().ok())
         {
             behind = n;

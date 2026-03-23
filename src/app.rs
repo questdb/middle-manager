@@ -7,10 +7,10 @@ use std::time::Instant;
 const DOUBLE_CLICK_MS: u128 = 400;
 
 use crate::action::Action;
+use crate::ci::CiPanel;
 use crate::editor::EditorState;
 use crate::fs_ops;
 use crate::hex_viewer::HexViewerState;
-use crate::ci::CiPanel;
 use crate::panel::git::GitCache;
 use crate::panel::sort::SortField;
 use crate::panel::Panel;
@@ -121,7 +121,11 @@ impl FuzzySearchState {
             .map(|p| {
                 let chars: Vec<char> = p.chars().collect();
                 let lower_chars: Vec<char> = p.to_lowercase().chars().collect();
-                let filename_start = chars.iter().rposition(|&c| c == '/').map(|i| i + 1).unwrap_or(0);
+                let filename_start = chars
+                    .iter()
+                    .rposition(|&c| c == '/')
+                    .map(|i| i + 1)
+                    .unwrap_or(0);
                 FileEntry {
                     path: p.clone(),
                     lower_chars,
@@ -188,8 +192,12 @@ fn fuzzy_score_precomputed(query_chars: &[char], entry: &FileEntry) -> Option<i6
             }
 
             // Word boundary bonus
-            if ci == 0 || ci == entry.filename_start
-                || matches!(entry.chars.get(ci.wrapping_sub(1)), Some('/' | '.' | '_' | '-' | ' '))
+            if ci == 0
+                || ci == entry.filename_start
+                || matches!(
+                    entry.chars.get(ci.wrapping_sub(1)),
+                    Some('/' | '.' | '_' | '-' | ' ')
+                )
             {
                 score += 10;
             }
@@ -212,8 +220,21 @@ fn fuzzy_score_precomputed(query_chars: &[char], entry: &FileEntry) -> Option<i6
     }
 }
 
-fn collect_files_recursive(root: &std::path::Path, max_files: usize, max_depth: usize) -> Vec<String> {
-    const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".hg", "__pycache__", ".DS_Store", ".idea", ".vscode"];
+fn collect_files_recursive(
+    root: &std::path::Path,
+    max_files: usize,
+    max_depth: usize,
+) -> Vec<String> {
+    const SKIP_DIRS: &[&str] = &[
+        ".git",
+        "node_modules",
+        "target",
+        ".hg",
+        "__pycache__",
+        ".DS_Store",
+        ".idea",
+        ".vscode",
+    ];
     let mut result = Vec::new();
     let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
 
@@ -256,9 +277,9 @@ pub enum AppMode {
     Dialog(DialogState),
     MkdirDialog(MkdirDialogState),
     CopyDialog(CopyDialogState),
-    Viewing(ViewerState),
-    HexViewing(HexViewerState),
-    Editing(EditorState),
+    Viewing(Box<ViewerState>),
+    HexViewing(Box<HexViewerState>),
+    Editing(Box<EditorState>),
 }
 
 // --- Simple dialog (delete, mkdir, rename) ---
@@ -542,24 +563,24 @@ impl SearchDialogField {
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum UnsavedDialogField {
-    ButtonSave,
-    ButtonDiscard,
-    ButtonCancel,
+    Save,
+    Discard,
+    Cancel,
 }
 
 impl UnsavedDialogField {
     pub fn next(self) -> Self {
         match self {
-            Self::ButtonSave => Self::ButtonDiscard,
-            Self::ButtonDiscard => Self::ButtonCancel,
-            Self::ButtonCancel => Self::ButtonSave,
+            Self::Save => Self::Discard,
+            Self::Discard => Self::Cancel,
+            Self::Cancel => Self::Save,
         }
     }
     pub fn prev(self) -> Self {
         match self {
-            Self::ButtonSave => Self::ButtonCancel,
-            Self::ButtonDiscard => Self::ButtonSave,
-            Self::ButtonCancel => Self::ButtonDiscard,
+            Self::Save => Self::Cancel,
+            Self::Discard => Self::Save,
+            Self::Cancel => Self::Discard,
         }
     }
 }
@@ -974,8 +995,8 @@ impl App {
                 KeyCode::Right => Action::CursorRight,
                 KeyCode::Home => Action::CursorLineStart,
                 KeyCode::End => Action::CursorLineEnd,
-                KeyCode::Tab | KeyCode::Down => Action::MoveDown,     // next completion
-                KeyCode::BackTab | KeyCode::Up => Action::MoveUp,     // prev completion
+                KeyCode::Tab | KeyCode::Down => Action::MoveDown, // next completion
+                KeyCode::BackTab | KeyCode::Up => Action::MoveUp, // prev completion
                 KeyCode::Char(c) => Action::DialogInput(c),
                 _ => Action::None,
             };
@@ -1003,7 +1024,9 @@ impl App {
             return match key.code {
                 KeyCode::Enter => Action::DialogConfirm,
                 KeyCode::Esc => Action::DialogCancel,
-                KeyCode::Tab | KeyCode::Left | KeyCode::Right | KeyCode::BackTab => Action::SwitchPanel,
+                KeyCode::Tab | KeyCode::Left | KeyCode::Right | KeyCode::BackTab => {
+                    Action::SwitchPanel
+                }
                 _ => Action::None,
             };
         }
@@ -1111,8 +1134,12 @@ impl App {
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::CopyName,
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::CopyPath,
-            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::GotoPathPrompt,
-            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::FuzzySearchPrompt,
+            KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::GotoPathPrompt
+            }
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::FuzzySearchPrompt
+            }
             KeyCode::Char(c) if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' => {
                 Action::QuickSearch(c)
             }
@@ -1269,7 +1296,7 @@ impl App {
                 KeyCode::Char('z') => Action::EditorUndo,
                 KeyCode::Char('g') => Action::GotoLinePrompt,
                 KeyCode::Char('q') => Action::DialogCancel,
-                KeyCode::Left => Action::WordLeft,   // Ctrl+Left (Linux)
+                KeyCode::Left => Action::WordLeft, // Ctrl+Left (Linux)
                 KeyCode::Right => Action::WordRight, // Ctrl+Right (Linux)
                 KeyCode::Home | KeyCode::Up => Action::MoveToTop,
                 KeyCode::End | KeyCode::Down => Action::MoveToBottom,
@@ -1342,7 +1369,7 @@ impl App {
         {
             let has_unsaved = matches!(self.mode, AppMode::Editing(ref e) if e.modified);
             if has_unsaved {
-                self.unsaved_dialog = Some(UnsavedDialogField::ButtonSave);
+                self.unsaved_dialog = Some(UnsavedDialogField::Save);
             } else {
                 self.quit_confirm = Some(true); // Quit button focused
             }
@@ -1377,7 +1404,7 @@ impl App {
                 Action::DialogConfirm => {
                     let focused = self.unsaved_dialog.unwrap();
                     match focused {
-                        UnsavedDialogField::ButtonSave => {
+                        UnsavedDialogField::Save => {
                             if let AppMode::Editing(ref mut e) = self.mode {
                                 match e.save() {
                                     Ok(()) => {}
@@ -1393,12 +1420,12 @@ impl App {
                             self.needs_clear = true;
                             self.reload_panels();
                         }
-                        UnsavedDialogField::ButtonDiscard => {
+                        UnsavedDialogField::Discard => {
                             self.unsaved_dialog = None;
                             self.mode = AppMode::Normal;
                             self.needs_clear = true;
                         }
-                        UnsavedDialogField::ButtonCancel => {
+                        UnsavedDialogField::Cancel => {
                             self.unsaved_dialog = None;
                         }
                     }
@@ -1468,14 +1495,13 @@ impl App {
                         match result {
                             Ok(path) => {
                                 self.ci_focused = None;
-                                self.mode = AppMode::Editing(
+                                self.mode = AppMode::Editing(Box::new(
                                     crate::editor::EditorState::open(path),
-                                );
+                                ));
                                 return;
                             }
                             Err(e) => {
-                                self.status_message =
-                                    Some(format!("Download failed: {}", e));
+                                self.status_message = Some(format!("Download failed: {}", e));
                             }
                         }
                     }
@@ -1584,7 +1610,11 @@ impl App {
 
             // Go-to-path
             Action::GotoPathPrompt => {
-                let path = self.active_panel().current_dir.to_string_lossy().to_string();
+                let path = self
+                    .active_panel()
+                    .current_dir
+                    .to_string_lossy()
+                    .to_string();
                 let cursor = path.len();
                 self.goto_path[self.active_panel] = Some(GotoPathState {
                     input: path,
@@ -1661,8 +1691,7 @@ impl App {
                             self.ci_focused = None;
                         }
                         Err(e) => {
-                            self.status_message =
-                                Some(format!("Failed to start terminal: {}", e));
+                            self.status_message = Some(format!("Failed to start terminal: {}", e));
                         }
                     }
                 } else {
@@ -1788,7 +1817,11 @@ impl App {
     fn handle_switch_panel_dir(&mut self, reverse: bool) {
         // Focus targets: Panel(side), Ci(side), Terminal
         #[derive(PartialEq)]
-        enum Target { Panel(usize), Ci(usize), Terminal }
+        enum Target {
+            Panel(usize),
+            Ci(usize),
+            Terminal,
+        }
 
         let has_terminal = self.terminal_panel.is_some();
 
@@ -1838,7 +1871,9 @@ impl App {
         } else if let Some(ci_side) = self.ci_focused {
             order.iter().position(|t| *t == Target::Ci(ci_side))
         } else {
-            order.iter().position(|t| *t == Target::Panel(self.active_panel))
+            order
+                .iter()
+                .position(|t| *t == Target::Panel(self.active_panel))
         };
 
         let len = order.len();
@@ -1992,7 +2027,11 @@ impl App {
             Action::CursorRight => {
                 if let Some(ref mut state) = self.goto_path[side] {
                     if state.cursor < state.input.len() {
-                        state.cursor += state.input[state.cursor..].chars().next().map(|c| c.len_utf8()).unwrap_or(0);
+                        state.cursor += state.input[state.cursor..]
+                            .chars()
+                            .next()
+                            .map(|c| c.len_utf8())
+                            .unwrap_or(0);
                     }
                     state.completions.clear();
                     state.comp_index = None;
@@ -2021,9 +2060,9 @@ impl App {
 
     /// Expand ~ and split the input into (parent_dir, prefix_to_match).
     fn expand_goto_input(input: &str) -> (PathBuf, String) {
-        let expanded = if input.starts_with('~') {
+        let expanded = if let Some(rest) = input.strip_prefix('~') {
             if let Some(home) = std::env::var_os("HOME") {
-                format!("{}{}", home.to_string_lossy(), &input[1..])
+                format!("{}{}", home.to_string_lossy(), rest)
             } else {
                 input.to_string()
             }
@@ -2070,7 +2109,7 @@ impl App {
                     }
                 })
                 .collect();
-            matches.sort_by(|a, b| a.to_lowercase().cmp(&b.to_lowercase()));
+            matches.sort_by_key(|a| a.to_lowercase());
             state.completions = matches;
         }
     }
@@ -2117,7 +2156,11 @@ impl App {
 
         // Append the characters beyond the typed prefix + trailing /
         let prefix_chars = prefix.chars().count();
-        let suffix: String = name.chars().skip(prefix_chars).chain(std::iter::once('/')).collect();
+        let suffix: String = name
+            .chars()
+            .skip(prefix_chars)
+            .chain(std::iter::once('/'))
+            .collect();
         state.input.insert_str(state.cursor, &suffix);
         state.cursor += suffix.len();
         state.completions.clear();
@@ -2126,10 +2169,10 @@ impl App {
     }
 
     fn goto_path_navigate(&mut self, side: usize, input: &str) {
-        let expanded = if input.starts_with('~') {
+        let expanded = if let Some(rest) = input.strip_prefix('~') {
             if let Some(home) = std::env::var_os("HOME") {
                 let home = home.to_string_lossy();
-                format!("{}{}", home, &input[1..])
+                format!("{}{}", home, rest)
             } else {
                 input.to_string()
             }
@@ -2164,9 +2207,9 @@ impl App {
                         let full_path = self.panels[side].current_dir.join(rel_path);
                         if full_path.is_file() {
                             self.fuzzy_search[side] = None;
-                            self.mode = AppMode::Editing(
+                            self.mode = AppMode::Editing(Box::new(
                                 crate::editor::EditorState::open(full_path),
-                            );
+                            ));
                             return;
                         }
                     }
@@ -2288,7 +2331,7 @@ impl App {
     fn handle_edit_builtin(&mut self) {
         if let Some(entry) = self.active_panel().selected_entry().cloned() {
             if !entry.is_dir {
-                self.mode = AppMode::Editing(EditorState::open(entry.path));
+                self.mode = AppMode::Editing(Box::new(EditorState::open(entry.path)));
             }
         }
     }
@@ -2326,7 +2369,7 @@ impl App {
             Action::Quit => {
                 let modified = matches!(self.mode, AppMode::Editing(ref e) if e.modified);
                 if modified {
-                    self.unsaved_dialog = Some(UnsavedDialogField::ButtonSave);
+                    self.unsaved_dialog = Some(UnsavedDialogField::Save);
                 } else {
                     self.should_quit = true;
                 }
@@ -2337,7 +2380,7 @@ impl App {
             Action::DialogCancel => {
                 let modified = matches!(self.mode, AppMode::Editing(ref e) if e.modified);
                 if modified {
-                    self.unsaved_dialog = Some(UnsavedDialogField::ButtonSave);
+                    self.unsaved_dialog = Some(UnsavedDialogField::Save);
                 } else {
                     self.mode = AppMode::Normal;
                     self.needs_clear = true;
@@ -2589,11 +2632,11 @@ impl App {
         match &self.mode {
             AppMode::Viewing(v) => {
                 let path = v.path.clone();
-                self.mode = AppMode::HexViewing(HexViewerState::open(path));
+                self.mode = AppMode::HexViewing(Box::new(HexViewerState::open(path)));
             }
             AppMode::HexViewing(h) => {
                 let path = h.path.clone();
-                self.mode = AppMode::Viewing(ViewerState::open(path));
+                self.mode = AppMode::Viewing(Box::new(ViewerState::open(path)));
             }
             _ => {}
         }
@@ -2601,9 +2644,9 @@ impl App {
 
     fn open_file(&mut self, path: PathBuf) {
         if HexViewerState::is_binary(&path) {
-            self.mode = AppMode::HexViewing(HexViewerState::open(path));
+            self.mode = AppMode::HexViewing(Box::new(HexViewerState::open(path)));
         } else {
-            self.mode = AppMode::Viewing(ViewerState::open(path));
+            self.mode = AppMode::Viewing(Box::new(ViewerState::open(path)));
         }
     }
 
@@ -2858,22 +2901,20 @@ impl App {
         match action {
             Action::None | Action::Tick | Action::Resize(_, _) => {
                 // Poll all CI panels and check downloads
-                for ci in self.ci_panels.iter_mut() {
-                    if let Some(ref mut ci) = ci {
-                        ci.poll();
-                        if let Some(result) = ci.poll_download() {
-                            match result {
-                                Ok(path) => {
-                                    // Open downloaded log in editor
-                                    self.ci_focused = None;
-                                    self.mode = AppMode::Editing(
-                                        crate::editor::EditorState::open(path),
-                                    );
-                                    return;
-                                }
-                                Err(e) => {
-                                    self.status_message = Some(format!("Download failed: {}", e));
-                                }
+                for ci in self.ci_panels.iter_mut().flatten() {
+                    ci.poll();
+                    if let Some(result) = ci.poll_download() {
+                        match result {
+                            Ok(path) => {
+                                // Open downloaded log in editor
+                                self.ci_focused = None;
+                                self.mode = AppMode::Editing(Box::new(
+                                    crate::editor::EditorState::open(path),
+                                ));
+                                return;
+                            }
+                            Err(e) => {
+                                self.status_message = Some(format!("Download failed: {}", e));
                             }
                         }
                     }
@@ -2920,9 +2961,7 @@ impl App {
             }
             Action::Enter => {
                 // enter() returns Some if a step was selected for log viewing
-                let log_info = self.ci_panels[side]
-                    .as_mut()
-                    .and_then(|ci| ci.enter());
+                let log_info = self.ci_panels[side].as_mut().and_then(|ci| ci.enter());
                 if let Some((run_id, step)) = log_info {
                     self.start_ci_log_download(side, run_id, &step);
                 }
@@ -3049,8 +3088,7 @@ impl App {
 
     fn click_in_terminal(&self, col: u16, row: u16) -> bool {
         let area = self.panel_areas[self.terminal_side];
-        col >= area.x && col < area.x + area.width
-            && row >= area.y && row < area.y + area.height
+        col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
     }
 
     fn forward_mouse_scroll_to_terminal(&mut self, _col: u16, _row: u16, up: bool) {
@@ -3086,7 +3124,7 @@ impl App {
         editor.cursor_col = target_col;
         editor.desired_col = target_col;
         editor.scroll_to_cursor();
-        self.mode = AppMode::Editing(editor);
+        self.mode = AppMode::Editing(Box::new(editor));
     }
 
     fn resize_terminal(&mut self) {
@@ -3112,7 +3150,13 @@ impl App {
         let safe_name: String = step
             .name
             .chars()
-            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' { c } else { '_' })
+            .map(|c| {
+                if c.is_alphanumeric() || c == '-' || c == '_' || c == '.' {
+                    c
+                } else {
+                    '_'
+                }
+            })
             .collect();
         let output_path = self.panels[self.active_panel]
             .current_dir
@@ -3132,7 +3176,10 @@ impl App {
             let job_id = self.ci_panels[side]
                 .as_ref()
                 .and_then(|ci| {
-                    if let crate::ci::CiView::Tree { items, selected, .. } = &ci.view {
+                    if let crate::ci::CiView::Tree {
+                        items, selected, ..
+                    } = &ci.view
+                    {
                         // Walk back from selected to find the parent check
                         for i in (0..=*selected).rev() {
                             if let crate::ci::TreeItem::Check { check, .. } = &items[i] {
@@ -3157,7 +3204,6 @@ impl App {
             } else {
                 self.status_message = Some("Cannot download: no job ID found".to_string());
             }
-            return;
         } else {
             self.status_message = Some("Cannot download logs: no run ID found".to_string());
         }
@@ -3262,7 +3308,11 @@ impl App {
 
         let dir = self.active_panel().current_dir.clone();
         let names: Vec<&str> = if process_multiple {
-            input.split(';').map(|s| s.trim()).filter(|s| !s.is_empty()).collect()
+            input
+                .split(';')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect()
         } else {
             vec![input.trim()]
         };
@@ -3442,10 +3492,7 @@ impl App {
             e.click_at(col, row);
             return;
         }
-        if matches!(
-            self.mode,
-            AppMode::Viewing(_) | AppMode::HexViewing(_)
-        ) {
+        if matches!(self.mode, AppMode::Viewing(_) | AppMode::HexViewing(_)) {
             return;
         }
         if matches!(
@@ -3731,7 +3778,11 @@ mod fuzzy_tests {
         let query_chars: Vec<char> = query.to_lowercase().chars().collect();
         let chars: Vec<char> = candidate.chars().collect();
         let lower_chars: Vec<char> = candidate.to_lowercase().chars().collect();
-        let filename_start = chars.iter().rposition(|&c| c == '/').map(|i| i + 1).unwrap_or(0);
+        let filename_start = chars
+            .iter()
+            .rposition(|&c| c == '/')
+            .map(|i| i + 1)
+            .unwrap_or(0);
         let entry = FileEntry {
             path: candidate.to_string(),
             lower_chars,
@@ -3799,7 +3850,12 @@ mod fuzzy_tests {
         // "main" consecutively in "main.rs" should score higher than spread across "myappinfo.rs"
         let s1 = score("main", "main.rs").unwrap();
         let s2 = score("main", "myappinfo.rs").unwrap();
-        assert!(s1 > s2, "consecutive match ({}) should beat spread ({})", s1, s2);
+        assert!(
+            s1 > s2,
+            "consecutive match ({}) should beat spread ({})",
+            s1,
+            s2
+        );
     }
 
     #[test]
@@ -3807,14 +3863,24 @@ mod fuzzy_tests {
         // "mod" in filename "mod.rs" should rank higher than in path "models/x.rs"
         let s1 = score("mod", "mod.rs").unwrap();
         let s2 = score("mod", "some/deep/path/models/data.rs").unwrap();
-        assert!(s1 > s2, "filename match ({}) should beat deep path ({})", s1, s2);
+        assert!(
+            s1 > s2,
+            "filename match ({}) should beat deep path ({})",
+            s1,
+            s2
+        );
     }
 
     #[test]
     fn shorter_path_preferred() {
         let s1 = score("app", "app.rs").unwrap();
         let s2 = score("app", "some/very/long/path/to/app.rs").unwrap();
-        assert!(s1 > s2, "short path ({}) should beat long path ({})", s1, s2);
+        assert!(
+            s1 > s2,
+            "short path ({}) should beat long path ({})",
+            s1,
+            s2
+        );
     }
 
     #[test]
@@ -3822,7 +3888,12 @@ mod fuzzy_tests {
         // "pv" matching at word boundaries (panel_view) should beat middle matches
         let s1 = score("pv", "panel_view.rs").unwrap();
         let s2 = score("pv", "approve.rs").unwrap();
-        assert!(s1 > s2, "boundary match ({}) should beat middle ({})", s1, s2);
+        assert!(
+            s1 > s2,
+            "boundary match ({}) should beat middle ({})",
+            s1,
+            s2
+        );
     }
 
     #[test]
@@ -3830,11 +3901,15 @@ mod fuzzy_tests {
         let dir = std::env::current_dir().unwrap();
         let files = collect_files_recursive(&dir, 10_000, 20);
         // Should not contain any paths starting with .git/
-        assert!(!files.iter().any(|p| p.starts_with(".git/")),
-            "should skip .git directory");
+        assert!(
+            !files.iter().any(|p| p.starts_with(".git/")),
+            "should skip .git directory"
+        );
         // Should contain our own source files
-        assert!(files.iter().any(|p| p.ends_with("main.rs")),
-            "should find main.rs");
+        assert!(
+            files.iter().any(|p| p.ends_with("main.rs")),
+            "should find main.rs"
+        );
     }
 
     #[test]
@@ -3856,12 +3931,349 @@ mod fuzzy_tests {
         state.update_results();
         assert!(!state.results.is_empty());
         let top_path = &state.all_paths[state.results[0].0];
-        assert!(top_path.contains("app"), "top result should contain 'app', got: {}", top_path);
+        assert!(
+            top_path.contains("app"),
+            "top result should contain 'app', got: {}",
+            top_path
+        );
 
         // Type "xyz" — should match nothing
         state.input = "xyz".to_string();
         state.cursor = 3;
         state.update_results();
         assert!(state.results.is_empty());
+    }
+
+    // --- Edge cases ---
+
+    #[test]
+    fn unicode_filenames() {
+        // Accented chars match themselves (no normalization, same as fzf)
+        assert!(score("café", "café.txt").is_some());
+        assert!(score("cafe", "café.txt").is_none()); // e ≠ é
+                                                      // CJK characters
+        assert!(score("日本", "日本語.md").is_some());
+        // Mixed ASCII and Unicode
+        assert!(score("txt", "café.txt").is_some());
+    }
+
+    #[test]
+    fn single_char_query() {
+        assert!(score("a", "app.rs").is_some());
+        assert!(score("z", "app.rs").is_none());
+    }
+
+    #[test]
+    fn query_equals_candidate() {
+        let s = score("main.rs", "main.rs").unwrap();
+        // Should be a high score (all consecutive + boundary matches)
+        assert!(s > 0, "exact match should have positive score, got {}", s);
+    }
+
+    #[test]
+    fn deeply_nested_path() {
+        assert!(score("file", "a/b/c/d/e/f/g/file.rs").is_some());
+        // Shallow should beat deep
+        let s1 = score("file", "file.rs").unwrap();
+        let s2 = score("file", "a/b/c/d/e/f/g/file.rs").unwrap();
+        assert!(s1 > s2);
+    }
+
+    #[test]
+    fn dotfiles() {
+        assert!(score("git", ".gitignore").is_some());
+        assert!(score("env", ".env").is_some());
+        assert!(score("gi", ".gitignore").is_some());
+    }
+
+    #[test]
+    fn duplicate_chars_in_query() {
+        // "ss" should match two s's in "settings.rs"
+        assert!(score("ss", "settings.rs").is_some());
+        // "tt" needs two t's — "settings" has two t's
+        assert!(score("tt", "settings.rs").is_some());
+        // "zz" needs two z's — none in "settings.rs"
+        assert!(score("zz", "settings.rs").is_none());
+    }
+
+    #[test]
+    fn special_chars_in_paths() {
+        assert!(score("my", "my file.rs").is_some());
+        assert!(score("my", "my-file.rs").is_some());
+        assert!(score("my", "my_file.rs").is_some());
+    }
+
+    #[test]
+    fn results_truncated_at_100() {
+        // Create 200 matching files
+        let paths: Vec<String> = (0..200).map(|i| format!("file{}.rs", i)).collect();
+        let mut state = FuzzySearchState::new(paths);
+        state.input = "file".to_string();
+        state.cursor = 4;
+        state.update_results();
+        assert!(
+            state.results.len() <= 100,
+            "results should be capped at 100, got {}",
+            state.results.len()
+        );
+    }
+
+    #[test]
+    fn empty_file_list() {
+        let state = FuzzySearchState::new(vec![]);
+        assert!(state.results.is_empty());
+    }
+
+    #[test]
+    fn all_files_match_no_panic() {
+        let paths = vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()];
+        let mut state = FuzzySearchState::new(paths);
+        state.input = "rs".to_string();
+        state.cursor = 2;
+        state.update_results();
+        assert_eq!(state.results.len(), 3);
+    }
+
+    #[test]
+    fn extension_only_match() {
+        // Searching for just an extension
+        assert!(score("rs", "main.rs").is_some());
+        assert!(score("md", "README.md").is_some());
+    }
+
+    #[test]
+    fn query_with_slash() {
+        // User types path separator in query
+        let s = score("src/app", "src/app.rs");
+        assert!(s.is_some());
+    }
+
+    #[test]
+    fn repeated_pattern_picks_best() {
+        // "test" appears in both path and filename
+        let s1 = score("test", "test.rs").unwrap();
+        let s2 = score("test", "test/test_helper.rs").unwrap();
+        // Direct filename match should rank higher
+        assert!(
+            s1 > s2,
+            "direct filename ({}) should beat path+filename ({})",
+            s1,
+            s2
+        );
+    }
+
+    // --- Go-to-path tests ---
+
+    #[test]
+    fn expand_tilde() {
+        let (dir, prefix) = App::expand_goto_input("~/Documents/pro");
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(dir, PathBuf::from(format!("{}/Documents", home)));
+        assert_eq!(prefix, "pro");
+    }
+
+    #[test]
+    fn expand_tilde_trailing_slash() {
+        let (dir, prefix) = App::expand_goto_input("~/Documents/");
+        let home = std::env::var("HOME").unwrap();
+        assert_eq!(dir, PathBuf::from(format!("{}/Documents/", home)));
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn expand_absolute_path() {
+        let (dir, prefix) = App::expand_goto_input("/usr/loc");
+        assert_eq!(dir, PathBuf::from("/usr"));
+        assert_eq!(prefix, "loc");
+    }
+
+    #[test]
+    fn expand_absolute_trailing_slash() {
+        let (dir, prefix) = App::expand_goto_input("/usr/local/");
+        assert_eq!(dir, PathBuf::from("/usr/local/"));
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn expand_empty_input() {
+        let (dir, prefix) = App::expand_goto_input("");
+        assert_eq!(dir, PathBuf::from(""));
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn expand_just_tilde() {
+        let (dir, prefix) = App::expand_goto_input("~");
+        let home = std::env::var("HOME").unwrap();
+        // "~" expands to home dir, no trailing slash, so it's treated as a partial name
+        // parent of /Users/foo is /Users, prefix is "foo"
+        assert!(dir.to_string_lossy().len() > 0);
+        assert!(!prefix.is_empty() || dir == PathBuf::from(&home));
+    }
+
+    #[test]
+    fn apply_completion_basic() {
+        let mut state = GotoPathState {
+            input: "/usr/lo".to_string(),
+            cursor: 7,
+            completions: vec!["local".to_string()],
+            comp_index: None,
+            comp_base: None,
+        };
+        App::apply_completion(&mut state, "local");
+        assert_eq!(state.input, "/usr/local/");
+        assert_eq!(state.cursor, 11);
+    }
+
+    #[test]
+    fn apply_completion_from_empty_prefix() {
+        let mut state = GotoPathState {
+            input: "/usr/".to_string(),
+            cursor: 5,
+            completions: vec!["local".to_string()],
+            comp_index: None,
+            comp_base: None,
+        };
+        App::apply_completion(&mut state, "local");
+        assert_eq!(state.input, "/usr/local/");
+        assert_eq!(state.cursor, 11);
+    }
+
+    #[test]
+    fn apply_common_prefix_extends() {
+        let mut state = GotoPathState {
+            input: "/usr/lo".to_string(),
+            cursor: 7,
+            completions: vec!["local".to_string(), "locale".to_string()],
+            comp_index: None,
+            comp_base: None,
+        };
+        let applied = App::apply_common_prefix(&mut state);
+        assert!(applied);
+        assert_eq!(state.input, "/usr/local");
+        assert_eq!(state.cursor, 10);
+    }
+
+    #[test]
+    fn apply_common_prefix_no_extension() {
+        let mut state = GotoPathState {
+            input: "/usr/local".to_string(),
+            cursor: 10,
+            completions: vec!["local".to_string(), "locale".to_string()],
+            comp_index: None,
+            comp_base: None,
+        };
+        // Already typed the full common prefix
+        let applied = App::apply_common_prefix(&mut state);
+        assert!(!applied);
+    }
+
+    #[test]
+    fn apply_common_prefix_empty_completions() {
+        let mut state = GotoPathState {
+            input: "/usr/xyz".to_string(),
+            cursor: 8,
+            completions: vec![],
+            comp_index: None,
+            comp_base: None,
+        };
+        let applied = App::apply_common_prefix(&mut state);
+        assert!(!applied);
+    }
+
+    #[test]
+    fn populate_completions_real_fs() {
+        // Test against /usr which should exist and have subdirs
+        let mut state = GotoPathState {
+            input: "/usr/".to_string(),
+            cursor: 5,
+            completions: vec![],
+            comp_index: None,
+            comp_base: None,
+        };
+        App::populate_completions(&mut state);
+        // /usr should have at least some subdirectories (bin, lib, etc.)
+        assert!(!state.completions.is_empty(), "should find dirs in /usr");
+        // All completions should be directory names
+        for name in &state.completions {
+            let path = PathBuf::from("/usr").join(name);
+            assert!(path.is_dir(), "{} should be a directory", name);
+        }
+    }
+
+    #[test]
+    fn populate_completions_with_prefix() {
+        let mut state = GotoPathState {
+            input: "/usr/lo".to_string(),
+            cursor: 7,
+            completions: vec![],
+            comp_index: None,
+            comp_base: None,
+        };
+        App::populate_completions(&mut state);
+        // Should match "local" if it exists
+        if PathBuf::from("/usr/local").is_dir() {
+            assert!(
+                state.completions.iter().any(|c| c == "local"),
+                "should find 'local' in /usr with prefix 'lo'"
+            );
+        }
+    }
+
+    #[test]
+    fn populate_completions_case_insensitive() {
+        let mut state = GotoPathState {
+            input: "/usr/LO".to_string(),
+            cursor: 7,
+            completions: vec![],
+            comp_index: None,
+            comp_base: None,
+        };
+        App::populate_completions(&mut state);
+        if PathBuf::from("/usr/local").is_dir() {
+            assert!(
+                state
+                    .completions
+                    .iter()
+                    .any(|c| c.to_lowercase() == "local"),
+                "case-insensitive matching should find 'local'"
+            );
+        }
+    }
+
+    #[test]
+    fn populate_completions_invalid_dir() {
+        let mut state = GotoPathState {
+            input: "/nonexistent_path_12345/".to_string(),
+            cursor: 23,
+            completions: vec![],
+            comp_index: None,
+            comp_base: None,
+        };
+        App::populate_completions(&mut state);
+        assert!(
+            state.completions.is_empty(),
+            "invalid dir should yield no completions"
+        );
+    }
+
+    #[test]
+    fn navigate_results_wraps() {
+        let paths = vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()];
+        let mut state = FuzzySearchState::new(paths);
+        assert_eq!(state.selected, 0);
+
+        // Move down wraps
+        let len = state.results.len().min(8);
+        state.selected = (state.selected + 1) % len;
+        assert_eq!(state.selected, 1);
+        state.selected = (state.selected + 1) % len;
+        assert_eq!(state.selected, 2);
+        state.selected = (state.selected + 1) % len;
+        assert_eq!(state.selected, 0); // wrapped
+
+        // Move up wraps
+        state.selected = (state.selected + len - 1) % len;
+        assert_eq!(state.selected, 2); // wrapped backward
     }
 }

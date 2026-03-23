@@ -222,10 +222,11 @@ impl Panel {
     /// Toggle selection on the current entry and move cursor down.
     pub fn toggle_select_current(&mut self) {
         let idx = self.selected_index();
-        if idx < self.entries.len() && self.entries[idx].name != ".." {
-            if !self.selected_indices.remove(&idx) {
-                self.selected_indices.insert(idx);
-            }
+        if idx < self.entries.len()
+            && self.entries[idx].name != ".."
+            && !self.selected_indices.remove(&idx)
+        {
+            self.selected_indices.insert(idx);
         }
         self.move_selection(1);
     }
