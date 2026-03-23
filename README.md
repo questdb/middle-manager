@@ -47,9 +47,12 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Spawns `claude` (Claude Code) in the opposite panel, using the active panel's directory
 - Full PTY emulation via `portable-pty` + `vt100` — colors, cursor, alternate screen all work
 - All keystrokes forwarded to the terminal (arrows, Ctrl combos, function keys)
+- 10,000-line scrollback buffer with trackpad/mouse scroll (like Ghostty/iTerm2)
+- F5 opens file:line references from terminal output in the built-in editor
 - Tab/Shift+Tab switches focus back to file panels, F12 closes
 - Auto-closes when the child process exits
 - Coalescing wakeup mechanism — terminal output renders immediately without flooding the event loop
+- Zero-allocation render loop (vt100 0.16 `&str` cells, reused buffers)
 
 **Text Viewer (F3 / Enter)**
 - Sliding buffer: only ~10K lines in memory at a time
@@ -167,6 +170,8 @@ cargo build --release
 | Key | Action |
 |-----|--------|
 | All keys | Forwarded to the terminal process |
+| Scroll / Trackpad | Scroll through scrollback buffer |
+| F5 | Open file:line reference in editor |
 | Tab | Switch focus to file panel |
 | Shift+Tab | Switch focus backward |
 | F12 | Close terminal panel |
