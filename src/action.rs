@@ -95,6 +95,10 @@ pub enum Action {
     OpenPr,
     ToggleCi,
 
+    // Terminal
+    ToggleTerminal,
+    TerminalInput(Vec<u8>),
+
     // Application
     Quit,
     Resize(u16, u16),

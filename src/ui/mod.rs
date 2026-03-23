@@ -10,6 +10,7 @@ pub mod mkdir_dialog;
 pub mod panel_view;
 pub mod search_dialog;
 mod shadow;
+pub mod terminal_view;
 pub mod viewer_view;
 
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -76,15 +77,30 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
 
     header::render(frame, header_area, app);
 
-    // File panels are active only when no CI panel is focused
-    let (left_active, right_active) = if app.ci_focused.is_some() {
+    // File panels are active only when no CI/terminal panel is focused
+    let (left_active, right_active) = if app.ci_focused.is_some() || app.terminal_focused {
         (false, false)
     } else {
         (app.active_panel == 0, app.active_panel == 1)
     };
+
+    let has_terminal = app.terminal_panel.is_some();
+    let terminal_side = app.terminal_side;
+
+    // Left panel: render terminal or file panel
     let [left_panel, right_panel] = app.panels.each_mut();
-    panel_view::render_with_goto(frame, left_area, left_panel, left_active, app.goto_path[0].as_ref());
-    panel_view::render_with_goto(frame, right_area, right_panel, right_active, app.goto_path[1].as_ref());
+    if has_terminal && terminal_side == 0 {
+        terminal_view::render(frame, left_area, app.terminal_panel.as_ref().unwrap(), app.terminal_focused);
+    } else {
+        panel_view::render_with_goto(frame, left_area, left_panel, left_active, app.goto_path[0].as_ref());
+    }
+
+    // Right panel: render terminal or file panel
+    if has_terminal && terminal_side == 1 {
+        terminal_view::render(frame, right_area, app.terminal_panel.as_ref().unwrap(), app.terminal_focused);
+    } else {
+        panel_view::render_with_goto(frame, right_area, right_panel, right_active, app.goto_path[1].as_ref());
+    }
 
     // Render CI panels
     if let (Some(ci_area), Some(ref mut ci)) = (left_ci_area, &mut app.ci_panels[0]) {
@@ -94,8 +110,10 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
         ci_view::render(frame, ci_area, ci, app.ci_focused == Some(1));
     }
 
-    // Show CI footer when CI panel is focused, otherwise normal footer
-    if let Some(side) = app.ci_focused {
+    // Show appropriate footer
+    if app.terminal_focused {
+        footer::render_terminal(frame, footer_area);
+    } else if let Some(side) = app.ci_focused {
         if let Some(ref ci) = app.ci_panels[side] {
             footer::render_ci(frame, footer_area, &ci.view);
         } else {

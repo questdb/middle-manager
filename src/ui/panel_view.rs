@@ -67,13 +67,14 @@ fn render_goto_path_input(frame: &mut Frame, area: Rect, state: &GotoPathState) 
     // Scroll the input so the cursor is visible
     let prompt_prefix = " Go: ";
     let available = area.width as usize - prompt_prefix.len();
-    let display_start = if before.len() >= available {
-        before.len() - available + 1
+    let before_chars = before.chars().count();
+    let visible_before = if before_chars > available {
+        // Skip enough characters from the start to fit in available width
+        let skip = before_chars - available + 1;
+        before.char_indices().nth(skip).map(|(i, _)| &before[i..]).unwrap_or("")
     } else {
-        0
+        before
     };
-
-    let visible_before = &before[display_start..];
 
     let mut spans = vec![
         Span::styled(prompt_prefix, prompt_style),

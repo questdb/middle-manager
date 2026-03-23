@@ -8,6 +8,7 @@ mod hex_viewer;
 mod panel;
 mod state;
 mod syntax;
+mod terminal;
 mod theme;
 mod ui;
 mod viewer;
@@ -76,6 +77,7 @@ fn main() -> Result<()> {
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::new();
     let mut events = EventHandler::new(Duration::from_millis(250));
+    app.set_wakeup_sender(events.wakeup_sender());
 
     loop {
         // Clear if needed (e.g. after leaving a full-screen mode)
@@ -129,6 +131,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
             }
             AppEvent::Tick => {
                 app.handle_action(action::Action::Tick);
+            }
+            AppEvent::Wakeup => {
+                // Terminal has output — poll it and re-render.
+                // ack_wakeup clears the flag so the next wake() can send again.
+                app.handle_action(action::Action::Tick);
+                events.ack_wakeup();
             }
         }
 
