@@ -432,22 +432,38 @@ fn build_git_suffix(panel: &Panel, t: &Theme) -> Vec<Span<'static>> {
 
     // PR status
     if let Some(ref pr) = gi.pr {
-        let (pr_color, check_marker) = match pr.checks {
-            PrCheckStatus::Pass => (t.git_added_fg, pr.checks.marker()),
-            PrCheckStatus::Fail => (t.git_deleted_fg, pr.checks.marker()),
-            PrCheckStatus::Pending => (ratatui::style::Color::Yellow, pr.checks.marker()),
-            PrCheckStatus::None => (t.git_branch_fg, ""),
-        };
         spans.push(Span::styled("  ", sep));
-        spans.push(Span::styled(
-            format!("PR #{}", pr.number),
-            Style::default().fg(t.git_branch_fg).bg(t.bg),
-        ));
-        if !check_marker.is_empty() {
+
+        if pr.state == "MERGED" {
+            // Merged PR — show ● in magenta, ignore check status
             spans.push(Span::styled(
-                format!(" {}", check_marker),
-                Style::default().fg(pr_color).bg(t.bg),
+                format!("PR #{} \u{25cf}", pr.number),
+                Style::default().fg(ratatui::style::Color::Magenta).bg(t.bg),
             ));
+        } else if pr.state == "CLOSED" {
+            // Closed without merge
+            spans.push(Span::styled(
+                format!("PR #{} \u{2718}", pr.number),
+                Style::default().fg(t.git_deleted_fg).bg(t.bg),
+            ));
+        } else {
+            // Open PR — show check status
+            let (pr_color, check_marker) = match pr.checks {
+                PrCheckStatus::Pass => (t.git_added_fg, pr.checks.marker()),
+                PrCheckStatus::Fail => (t.git_deleted_fg, pr.checks.marker()),
+                PrCheckStatus::Pending => (ratatui::style::Color::Yellow, pr.checks.marker()),
+                PrCheckStatus::None => (t.git_branch_fg, ""),
+            };
+            spans.push(Span::styled(
+                format!("PR #{}", pr.number),
+                Style::default().fg(t.git_branch_fg).bg(t.bg),
+            ));
+            if !check_marker.is_empty() {
+                spans.push(Span::styled(
+                    format!(" {}", check_marker),
+                    Style::default().fg(pr_color).bg(t.bg),
+                ));
+            }
         }
     }
 

@@ -845,10 +845,9 @@ impl App {
                 KeyCode::F(5) => Action::TerminalOpenFile,
                 KeyCode::F(12) => Action::ToggleTerminal,
                 KeyCode::F(10) => Action::Quit,
-                // Tab switches focus away from terminal
-                KeyCode::Tab if key.modifiers.is_empty() => Action::SwitchPanel,
-                KeyCode::BackTab => Action::SwitchPanelReverse,
-                // Everything else is forwarded to the terminal
+                // F1 switches focus away from terminal (Tab forwarded to claude)
+                KeyCode::F(1) => Action::SwitchPanel,
+                // Everything else (including Tab) is forwarded to the terminal
                 _ => Action::TerminalInput(crate::terminal::encode_key_event(key)),
             };
         }
@@ -2732,8 +2731,22 @@ impl App {
             Action::Quit => {
                 self.quit_confirm = Some(true);
             }
-            Action::MouseClick(col, row) => self.handle_mouse_click(col, row),
-            Action::MouseDoubleClick(col, row) => self.handle_mouse_double_click(col, row),
+            Action::MouseClick(col, row) => {
+                if self.click_in_terminal(col, row) {
+                    // Click inside terminal — stay focused
+                } else {
+                    self.terminal_focused = false;
+                    self.handle_mouse_click(col, row);
+                }
+            }
+            Action::MouseDoubleClick(col, row) => {
+                if self.click_in_terminal(col, row) {
+                    // Double-click inside terminal — absorb
+                } else {
+                    self.terminal_focused = false;
+                    self.handle_mouse_double_click(col, row);
+                }
+            }
             Action::MouseScrollUp(col, row) => {
                 self.forward_mouse_scroll_to_terminal(col, row, true);
             }
@@ -2742,6 +2755,12 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    fn click_in_terminal(&self, col: u16, row: u16) -> bool {
+        let area = self.panel_areas[self.terminal_side];
+        col >= area.x && col < area.x + area.width
+            && row >= area.y && row < area.y + area.height
     }
 
     fn forward_mouse_scroll_to_terminal(&mut self, _col: u16, _row: u16, up: bool) {

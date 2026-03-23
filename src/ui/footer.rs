@@ -24,6 +24,7 @@ pub fn render(frame: &mut Frame, area: Rect) {
         ("F8", "Del"),
         ("F9", "Sort"),
         ("F10", "Quit"),
+        ("F12", "Claude"),
     ];
 
     let mut spans = Vec::with_capacity(items.len() * 3);
@@ -88,10 +89,10 @@ pub fn render_terminal(frame: &mut Frame, area: Rect) {
     let sep_style = Style::default().fg(t.footer_sep_fg).bg(t.footer_sep_bg);
 
     let items: &[(&str, &str)] = &[
+        ("F1", "Switch"),
         ("F5", "Open"),
-        ("Tab", "Switch"),
-        ("F12", "Close"),
         ("F10", "Quit"),
+        ("F12", "Close"),
     ];
 
     let mut spans = Vec::with_capacity(items.len() * 3);

@@ -26,7 +26,7 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Branch name with `⎇` glyph in panel title
 - Ahead/behind remote counts (`↑N ↓M`)
 - Repo-wide status summary in panel title (`● 6 + 3 ? 7`)
-- GitHub PR status with CI check indicators (`PR #42 ✓` / `✗` / `○`)
+- GitHub PR status with CI check indicators (`PR #42 ✓` / `✗` / `○`), merged (`●` magenta) and closed (`✘` red) states
 - Shared git cache across panels, async PR queries (never blocks UI)
 - File name coloring based on git status
 
@@ -169,11 +169,11 @@ cargo build --release
 
 | Key | Action |
 |-----|--------|
-| All keys | Forwarded to the terminal process |
+| All keys (incl. Tab) | Forwarded to the terminal process |
 | Scroll / Trackpad | Scroll through scrollback buffer |
 | F5 | Open file:line reference in editor |
-| Tab | Switch focus to file panel |
-| Shift+Tab | Switch focus backward |
+| F1 | Switch focus to file panel |
+| Mouse click | Click on file panel to switch focus |
 | F12 | Close terminal panel |
 | F10 | Quit (with confirmation) |
 
