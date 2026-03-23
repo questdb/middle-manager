@@ -3722,3 +3722,146 @@ impl App {
         }
     }
 }
+
+#[cfg(test)]
+mod fuzzy_tests {
+    use super::*;
+
+    fn score(query: &str, candidate: &str) -> Option<i64> {
+        let query_chars: Vec<char> = query.to_lowercase().chars().collect();
+        let chars: Vec<char> = candidate.chars().collect();
+        let lower_chars: Vec<char> = candidate.to_lowercase().chars().collect();
+        let filename_start = chars.iter().rposition(|&c| c == '/').map(|i| i + 1).unwrap_or(0);
+        let entry = FileEntry {
+            path: candidate.to_string(),
+            lower_chars,
+            chars,
+            filename_start,
+        };
+        fuzzy_score_precomputed(&query_chars, &entry)
+    }
+
+    #[test]
+    fn exact_match() {
+        assert!(score("main.rs", "main.rs").is_some());
+    }
+
+    #[test]
+    fn prefix_match() {
+        assert!(score("main", "main.rs").is_some());
+    }
+
+    #[test]
+    fn substring_chars_in_order() {
+        // "aprs" matches "app.rs" — a, p, r, s in order
+        assert!(score("aprs", "app.rs").is_some());
+    }
+
+    #[test]
+    fn middle_of_filename() {
+        assert!(score("view", "panel_view.rs").is_some());
+    }
+
+    #[test]
+    fn path_match() {
+        assert!(score("src/main", "src/main.rs").is_some());
+    }
+
+    #[test]
+    fn no_match_wrong_order() {
+        // "srm" — s, r, m not in order in "main.rs"
+        assert!(score("srm", "main.rs").is_none());
+    }
+
+    #[test]
+    fn no_match_missing_chars() {
+        assert!(score("xyz", "main.rs").is_none());
+    }
+
+    #[test]
+    fn case_insensitive() {
+        assert!(score("MAIN", "main.rs").is_some());
+        assert!(score("main", "Main.rs").is_some());
+    }
+
+    #[test]
+    fn empty_query_matches_all() {
+        assert!(score("", "anything.rs").is_some());
+    }
+
+    #[test]
+    fn query_longer_than_candidate_rejected() {
+        assert!(score("toolongquery", "short").is_none());
+    }
+
+    #[test]
+    fn consecutive_bonus() {
+        // "main" consecutively in "main.rs" should score higher than spread across "myappinfo.rs"
+        let s1 = score("main", "main.rs").unwrap();
+        let s2 = score("main", "myappinfo.rs").unwrap();
+        assert!(s1 > s2, "consecutive match ({}) should beat spread ({})", s1, s2);
+    }
+
+    #[test]
+    fn filename_match_beats_path_match() {
+        // "mod" in filename "mod.rs" should rank higher than in path "models/x.rs"
+        let s1 = score("mod", "mod.rs").unwrap();
+        let s2 = score("mod", "some/deep/path/models/data.rs").unwrap();
+        assert!(s1 > s2, "filename match ({}) should beat deep path ({})", s1, s2);
+    }
+
+    #[test]
+    fn shorter_path_preferred() {
+        let s1 = score("app", "app.rs").unwrap();
+        let s2 = score("app", "some/very/long/path/to/app.rs").unwrap();
+        assert!(s1 > s2, "short path ({}) should beat long path ({})", s1, s2);
+    }
+
+    #[test]
+    fn word_boundary_bonus() {
+        // "pv" matching at word boundaries (panel_view) should beat middle matches
+        let s1 = score("pv", "panel_view.rs").unwrap();
+        let s2 = score("pv", "approve.rs").unwrap();
+        assert!(s1 > s2, "boundary match ({}) should beat middle ({})", s1, s2);
+    }
+
+    #[test]
+    fn collect_files_skips_git() {
+        let dir = std::env::current_dir().unwrap();
+        let files = collect_files_recursive(&dir, 10_000, 20);
+        // Should not contain any paths starting with .git/
+        assert!(!files.iter().any(|p| p.starts_with(".git/")),
+            "should skip .git directory");
+        // Should contain our own source files
+        assert!(files.iter().any(|p| p.ends_with("main.rs")),
+            "should find main.rs");
+    }
+
+    #[test]
+    fn fuzzy_search_state_update_results() {
+        let paths = vec![
+            "src/main.rs".to_string(),
+            "src/app.rs".to_string(),
+            "src/editor.rs".to_string(),
+            "README.md".to_string(),
+        ];
+        let mut state = FuzzySearchState::new(paths);
+
+        // Empty query shows all
+        assert_eq!(state.results.len(), 4);
+
+        // Type "app" — should match app.rs
+        state.input = "app".to_string();
+        state.cursor = 3;
+        state.update_results();
+        assert!(!state.results.is_empty());
+        let top_path = &state.all_paths[state.results[0].0];
+        assert!(top_path.contains("app"), "top result should contain 'app', got: {}", top_path);
+
+        // Type "xyz" — should match nothing
+        state.input = "xyz".to_string();
+        state.cursor = 3;
+        state.update_results();
+        assert!(state.results.is_empty());
+    }
+}
