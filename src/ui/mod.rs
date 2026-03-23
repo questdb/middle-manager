@@ -5,6 +5,7 @@ pub mod dialog_helpers;
 pub mod editor_view;
 pub mod footer;
 pub mod header;
+pub mod help_dialog;
 pub mod hex_view;
 pub mod mkdir_dialog;
 pub mod panel_view;
@@ -38,6 +39,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     // Render quit confirmation overlay
     if let Some(quit_focused) = app.quit_confirm {
         let area = render_quit_dialog(frame, quit_focused);
+        shadow::render_shadow(frame, area);
+    }
+
+    // Render help dialog overlay
+    if let Some(scroll) = app.help_scroll {
+        let area = help_dialog::render(frame, scroll);
         shadow::render_shadow(frame, area);
     }
 }

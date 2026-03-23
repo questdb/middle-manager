@@ -231,30 +231,28 @@ impl Panel {
         self.move_selection(1);
     }
 
-    /// Extend selection upward: select current, move up, select new position.
+    /// Toggle selection on current item, then move up.
     pub fn select_move_up(&mut self) {
         let idx = self.selected_index();
-        if idx < self.entries.len() && self.entries[idx].name != ".." {
+        if idx < self.entries.len()
+            && self.entries[idx].name != ".."
+            && !self.selected_indices.remove(&idx)
+        {
             self.selected_indices.insert(idx);
         }
         self.move_selection(-1);
-        let new_idx = self.selected_index();
-        if new_idx < self.entries.len() && self.entries[new_idx].name != ".." {
-            self.selected_indices.insert(new_idx);
-        }
     }
 
-    /// Extend selection downward: select current, move down, select new position.
+    /// Toggle selection on current item, then move down.
     pub fn select_move_down(&mut self) {
         let idx = self.selected_index();
-        if idx < self.entries.len() && self.entries[idx].name != ".." {
+        if idx < self.entries.len()
+            && self.entries[idx].name != ".."
+            && !self.selected_indices.remove(&idx)
+        {
             self.selected_indices.insert(idx);
         }
         self.move_selection(1);
-        let new_idx = self.selected_index();
-        if new_idx < self.entries.len() && self.entries[new_idx].name != ".." {
-            self.selected_indices.insert(new_idx);
-        }
     }
 
     /// Returns paths of all selected entries, or the single cursor entry if none selected.

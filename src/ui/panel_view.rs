@@ -412,7 +412,13 @@ pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool)
         .highlight_symbol("  ");
 
     if is_active {
-        table = table.row_highlight_style(t.highlight_style());
+        let cursor_idx = panel.table_state.selected().unwrap_or(0);
+        let cursor_is_selected = panel.selected_indices.contains(&cursor_idx);
+        if cursor_is_selected {
+            table = table.row_highlight_style(t.selected_highlight_style());
+        } else {
+            table = table.row_highlight_style(t.highlight_style());
+        }
     }
 
     frame.render_stateful_widget(table, area, &mut panel.table_state);

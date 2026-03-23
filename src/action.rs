@@ -101,6 +101,9 @@ pub enum Action {
     TerminalInput(Vec<u8>),
     TerminalOpenFile,
 
+    // Help
+    ShowHelp,
+
     // Application
     Quit,
     Resize(u16, u16),

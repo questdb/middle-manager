@@ -68,6 +68,8 @@ pub struct App {
     pub goto_path: [Option<GotoPathState>; 2],
     /// Fuzzy file search per panel side.
     pub fuzzy_search: [Option<FuzzySearchState>; 2],
+    /// Help dialog scroll offset.
+    pub help_scroll: Option<usize>,
     /// Embedded terminal panel (runs `claude`).
     pub terminal_panel: Option<TerminalPanel>,
     /// Which panel side the terminal occupies (0=left, 1=right).
@@ -862,6 +864,7 @@ impl App {
             quit_confirm: None,
             goto_path: [None, None],
             fuzzy_search: [None, None],
+            help_scroll: None,
             terminal_panel: None,
             terminal_side: 1,
             terminal_focused: false,
@@ -974,6 +977,20 @@ impl App {
     }
 
     pub fn map_key_to_action(&self, key: KeyEvent) -> Action {
+        // Help dialog intercepts keys
+        if self.help_scroll.is_some() {
+            return match key.code {
+                KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q') => Action::DialogCancel,
+                KeyCode::Up => Action::MoveUp,
+                KeyCode::Down => Action::MoveDown,
+                KeyCode::PageUp => Action::PageUp,
+                KeyCode::PageDown => Action::PageDown,
+                KeyCode::Home => Action::MoveToTop,
+                KeyCode::End => Action::MoveToBottom,
+                _ => Action::None,
+            };
+        }
+
         // Goto-line prompt intercepts keys
         if self.goto_line_input.is_some() {
             return match key.code {
@@ -1108,6 +1125,7 @@ impl App {
             KeyCode::Backspace => Action::GoUp,
             KeyCode::Tab => Action::SwitchPanel,
             KeyCode::BackTab => Action::SwitchPanelReverse,
+            KeyCode::F(1) => Action::ShowHelp,
             KeyCode::F(3) => Action::ViewFile,
             KeyCode::F(4) => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -1344,6 +1362,37 @@ impl App {
     // --- Action dispatch ---
 
     pub fn handle_action(&mut self, action: Action) {
+        // Help dialog intercepts when active
+        if self.help_scroll.is_some() {
+            match action {
+                Action::DialogCancel => self.help_scroll = None,
+                Action::MoveUp => {
+                    if let Some(ref mut s) = self.help_scroll {
+                        *s = s.saturating_sub(1);
+                    }
+                }
+                Action::MoveDown => {
+                    if let Some(ref mut s) = self.help_scroll {
+                        *s += 1;
+                    }
+                }
+                Action::PageUp => {
+                    if let Some(ref mut s) = self.help_scroll {
+                        *s = s.saturating_sub(20);
+                    }
+                }
+                Action::PageDown => {
+                    if let Some(ref mut s) = self.help_scroll {
+                        *s += 20;
+                    }
+                }
+                Action::MoveToTop => self.help_scroll = Some(0),
+                Action::MoveToBottom => self.help_scroll = Some(usize::MAX),
+                _ => {}
+            }
+            return;
+        }
+
         // Go-to-line prompt intercepts all input when active
         if self.goto_line_input.is_some() {
             self.handle_goto_line_action(action);
@@ -1623,6 +1672,11 @@ impl App {
                     comp_index: None,
                     comp_base: None,
                 });
+            }
+
+            // Help
+            Action::ShowHelp => {
+                self.help_scroll = Some(0);
             }
 
             // Fuzzy file search
