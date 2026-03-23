@@ -1,7 +1,7 @@
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Cell, Row, Table};
+use ratatui::widgets::{Block, Borders, Cell, Clear, Row, Table};
 use ratatui::Frame;
 
 use crate::app::GotoPathState;
@@ -18,23 +18,28 @@ pub fn render_with_goto(
     goto_path: Option<&GotoPathState>,
 ) {
     if let Some(state) = goto_path {
-        let comp_rows = if state.completions.len() > 1 {
-            (state.completions.len() as u16).min(8) // show at most 8 candidates
-        } else {
-            0
-        };
-
-        let [goto_area, comp_area, panel_area] = Layout::vertical([
+        let [goto_area, panel_area] = Layout::vertical([
             Constraint::Length(1),
-            Constraint::Length(comp_rows),
             Constraint::Fill(1),
         ]).areas(area);
 
+        render(frame, panel_area, panel, is_active);
         render_goto_path_input(frame, goto_area, state);
-        if comp_rows > 0 {
+
+        // Render completions as an overlay on top of the panel
+        if state.completions.len() > 1 {
+            let comp_rows = (state.completions.len() as u16).min(8);
+            // comp_area is the inner content area; render_completions adds borders around it
+            let available_h = panel_area.height.saturating_sub(2); // reserve space for borders
+            let inner_rows = comp_rows.min(available_h);
+            let comp_area = Rect::new(
+                area.x,
+                goto_area.y + goto_area.height,
+                area.width,
+                inner_rows,
+            );
             render_completions(frame, comp_area, state);
         }
-        render(frame, panel_area, panel, is_active);
     } else {
         render(frame, area, panel, is_active);
     }
@@ -43,12 +48,16 @@ pub fn render_with_goto(
 fn render_goto_path_input(frame: &mut Frame, area: Rect, state: &GotoPathState) {
     let t = theme();
 
-    let prompt_style = Style::default().fg(t.search_label_fg).bg(t.search_label_bg);
-    let input_style = Style::default()
-        .fg(t.editor_text_fg)
-        .bg(t.bg)
+    let prompt_style = Style::default()
+        .fg(t.dialog_title_fg)
+        .bg(t.dialog_bg)
         .add_modifier(Modifier::BOLD);
-    let cursor_style = Style::default().fg(t.dialog_cursor_fg).bg(t.dialog_bg);
+    let input_style = Style::default()
+        .fg(t.dialog_text_fg)
+        .bg(t.dialog_bg);
+    let cursor_style = Style::default()
+        .fg(t.dialog_bg)
+        .bg(t.dialog_text_fg);
 
     let before = &state.input[..state.cursor];
     let cursor_char = state.input[state.cursor..].chars().next();
@@ -56,7 +65,7 @@ fn render_goto_path_input(frame: &mut Frame, area: Rect, state: &GotoPathState) 
     let after = &state.input[after_start..];
 
     // Scroll the input so the cursor is visible
-    let prompt_prefix = "Go: ";
+    let prompt_prefix = " Go: ";
     let available = area.width as usize - prompt_prefix.len();
     let display_start = if before.len() >= available {
         before.len() - available + 1
@@ -80,19 +89,43 @@ fn render_goto_path_input(frame: &mut Frame, area: Rect, state: &GotoPathState) 
     }
 
     let line = Line::from(spans);
+    frame.render_widget(Clear, area);
     frame.render_widget(
-        ratatui::widgets::Paragraph::new(line).style(Style::default().bg(t.bg)),
+        ratatui::widgets::Paragraph::new(line).style(Style::default().bg(t.dialog_bg)),
         area,
     );
 }
 
 fn render_completions(frame: &mut Frame, area: Rect, state: &GotoPathState) {
     let t = theme();
-    let normal = Style::default().fg(t.dir_fg).bg(t.bg).add_modifier(Modifier::BOLD);
-    let highlight = Style::default().fg(t.highlight_fg).bg(t.highlight_bg).add_modifier(Modifier::BOLD);
+    let normal = Style::default().fg(t.dialog_text_fg).bg(t.dialog_bg);
+    let highlight = Style::default()
+        .fg(t.dialog_input_fg_focused)
+        .bg(t.dialog_input_bg)
+        .add_modifier(Modifier::BOLD);
+    let border_style = Style::default().fg(t.dialog_border_fg).bg(t.dialog_bg);
+
+    // Add 2 rows for top/bottom border
+    let total_h = area.height + 2;
+    let bordered_area = Rect::new(
+        area.x,
+        area.y,
+        area.width,
+        total_h.min(area.y + area.height + 2 - area.y),
+    );
+
+    frame.render_widget(Clear, bordered_area);
+
+    let block = Block::default()
+        .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+        .border_style(border_style)
+        .style(Style::default().bg(t.dialog_bg));
+
+    let inner = block.inner(bordered_area);
+    frame.render_widget(block, bordered_area);
 
     // Scroll the list so the selected item is visible
-    let max_visible = area.height as usize;
+    let max_visible = inner.height as usize;
     let selected = state.comp_index.unwrap_or(0);
     let scroll = if selected >= max_visible {
         selected - max_visible + 1
@@ -100,25 +133,21 @@ fn render_completions(frame: &mut Frame, area: Rect, state: &GotoPathState) {
         0
     };
 
-    for (i, row) in (0..max_visible).enumerate() {
+    for i in 0..max_visible {
         let idx = scroll + i;
-        let y = area.y + row as u16;
-        if y >= area.y + area.height {
+        let y = inner.y + i as u16;
+        if y >= inner.y + inner.height {
             break;
         }
-        let row_area = Rect::new(area.x, y, area.width, 1);
+        let row_area = Rect::new(inner.x, y, inner.width, 1);
 
         if idx < state.completions.len() {
             let name = &state.completions[idx];
             let style = if state.comp_index == Some(idx) { highlight } else { normal };
-            let display = format!("  /{}", name);
+            let display = format!(" /{}", name);
             let line = Line::from(Span::styled(display, style));
-            // Fill background for the whole row
-            let bg_fill = ratatui::widgets::Paragraph::new(line).style(style);
-            frame.render_widget(bg_fill, row_area);
-        } else {
-            let bg_fill = ratatui::widgets::Paragraph::new("").style(Style::default().bg(t.bg));
-            frame.render_widget(bg_fill, row_area);
+            let p = ratatui::widgets::Paragraph::new(line).style(style);
+            frame.render_widget(p, row_area);
         }
     }
 }

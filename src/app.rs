@@ -792,8 +792,8 @@ impl App {
                 KeyCode::Right => Action::CursorRight,
                 KeyCode::Home => Action::CursorLineStart,
                 KeyCode::End => Action::CursorLineEnd,
-                KeyCode::Tab => Action::MoveDown,     // next completion
-                KeyCode::BackTab => Action::MoveUp,   // prev completion
+                KeyCode::Tab | KeyCode::Down => Action::MoveDown,     // next completion
+                KeyCode::BackTab | KeyCode::Up => Action::MoveUp,     // prev completion
                 KeyCode::Char(c) => Action::DialogInput(c),
                 _ => Action::None,
             };
