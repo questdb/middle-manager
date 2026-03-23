@@ -92,14 +92,14 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
     if has_terminal && terminal_side == 0 {
         terminal_view::render(frame, left_area, app.terminal_panel.as_ref().unwrap(), app.terminal_focused);
     } else {
-        panel_view::render_with_goto(frame, left_area, left_panel, left_active, app.goto_path[0].as_ref());
+        panel_view::render_with_overlays(frame, left_area, left_panel, left_active, app.goto_path[0].as_ref(), app.fuzzy_search[0].as_ref());
     }
 
     // Right panel: render terminal or file panel
     if has_terminal && terminal_side == 1 {
         terminal_view::render(frame, right_area, app.terminal_panel.as_ref().unwrap(), app.terminal_focused);
     } else {
-        panel_view::render_with_goto(frame, right_area, right_panel, right_active, app.goto_path[1].as_ref());
+        panel_view::render_with_overlays(frame, right_area, right_panel, right_active, app.goto_path[1].as_ref(), app.fuzzy_search[1].as_ref());
     }
 
     // Render CI panels

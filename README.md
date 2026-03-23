@@ -15,6 +15,7 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Far Manager-style dialogs with keyboard navigation (copy, mkdir, delete, rename)
 - Quick search — just start typing to jump to a file, Enter to open
 - Go-to-path (Ctrl+G) — type a path to navigate instantly, with zsh-style tab completion (case-insensitive, overlay dropdown)
+- Fuzzy file search (Ctrl+F) — recursively finds files by partial/misspelled names, ranked by match quality, opens in editor
 - Clipboard copy — Ctrl+C copies filename, Ctrl+P copies full path (OSC 52)
 - Sort by name, size, or date (F9), persisted across restarts
 - Mouse support — click to select, double-click to open, scroll wheel to navigate
@@ -132,6 +133,7 @@ cargo build --release
 | Backspace | Go to parent directory |
 | Tab | Switch panel forward (cycles through CI/terminal panels) |
 | Shift+Tab | Switch panel backward |
+| Ctrl+F | Fuzzy file search (opens in editor) |
 | Ctrl+G | Go to path (with tab completion) |
 | Ctrl+C | Copy filename to clipboard |
 | Ctrl+P | Copy full path to clipboard |

@@ -16,6 +16,7 @@ pub enum Action {
     CopyName,
     CopyPath,
     GotoPathPrompt,
+    FuzzySearchPrompt,
 
     // Panel multi-file selection
     ToggleSelect,

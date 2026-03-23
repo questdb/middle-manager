@@ -66,6 +66,8 @@ pub struct App {
     pub ci_focused: Option<usize>,
     /// Go-to-path input per panel side. When Some, a path editor is shown at the top of the panel.
     pub goto_path: [Option<GotoPathState>; 2],
+    /// Fuzzy file search per panel side.
+    pub fuzzy_search: [Option<FuzzySearchState>; 2],
     /// Embedded terminal panel (runs `claude`).
     pub terminal_panel: Option<TerminalPanel>,
     /// Which panel side the terminal occupies (0=left, 1=right).
@@ -85,6 +87,167 @@ pub struct GotoPathState {
     pub comp_index: Option<usize>,
     /// The prefix that was being completed (used to detect when input changes).
     pub comp_base: Option<String>,
+}
+
+/// Pre-computed data for each file path to avoid per-keystroke allocation.
+struct FileEntry {
+    /// Original relative path.
+    path: String,
+    /// Lowercase chars (pre-computed once).
+    lower_chars: Vec<char>,
+    /// Original chars (for word boundary checks).
+    chars: Vec<char>,
+    /// Char index where the filename starts (after last '/').
+    filename_start: usize,
+}
+
+pub struct FuzzySearchState {
+    pub input: String,
+    pub cursor: usize,
+    /// Pre-computed file entries.
+    entries: Vec<FileEntry>,
+    /// Filtered + ranked results: (index into entries, score).
+    pub results: Vec<(usize, i64)>,
+    /// Currently highlighted result index.
+    pub selected: usize,
+    /// Public access to paths for rendering.
+    pub all_paths: Vec<String>,
+}
+
+impl FuzzySearchState {
+    fn new(paths: Vec<String>) -> Self {
+        let entries: Vec<FileEntry> = paths
+            .iter()
+            .map(|p| {
+                let chars: Vec<char> = p.chars().collect();
+                let lower_chars: Vec<char> = p.to_lowercase().chars().collect();
+                let filename_start = chars.iter().rposition(|&c| c == '/').map(|i| i + 1).unwrap_or(0);
+                FileEntry {
+                    path: p.clone(),
+                    lower_chars,
+                    chars,
+                    filename_start,
+                }
+            })
+            .collect();
+
+        let mut state = Self {
+            input: String::new(),
+            cursor: 0,
+            entries,
+            results: Vec::new(),
+            selected: 0,
+            all_paths: paths,
+        };
+        state.update_results();
+        state
+    }
+
+    fn update_results(&mut self) {
+        self.results.clear();
+        if self.input.is_empty() {
+            self.results = (0..self.entries.len().min(100)).map(|i| (i, 0)).collect();
+        } else {
+            // Pre-compute query chars once
+            let query_chars: Vec<char> = self.input.to_lowercase().chars().collect();
+            for (i, entry) in self.entries.iter().enumerate() {
+                if let Some(score) = fuzzy_score_precomputed(&query_chars, entry) {
+                    self.results.push((i, score));
+                }
+            }
+            self.results.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            self.results.truncate(100);
+        }
+        self.selected = 0;
+    }
+}
+
+/// Fuzzy match against pre-computed entry data. Zero allocation.
+fn fuzzy_score_precomputed(query_chars: &[char], entry: &FileEntry) -> Option<i64> {
+    if query_chars.is_empty() {
+        return Some(0);
+    }
+    // Quick reject: query longer than candidate
+    if query_chars.len() > entry.lower_chars.len() {
+        return None;
+    }
+
+    let mut score: i64 = 0;
+    let mut qi = 0;
+    let mut prev_match: Option<usize> = None;
+
+    for (ci, &cc) in entry.lower_chars.iter().enumerate() {
+        if qi < query_chars.len() && cc == query_chars[qi] {
+            score += 1;
+
+            // Consecutive match bonus
+            if let Some(prev) = prev_match {
+                if ci == prev + 1 {
+                    score += 5;
+                }
+            }
+
+            // Word boundary bonus
+            if ci == 0 || ci == entry.filename_start
+                || matches!(entry.chars.get(ci.wrapping_sub(1)), Some('/' | '.' | '_' | '-' | ' '))
+            {
+                score += 10;
+            }
+
+            // Filename match bonus
+            if ci >= entry.filename_start {
+                score += 3;
+            }
+
+            prev_match = Some(ci);
+            qi += 1;
+        }
+    }
+
+    if qi == query_chars.len() {
+        score -= (entry.path.len() as i64) / 10;
+        Some(score)
+    } else {
+        None
+    }
+}
+
+fn collect_files_recursive(root: &std::path::Path, max_files: usize, max_depth: usize) -> Vec<String> {
+    const SKIP_DIRS: &[&str] = &[".git", "node_modules", "target", ".hg", "__pycache__", ".DS_Store", ".idea", ".vscode"];
+    let mut result = Vec::new();
+    let mut stack: Vec<(PathBuf, usize)> = vec![(root.to_path_buf(), 0)];
+
+    while let Some((dir, depth)) = stack.pop() {
+        if depth > max_depth || result.len() >= max_files {
+            break;
+        }
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            if result.len() >= max_files {
+                break;
+            }
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if file_type.is_dir() {
+                if !SKIP_DIRS.contains(&name_str.as_ref()) {
+                    stack.push((entry.path(), depth + 1));
+                }
+            } else if file_type.is_file() {
+                if let Ok(rel) = entry.path().strip_prefix(root) {
+                    result.push(rel.to_string_lossy().to_string());
+                }
+            }
+        }
+    }
+    result.sort_unstable();
+    result
 }
 
 pub enum AppMode {
@@ -677,6 +840,7 @@ impl App {
             ci_focused: None,
             quit_confirm: None,
             goto_path: [None, None],
+            fuzzy_search: [None, None],
             terminal_panel: None,
             terminal_side: 1,
             terminal_focused: false,
@@ -817,6 +981,23 @@ impl App {
             };
         }
 
+        // Fuzzy file search input intercepts keys
+        if self.fuzzy_search[self.active_panel].is_some() {
+            return match key.code {
+                KeyCode::Esc => Action::DialogCancel,
+                KeyCode::Enter => Action::DialogConfirm,
+                KeyCode::Backspace => Action::DialogBackspace,
+                KeyCode::Left => Action::CursorLeft,
+                KeyCode::Right => Action::CursorRight,
+                KeyCode::Home => Action::CursorLineStart,
+                KeyCode::End => Action::CursorLineEnd,
+                KeyCode::Tab | KeyCode::Down => Action::MoveDown,
+                KeyCode::BackTab | KeyCode::Up => Action::MoveUp,
+                KeyCode::Char(c) => Action::DialogInput(c),
+                _ => Action::None,
+            };
+        }
+
         // Quit confirmation intercepts keys
         if self.quit_confirm.is_some() {
             return match key.code {
@@ -931,6 +1112,7 @@ impl App {
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::CopyName,
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::CopyPath,
             KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::GotoPathPrompt,
+            KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::FuzzySearchPrompt,
             KeyCode::Char(c) if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' => {
                 Action::QuickSearch(c)
             }
@@ -1144,6 +1326,12 @@ impl App {
         // Go-to-path input intercepts all input when active
         if self.goto_path[self.active_panel].is_some() {
             self.handle_goto_path_action(action);
+            return;
+        }
+
+        // Fuzzy file search intercepts all input when active
+        if self.fuzzy_search[self.active_panel].is_some() {
+            self.handle_fuzzy_search_action(action);
             return;
         }
 
@@ -1407,6 +1595,13 @@ impl App {
                 });
             }
 
+            // Fuzzy file search
+            Action::FuzzySearchPrompt => {
+                let root = self.active_panel().current_dir.clone();
+                let paths = collect_files_recursive(&root, 10_000, 20);
+                self.fuzzy_search[self.active_panel] = Some(FuzzySearchState::new(paths));
+            }
+
             // Sorting
             Action::CycleSort => {
                 self.active_panel_mut().cycle_sort();
@@ -1489,7 +1684,7 @@ impl App {
             Action::DialogCancel => self.handle_dialog_cancel(),
             Action::DialogBackspace => self.handle_dialog_backspace(),
             Action::DialogConfirm | Action::DialogInput(_) => {}
-            Action::TerminalInput(_) | Action::TerminalOpenFile => {} // handled by terminal intercept above
+            Action::TerminalInput(_) | Action::TerminalOpenFile => {} // handled by intercepts above
         }
     }
 
@@ -1953,6 +2148,101 @@ impl App {
             }
         } else {
             self.status_message = Some(format!("Not a directory: {}", expanded));
+        }
+    }
+
+    fn handle_fuzzy_search_action(&mut self, action: Action) {
+        let side = self.active_panel;
+        match action {
+            Action::DialogCancel => {
+                self.fuzzy_search[side] = None;
+            }
+            Action::DialogConfirm => {
+                if let Some(ref state) = self.fuzzy_search[side] {
+                    if let Some(&(path_idx, _)) = state.results.get(state.selected) {
+                        let rel_path = &state.all_paths[path_idx];
+                        let full_path = self.panels[side].current_dir.join(rel_path);
+                        if full_path.is_file() {
+                            self.fuzzy_search[side] = None;
+                            self.mode = AppMode::Editing(
+                                crate::editor::EditorState::open(full_path),
+                            );
+                            return;
+                        }
+                    }
+                }
+                self.fuzzy_search[side] = None;
+            }
+            Action::DialogInput(c) => {
+                if let Some(ref mut state) = self.fuzzy_search[side] {
+                    state.input.insert(state.cursor, c);
+                    state.cursor += c.len_utf8();
+                    state.update_results();
+                }
+            }
+            Action::DialogBackspace => {
+                if let Some(ref mut state) = self.fuzzy_search[side] {
+                    if state.cursor > 0 {
+                        let prev = state.input[..state.cursor]
+                            .char_indices()
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                        state.input.remove(prev);
+                        state.cursor = prev;
+                        state.update_results();
+                    }
+                }
+            }
+            Action::MoveDown => {
+                if let Some(ref mut state) = self.fuzzy_search[side] {
+                    let len = state.results.len().min(8);
+                    if len > 0 {
+                        state.selected = (state.selected + 1) % len;
+                    }
+                }
+            }
+            Action::MoveUp => {
+                if let Some(ref mut state) = self.fuzzy_search[side] {
+                    let len = state.results.len().min(8);
+                    if len > 0 {
+                        state.selected = (state.selected + len - 1) % len;
+                    }
+                }
+            }
+            Action::CursorLeft => {
+                if let Some(ref mut state) = self.fuzzy_search[side] {
+                    if state.cursor > 0 {
+                        state.cursor = state.input[..state.cursor]
+                            .char_indices()
+                            .last()
+                            .map(|(i, _)| i)
+                            .unwrap_or(0);
+                    }
+                }
+            }
+            Action::CursorRight => {
+                if let Some(ref mut state) = self.fuzzy_search[side] {
+                    if state.cursor < state.input.len() {
+                        state.cursor += state.input[state.cursor..]
+                            .chars()
+                            .next()
+                            .map(|c| c.len_utf8())
+                            .unwrap_or(0);
+                    }
+                }
+            }
+            Action::CursorLineStart => {
+                if let Some(ref mut state) = self.fuzzy_search[side] {
+                    state.cursor = 0;
+                }
+            }
+            Action::CursorLineEnd => {
+                if let Some(ref mut state) = self.fuzzy_search[side] {
+                    state.cursor = state.input.len();
+                }
+            }
+            _ => {}
         }
     }
 

@@ -4,41 +4,60 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Row, Table};
 use ratatui::Frame;
 
-use crate::app::GotoPathState;
+use crate::app::{FuzzySearchState, GotoPathState};
 use crate::panel::github::PrCheckStatus;
 use crate::panel::sort::SortField;
 use crate::panel::Panel;
 use crate::theme::{theme, Theme};
 
-pub fn render_with_goto(
+pub fn render_with_overlays(
     frame: &mut Frame,
     area: Rect,
     panel: &mut Panel,
     is_active: bool,
     goto_path: Option<&GotoPathState>,
+    fuzzy_search: Option<&FuzzySearchState>,
 ) {
-    if let Some(state) = goto_path {
-        let [goto_area, panel_area] = Layout::vertical([
+    // Determine which overlay is active (at most one at a time)
+    let has_overlay = goto_path.is_some() || fuzzy_search.is_some();
+
+    if has_overlay {
+        let [input_area, panel_area] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Fill(1),
         ]).areas(area);
 
         render(frame, panel_area, panel, is_active);
-        render_goto_path_input(frame, goto_area, state);
 
-        // Render completions as an overlay on top of the panel
-        if state.completions.len() > 1 {
-            let comp_rows = (state.completions.len() as u16).min(8);
-            // comp_area is the inner content area; render_completions adds borders around it
-            let available_h = panel_area.height.saturating_sub(2); // reserve space for borders
-            let inner_rows = comp_rows.min(available_h);
-            let comp_area = Rect::new(
-                area.x,
-                goto_area.y + goto_area.height,
-                area.width,
-                inner_rows,
-            );
-            render_completions(frame, comp_area, state);
+        if let Some(state) = goto_path {
+            render_goto_path_input(frame, input_area, state);
+            // Render completions as an overlay on top of the panel
+            if state.completions.len() > 1 {
+                let comp_rows = (state.completions.len() as u16).min(8);
+                let available_h = panel_area.height.saturating_sub(2);
+                let inner_rows = comp_rows.min(available_h);
+                let comp_area = Rect::new(
+                    area.x,
+                    input_area.y + input_area.height,
+                    area.width,
+                    inner_rows,
+                );
+                render_completions(frame, comp_area, state);
+            }
+        } else if let Some(state) = fuzzy_search {
+            render_fuzzy_input(frame, input_area, state);
+            if !state.results.is_empty() {
+                let result_rows = (state.results.len() as u16).min(8);
+                let available_h = panel_area.height.saturating_sub(2);
+                let inner_rows = result_rows.min(available_h);
+                let comp_area = Rect::new(
+                    area.x,
+                    input_area.y + input_area.height,
+                    area.width,
+                    inner_rows,
+                );
+                render_fuzzy_results(frame, comp_area, state);
+            }
         }
     } else {
         render(frame, area, panel, is_active);
@@ -146,6 +165,96 @@ fn render_completions(frame: &mut Frame, area: Rect, state: &GotoPathState) {
             let name = &state.completions[idx];
             let style = if state.comp_index == Some(idx) { highlight } else { normal };
             let display = format!(" /{}", name);
+            let line = Line::from(Span::styled(display, style));
+            let p = ratatui::widgets::Paragraph::new(line).style(style);
+            frame.render_widget(p, row_area);
+        }
+    }
+}
+
+fn render_fuzzy_input(frame: &mut Frame, area: Rect, state: &FuzzySearchState) {
+    let t = theme();
+    let prompt_style = Style::default()
+        .fg(t.dialog_title_fg)
+        .bg(t.dialog_bg)
+        .add_modifier(Modifier::BOLD);
+    let input_style = Style::default().fg(t.dialog_text_fg).bg(t.dialog_bg);
+    let cursor_style = Style::default().fg(t.dialog_bg).bg(t.dialog_text_fg);
+
+    let before = &state.input[..state.cursor];
+    let cursor_char = state.input[state.cursor..].chars().next();
+    let after_start = state.cursor + cursor_char.map(|c| c.len_utf8()).unwrap_or(0);
+    let after = &state.input[after_start..];
+
+    let prompt_prefix = " Find: ";
+    let available = area.width as usize - prompt_prefix.len();
+    let before_chars = before.chars().count();
+    let visible_before = if before_chars > available {
+        let skip = before_chars - available + 1;
+        before.char_indices().nth(skip).map(|(i, _)| &before[i..]).unwrap_or("")
+    } else {
+        before
+    };
+
+    let mut spans = vec![
+        Span::styled(prompt_prefix, prompt_style),
+        Span::styled(visible_before.to_string(), input_style),
+    ];
+    if let Some(c) = cursor_char {
+        spans.push(Span::styled(c.to_string(), cursor_style));
+    } else {
+        spans.push(Span::styled(" ", cursor_style));
+    }
+    if !after.is_empty() {
+        spans.push(Span::styled(after.to_string(), input_style));
+    }
+
+    let count = state.results.len();
+    let count_str = format!(" {}", count);
+    spans.push(Span::styled(count_str, Style::default().fg(t.dialog_title_fg).bg(t.dialog_bg)));
+
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        ratatui::widgets::Paragraph::new(Line::from(spans)).style(Style::default().bg(t.dialog_bg)),
+        area,
+    );
+}
+
+fn render_fuzzy_results(frame: &mut Frame, area: Rect, state: &FuzzySearchState) {
+    let t = theme();
+    let normal = Style::default().fg(t.dialog_text_fg).bg(t.dialog_bg);
+    let highlight = Style::default()
+        .fg(t.dialog_input_fg_focused)
+        .bg(t.dialog_input_bg)
+        .add_modifier(Modifier::BOLD);
+    let border_style = Style::default().fg(t.dialog_border_fg).bg(t.dialog_bg);
+
+    let total_h = area.height + 2;
+    let bordered_area = Rect::new(area.x, area.y, area.width, total_h);
+
+    frame.render_widget(Clear, bordered_area);
+
+    let block = Block::default()
+        .borders(Borders::LEFT | Borders::RIGHT | Borders::BOTTOM)
+        .border_style(border_style)
+        .style(Style::default().bg(t.dialog_bg));
+
+    let inner = block.inner(bordered_area);
+    frame.render_widget(block, bordered_area);
+
+    let max_visible = inner.height as usize;
+
+    for i in 0..max_visible {
+        let y = inner.y + i as u16;
+        if y >= inner.y + inner.height {
+            break;
+        }
+        let row_area = Rect::new(inner.x, y, inner.width, 1);
+
+        if let Some(&(path_idx, _score)) = state.results.get(i) {
+            let path = &state.all_paths[path_idx];
+            let style = if state.selected == i { highlight } else { normal };
+            let display = format!(" {}", path);
             let line = Line::from(Span::styled(display, style));
             let p = ratatui::widgets::Paragraph::new(line).style(style);
             frame.render_widget(p, row_area);
