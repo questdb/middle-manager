@@ -842,6 +842,7 @@ impl App {
         if self.terminal_focused && self.terminal_panel.is_some() {
             return match key.code {
                 // These keys are reserved for middle-manager
+                KeyCode::F(5) => Action::TerminalOpenFile,
                 KeyCode::F(12) => Action::ToggleTerminal,
                 KeyCode::F(10) => Action::Quit,
                 // Tab switches focus away from terminal
@@ -1489,7 +1490,7 @@ impl App {
             Action::DialogCancel => self.handle_dialog_cancel(),
             Action::DialogBackspace => self.handle_dialog_backspace(),
             Action::DialogConfirm | Action::DialogInput(_) => {}
-            Action::TerminalInput(_) => {} // handled by terminal intercept above
+            Action::TerminalInput(_) | Action::TerminalOpenFile => {} // handled by terminal intercept above
         }
     }
 
@@ -2716,6 +2717,8 @@ impl App {
             }
             Action::TerminalInput(bytes) => {
                 if let Some(ref mut tp) = self.terminal_panel {
+                    // Auto-scroll to bottom when user types
+                    tp.scroll_to_bottom();
                     tp.write_bytes(&bytes);
                 }
             }
@@ -2725,15 +2728,56 @@ impl App {
                 self.terminal_panel = None;
                 self.terminal_focused = false;
             }
+            Action::TerminalOpenFile => self.handle_terminal_open_file(),
             Action::Quit => {
                 self.quit_confirm = Some(true);
             }
             Action::MouseClick(col, row) => self.handle_mouse_click(col, row),
             Action::MouseDoubleClick(col, row) => self.handle_mouse_double_click(col, row),
-            Action::MouseScrollUp(col, row) => self.handle_mouse_scroll(col, row, -3),
-            Action::MouseScrollDown(col, row) => self.handle_mouse_scroll(col, row, 3),
+            Action::MouseScrollUp(col, row) => {
+                self.forward_mouse_scroll_to_terminal(col, row, true);
+            }
+            Action::MouseScrollDown(col, row) => {
+                self.forward_mouse_scroll_to_terminal(col, row, false);
+            }
             _ => {}
         }
+    }
+
+    fn forward_mouse_scroll_to_terminal(&mut self, _col: u16, _row: u16, up: bool) {
+        if let Some(ref mut tp) = self.terminal_panel {
+            if up {
+                tp.scroll_up(3);
+            } else {
+                tp.scroll_down(3);
+            }
+        }
+    }
+
+    fn handle_terminal_open_file(&mut self) {
+        let (path, line, col) = match self.terminal_panel {
+            Some(ref tp) => match tp.find_file_reference() {
+                Some(r) => r,
+                None => {
+                    self.status_message = Some("No file:line reference found".to_string());
+                    return;
+                }
+            },
+            None => return,
+        };
+
+        let mut editor = crate::editor::EditorState::open(path);
+        let target_line = line.saturating_sub(1); // convert to 0-based
+        let target_col = col.saturating_sub(1);
+        // Ensure the editor has scanned far enough
+        if !editor.scan_complete {
+            editor.scan_to_line(target_line + 100);
+        }
+        editor.cursor_line = target_line;
+        editor.cursor_col = target_col;
+        editor.desired_col = target_col;
+        editor.scroll_to_cursor();
+        self.mode = AppMode::Editing(editor);
     }
 
     fn resize_terminal(&mut self) {

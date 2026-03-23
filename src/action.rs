@@ -98,6 +98,7 @@ pub enum Action {
     // Terminal
     ToggleTerminal,
     TerminalInput(Vec<u8>),
+    TerminalOpenFile,
 
     // Application
     Quit,

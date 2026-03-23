@@ -29,16 +29,21 @@ pub fn render(frame: &mut Frame, area: Rect, tp: &TerminalPanel, is_active: bool
     frame.render_widget(block, area);
 
     let screen = tp.screen();
+    let width = inner.width as u16;
     let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
+    // Pre-allocate reusable buffers
+    let mut current_text = String::with_capacity(width as usize * 4);
+    let mut spans: Vec<Span> = Vec::with_capacity(width as usize);
 
     for row in 0..inner.height as u16 {
-        let mut spans: Vec<Span> = Vec::new();
-        let mut current_text = String::new();
+        spans.clear();
+        current_text.clear();
         let mut current_style = Style::default();
         let mut first = true;
 
-        for col in 0..inner.width as u16 {
+        for col in 0..width {
             let cell = screen.cell(row, col);
+
             let style = match cell {
                 Some(cell) => vt100_cell_style(cell),
                 None => Style::default(),
@@ -51,53 +56,42 @@ pub fn render(frame: &mut Frame, area: Rect, tp: &TerminalPanel, is_active: bool
 
             if style != current_style {
                 if !current_text.is_empty() {
-                    spans.push(Span::styled(
-                        std::mem::take(&mut current_text),
-                        current_style,
-                    ));
+                    // Clone text into span, keeping current_text's buffer for reuse
+                    spans.push(Span::styled(current_text.clone(), current_style));
+                    current_text.clear();
                 }
                 current_style = style;
             }
 
-            // Append cell content directly into the accumulator (no per-cell allocation)
             match cell {
-                Some(cell) => {
-                    let contents = cell.contents();
-                    if contents.is_empty() {
-                        current_text.push(' ');
-                    } else {
-                        current_text.push_str(&contents);
-                    }
+                Some(cell) if cell.has_contents() => {
+                    current_text.push_str(cell.contents());
                 }
-                None => current_text.push(' '),
+                _ => current_text.push(' '),
             }
         }
         if !current_text.is_empty() {
-            spans.push(Span::styled(current_text, current_style));
+            spans.push(Span::styled(current_text.clone(), current_style));
+            current_text.clear();
         }
-        lines.push(Line::from(spans));
+        lines.push(Line::from(spans.clone()));
+        spans.clear();
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn vt100_cell_style(cell: &vt100::Cell) -> Style {
-    let mut style = Style::default();
-    style = style.fg(vt100_color(cell.fgcolor()));
-    style = style.bg(vt100_color(cell.bgcolor()));
-    if cell.bold() {
-        style = style.add_modifier(Modifier::BOLD);
-    }
-    if cell.italic() {
-        style = style.add_modifier(Modifier::ITALIC);
-    }
-    if cell.underline() {
-        style = style.add_modifier(Modifier::UNDERLINED);
-    }
-    if cell.inverse() {
-        style = style.add_modifier(Modifier::REVERSED);
-    }
-    style
+    let mut mods = Modifier::empty();
+    if cell.bold() { mods |= Modifier::BOLD; }
+    if cell.italic() { mods |= Modifier::ITALIC; }
+    if cell.underline() { mods |= Modifier::UNDERLINED; }
+    if cell.inverse() { mods |= Modifier::REVERSED; }
+
+    Style::default()
+        .fg(vt100_color(cell.fgcolor()))
+        .bg(vt100_color(cell.bgcolor()))
+        .add_modifier(mods)
 }
 
 fn vt100_color(color: vt100::Color) -> Color {

@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 
 use crate::event::WakeupSender;
@@ -24,6 +24,8 @@ pub struct TerminalPanel {
     pub exited: bool,
     /// Title to display in the panel border.
     pub title: String,
+    /// Directory the terminal was spawned in (for resolving relative paths).
+    pub spawn_dir: PathBuf,
 }
 
 impl TerminalPanel {
@@ -69,7 +71,7 @@ impl TerminalPanel {
             }
         });
 
-        let parser = vt100::Parser::new(rows, cols, 0);
+        let parser = vt100::Parser::new(rows, cols, 10000);
 
         Ok(Self {
             parser,
@@ -81,6 +83,7 @@ impl TerminalPanel {
             rows,
             exited: false,
             title: format!(" Claude — {} ", dir.display()),
+            spawn_dir: dir.to_path_buf(),
         })
     }
 
@@ -118,7 +121,7 @@ impl TerminalPanel {
             pixel_width: 0,
             pixel_height: 0,
         });
-        self.parser.set_size(rows, cols);
+        self.parser.screen_mut().set_size(rows, cols);
     }
 
     /// Get the current terminal screen.
@@ -126,6 +129,120 @@ impl TerminalPanel {
         self.parser.screen()
     }
 
+    /// Scroll up in the scrollback buffer.
+    pub fn scroll_up(&mut self, lines: usize) {
+        let current = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(current + lines);
+    }
+
+    /// Scroll down (toward current output). Stops at 0 (live view).
+    pub fn scroll_down(&mut self, lines: usize) {
+        let current = self.parser.screen().scrollback();
+        self.parser.screen_mut().set_scrollback(current.saturating_sub(lines));
+    }
+
+    /// Jump back to live output (scroll offset 0).
+    pub fn scroll_to_bottom(&mut self) {
+        self.parser.screen_mut().set_scrollback(0);
+    }
+
+    /// Scan visible rows for file:line references, starting from the cursor row.
+    /// as (resolved_path, line, col).
+    pub fn find_file_reference(&self) -> Option<(PathBuf, usize, usize)> {
+        let screen = self.parser.screen();
+        // Scan from cursor row outward (cursor row first, then up, then down)
+        let (cursor_row, _) = screen.cursor_position();
+        let mut rows_to_check: Vec<u16> = vec![cursor_row];
+        for offset in 1..self.rows {
+            if cursor_row >= offset {
+                rows_to_check.push(cursor_row - offset);
+            }
+            if cursor_row + offset < self.rows {
+                rows_to_check.push(cursor_row + offset);
+            }
+        }
+
+        for row in rows_to_check {
+            let mut text = String::with_capacity(self.cols as usize);
+            for col in 0..self.cols {
+                if let Some(cell) = screen.cell(row, col) {
+                    let contents = cell.contents();
+                    if contents.is_empty() {
+                        text.push(' ');
+                    } else {
+                        text.push_str(&contents);
+                    }
+                } else {
+                    text.push(' ');
+                }
+            }
+            let text = text.trim_end();
+            if let Some((path, line, col)) = parse_file_reference(text, &self.spawn_dir) {
+                return Some((path, line, col));
+            }
+        }
+        None
+    }
+}
+
+/// Parse a line of text for file:line[:col] references.
+/// Returns the first valid (existing file, line, col) found.
+fn parse_file_reference(text: &str, base_dir: &Path) -> Option<(PathBuf, usize, usize)> {
+    // Scan for patterns like path:line or path:line:col
+    // Look for ':' followed by digits, then check if text before it looks like a file path.
+    for (i, _) in text.match_indices(':') {
+        // Text after the colon must start with digits
+        let after = &text[i + 1..];
+        let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            continue;
+        }
+        let line: usize = match digits.parse() {
+            Ok(n) if n > 0 => n,
+            _ => continue,
+        };
+
+        // Optional :col after the line number
+        let col_start = i + 1 + digits.len();
+        let col = if text.get(col_start..col_start + 1) == Some(":") {
+            let after_col = &text[col_start + 1..];
+            let col_digits: String = after_col.chars().take_while(|c| c.is_ascii_digit()).collect();
+            col_digits.parse::<usize>().unwrap_or(1)
+        } else {
+            1
+        };
+
+        // Extract the file path: scan backward from the colon to find the start
+        let before = &text[..i];
+        let path_start = before
+            .rfind(|c: char| c.is_whitespace() || c == '(' || c == '\'' || c == '"' || c == '`')
+            .map(|pos| {
+                // Advance past the matched character (which may be multi-byte)
+                pos + before[pos..].chars().next().map(|c| c.len_utf8()).unwrap_or(1)
+            })
+            .unwrap_or(0);
+        let path_str = &before[path_start..];
+
+        // Must look like a file path (has a dot or slash, not empty)
+        if path_str.is_empty() {
+            continue;
+        }
+        if !path_str.contains('.') && !path_str.contains('/') {
+            continue;
+        }
+
+        // Resolve relative to base_dir
+        let path = if Path::new(path_str).is_absolute() {
+            PathBuf::from(path_str)
+        } else {
+            base_dir.join(path_str)
+        };
+
+        if path.is_file() {
+            return Some((path, line, col));
+        }
+    }
+    None
 }
 
 impl Drop for TerminalPanel {

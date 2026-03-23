@@ -88,6 +88,7 @@ pub fn render_terminal(frame: &mut Frame, area: Rect) {
     let sep_style = Style::default().fg(t.footer_sep_fg).bg(t.footer_sep_bg);
 
     let items: &[(&str, &str)] = &[
+        ("F5", "Open"),
         ("Tab", "Switch"),
         ("F12", "Close"),
         ("F10", "Quit"),
