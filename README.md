@@ -11,7 +11,7 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 **File Manager**
 - Dual-panel layout with directory listings (name, size, date, permissions)
 - File operations: copy (F5), move (F6), rename (Shift+F6), mkdir (F7), delete (F8)
-- Multi-file selection with Shift+Up/Down and Insert key for batch operations
+- Multi-file selection with Shift+Up/Down (toggle) and Insert key for batch operations
 - Far Manager-style dialogs with keyboard navigation (copy, mkdir, delete, rename)
 - Quick search — just start typing to jump to a file, Enter to open
 - Go-to-path (Ctrl+G) — type a path to navigate instantly, with zsh-style tab completion (case-insensitive, overlay dropdown)
@@ -20,7 +20,7 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Sort by name, size, or date (F9), persisted across restarts
 - Mouse support — click to select, double-click to open, scroll wheel to navigate
 - Filesystem watcher — panels auto-refresh on external changes (kqueue/inotify, zero-cost idle)
-- Persistent state — panel paths, sort preferences, and search queries survive restarts
+- Persistent state — panel paths, sort preferences, search queries, open panels, and split sizes survive restarts
 
 **Git Integration**
 - Git status markers per file: `●` modified, `+` added, `-` deleted, `→` renamed, `?` untracked, `!` conflict
@@ -38,20 +38,31 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Download step logs and open in the built-in editor
 - Async fetching with animated spinners — never blocks the UI
 - Per-panel CI (left and right panels can each have their own CI view)
-- Tab/Shift+Tab cycles focus forward/backward: file panel → CI panel → other file panel
+- Tab/Shift+Tab cycles focus forward/backward through all panels
 - PageUp/PageDown/Home/End for fast scrolling through long check lists
+- Alt+Up/Down to resize split, Alt+Enter to maximize/restore
 - Mouse click support for selecting items in the tree
 - Failed checks sorted to top for quick access
 - PR number displayed in panel title
 
-**Embedded Terminal (F12)**
-- Spawns `claude` (Claude Code) in the opposite panel, using the active panel's directory
+**Shell Panel (Ctrl+O)**
+- Spawns your default `$SHELL` at the bottom of the active panel
+- Full PTY emulation — colors, cursor, scrollback all work
+- Independent per-side (left and right panels can each have their own shell)
+- Alt+Up/Down to resize split, Alt+Enter to maximize/restore
+- F1 switches focus back to file panel, Ctrl+O closes
+- Auto-closes when the shell exits
+- Restored on restart
+
+**Claude Code Panel (F12)**
+- Spawns `claude` maximized on the opposite panel, using the active panel's directory
 - Full PTY emulation via `portable-pty` + `vt100` — colors, cursor, alternate screen all work
-- All keystrokes forwarded to the terminal (arrows, Ctrl combos, function keys)
+- All keystrokes (including Tab) forwarded to Claude Code
 - 10,000-line scrollback buffer with trackpad/mouse scroll (like Ghostty/iTerm2)
 - F5 opens file:line references from terminal output in the built-in editor
-- Tab/Shift+Tab switches focus back to file panels, F12 closes
-- Auto-closes when the child process exits
+- F1 switches focus back to file panel, F12 closes
+- Restored on restart with `claude -c` (continues last session)
+- Auto-closes when Claude exits
 - Coalescing wakeup mechanism — terminal output renders immediately without flooding the event loop
 - Zero-allocation render loop (vt100 0.16 `&str` cells, reused buffers)
 
@@ -125,7 +136,7 @@ cargo build --release
 | Key | Action |
 |-----|--------|
 | Up / Down | Navigate |
-| Shift+Up / Shift+Down | Extend selection |
+| Shift+Up / Shift+Down | Toggle selection and move |
 | Insert | Toggle selection on current item |
 | Left / Home | Jump to top |
 | Right / End | Jump to bottom |
@@ -136,6 +147,7 @@ cargo build --release
 | Ctrl+F | Fuzzy file search (opens in editor) |
 | Ctrl+G | Go to path (with tab completion) |
 | Ctrl+C | Copy filename to clipboard |
+| Ctrl+O | Toggle shell panel |
 | Ctrl+P | Copy full path to clipboard |
 | F2 | Toggle CI panel |
 | F3 | View file |
@@ -149,7 +161,7 @@ cargo build --release
 | F9 | Cycle sort |
 | F10 | Quit (with confirmation) |
 | F11 | Open PR in browser |
-| F12 | Toggle terminal panel (Claude Code) |
+| F12 | Toggle Claude Code panel (maximized, opposite side) |
 | Type chars | Quick search |
 
 ### CI Panel
@@ -163,20 +175,33 @@ cargo build --release
 | Left | Collapse check / jump to parent |
 | Enter | Expand/collapse check, or download step log |
 | o | Open check in browser |
+| Alt+Up / Alt+Down | Resize panel split |
+| Alt+Enter | Maximize / restore panel |
 | Tab / Shift+Tab | Switch panel forward / backward |
 | F2 | Close CI panel |
 | Mouse click | Select item and focus panel |
 
-### Terminal Panel
+### Shell Panel
 
 | Key | Action |
 |-----|--------|
-| All keys (incl. Tab) | Forwarded to the terminal process |
+| All keys (incl. Tab) | Forwarded to the shell |
+| Scroll / Trackpad | Scroll through scrollback buffer |
+| Alt+Up / Alt+Down | Resize panel split |
+| Alt+Enter | Maximize / restore panel |
+| F1 | Switch focus to file panel |
+| Ctrl+O | Close shell panel |
+| F10 | Quit (with confirmation) |
+
+### Claude Code Panel
+
+| Key | Action |
+|-----|--------|
+| All keys (incl. Tab) | Forwarded to Claude Code |
 | Scroll / Trackpad | Scroll through scrollback buffer |
 | F5 | Open file:line reference in editor |
 | F1 | Switch focus to file panel |
-| Mouse click | Click on file panel to switch focus |
-| F12 | Close terminal panel |
+| F12 | Close Claude Code panel |
 | F10 | Quit (with confirmation) |
 
 ### Viewer / Hex Viewer
@@ -223,7 +248,7 @@ src/
   app.rs            App state machine, action dispatch, all modes
   action.rs         Action enum (every possible user intent)
   event.rs          Background thread event polling, coalescing wakeup mechanism
-  terminal.rs       Embedded terminal: PTY lifecycle, vt100 parsing, key encoding
+  terminal.rs       Embedded terminal: PTY lifecycle, vt100 parsing, key encoding (shell + Claude)
   ci.rs             CI panel: check/step fetching, log download, tree state
   state.rs          Persistent state (JSON, ~/.config/middle-manager/)
   syntax.rs         Tree-sitter syntax highlighting with hybrid caching

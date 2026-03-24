@@ -78,6 +78,11 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
     let mut app = App::new();
     let mut events = EventHandler::new(Duration::from_millis(250));
     app.set_wakeup_sender(events.wakeup_sender());
+    app.restore_bottom_panels();
+
+    // First render to compute actual panel areas, then resize PTYs to match
+    terminal.draw(|frame| ui::render(frame, &mut app))?;
+    app.resize_all_bottom_panels();
 
     loop {
         // Clear if needed (e.g. after leaving a full-screen mode)
@@ -86,8 +91,9 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
             app.needs_clear = false;
         }
 
-        // Render
+        // Render, then sync PTY sizes with rendered areas
         terminal.draw(|frame| ui::render(frame, &mut app))?;
+        app.resize_all_bottom_panels();
 
         // Check for edit request
         if let Some(edit_path) = app.take_edit_request() {

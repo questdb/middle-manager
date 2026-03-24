@@ -12,7 +12,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         "File Panels",
         &[
             ("Up / Down", "Navigate files"),
-            ("Shift+Up/Down", "Extend selection"),
+            ("Shift+Up/Down", "Toggle selection and move"),
             ("Insert", "Toggle selection on current item"),
             ("Home / Left", "Jump to top"),
             ("End / Right", "Jump to bottom"),
@@ -52,12 +52,25 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Left", "Collapse check / jump to parent"),
             ("Enter", "Expand/collapse or download step log"),
             ("o", "Open check in browser"),
+            ("Alt+Up / Alt+Down", "Resize panel split"),
+            ("Alt+Enter", "Maximize / restore panel"),
         ],
     ),
     (
-        "Terminal Panel (Claude Code)",
+        "Shell Panel (Ctrl+O)",
         &[
-            ("F12", "Open / close terminal panel"),
+            ("Ctrl+O", "Open / close shell in active panel"),
+            ("F1", "Switch focus to file panel"),
+            ("Scroll / Trackpad", "Scroll through output history"),
+            ("Alt+Up / Alt+Down", "Resize panel split"),
+            ("Alt+Enter", "Maximize / restore panel"),
+            ("All other keys", "Forwarded to shell"),
+        ],
+    ),
+    (
+        "Claude Code Panel (F12)",
+        &[
+            ("F12", "Open / close (always maximized, opposite panel)"),
             ("F1", "Switch focus to file panel"),
             ("F5", "Open file:line reference in editor"),
             ("Scroll / Trackpad", "Scroll through output history"),

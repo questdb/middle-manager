@@ -5,6 +5,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_split() -> u16 {
+    60
+}
+
 /// Persistent application state saved to ~/.config/middle-manager/state.json
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppState {
@@ -21,6 +25,27 @@ pub struct AppState {
     pub left_panel_path: Option<String>,
     #[serde(default)]
     pub right_panel_path: Option<String>,
+
+    /// Bottom panel split sizes (percentage for file panel, per type).
+    #[serde(default = "default_split")]
+    pub split_pct_ci: u16,
+    #[serde(default = "default_split")]
+    pub split_pct_shell: u16,
+    #[serde(default = "default_split")]
+    pub split_pct_claude: u16,
+
+    /// Open bottom panels per side: "ci", "shell", "claude", or empty.
+    /// Multiple can be open; stored as comma-separated.
+    #[serde(default)]
+    pub left_bottom_panels: String,
+    #[serde(default)]
+    pub right_bottom_panels: String,
+
+    /// Directory Claude was spawned in (may differ from the panel's current dir).
+    #[serde(default)]
+    pub claude_dir_left: Option<String>,
+    #[serde(default)]
+    pub claude_dir_right: Option<String>,
 
     /// Panel sort preferences.
     #[serde(default)]
@@ -41,6 +66,13 @@ impl Default for AppState {
             search_case_sensitive: false,
             left_panel_path: None,
             right_panel_path: None,
+            split_pct_ci: 60,
+            split_pct_shell: 60,
+            split_pct_claude: 60,
+            left_bottom_panels: String::new(),
+            right_bottom_panels: String::new(),
+            claude_dir_left: None,
+            claude_dir_right: None,
             left_sort_field: 0,
             left_sort_ascending: true,
             right_sort_field: 0,

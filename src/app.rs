@@ -5,6 +5,10 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 const DOUBLE_CLICK_MS: u128 = 400;
+const SPLIT_RESIZE_STEP: u16 = 2;
+const SPLIT_MIN_PCT: u16 = 20;
+const SPLIT_MAX_PCT: u16 = 80;
+const SPLIT_DEFAULT_PCT: u16 = 60;
 
 use crate::action::Action;
 use crate::ci::CiPanel;
@@ -75,12 +79,16 @@ pub struct App {
     pub shell_panels: [Option<TerminalPanel>; 2],
     /// Which shell panel has focus (None = not focused).
     pub shell_focused: Option<usize>,
-    /// Embedded terminal panel (runs `claude`).
-    pub terminal_panel: Option<TerminalPanel>,
-    /// Which panel side the terminal occupies (0=left, 1=right).
-    pub terminal_side: usize,
-    /// Whether the terminal panel has focus.
-    pub terminal_focused: bool,
+    /// Claude Code panels (one per file panel side, like shell panels).
+    pub claude_panels: [Option<TerminalPanel>; 2],
+    /// Which Claude panel has focus.
+    pub claude_focused: Option<usize>,
+    /// Rendered areas for Claude panels (for click detection and resize).
+    pub claude_panel_areas: [Option<Rect>; 2],
+    /// Split ratio per side: percentage for file panel (top). Default 60.
+    pub bottom_split_pct: [u16; 2],
+    /// Per-side maximize toggle for bottom panels.
+    pub bottom_maximized: [bool; 2],
     /// Wakeup sender for the event loop (given to terminal reader threads).
     wakeup_sender: Option<crate::event::WakeupSender>,
 }
@@ -873,9 +881,11 @@ impl App {
             help_scroll: None,
             shell_panels: [None, None],
             shell_focused: None,
-            terminal_panel: None,
-            terminal_side: 1,
-            terminal_focused: false,
+            claude_panels: [None, None],
+            claude_focused: None,
+            claude_panel_areas: [None, None],
+            bottom_split_pct: [SPLIT_DEFAULT_PCT, SPLIT_DEFAULT_PCT],
+            bottom_maximized: [false, false],
             wakeup_sender: None,
         }
     }
@@ -883,6 +893,72 @@ impl App {
     /// Set the wakeup sender (called from main after creating the event handler).
     pub fn set_wakeup_sender(&mut self, sender: crate::event::WakeupSender) {
         self.wakeup_sender = Some(sender);
+    }
+
+    /// Restore bottom panels from persisted state. Call after set_wakeup_sender.
+    pub fn restore_bottom_panels(&mut self) {
+        let wakeup = match self.wakeup_sender {
+            Some(ref w) => w.clone(),
+            None => return,
+        };
+
+        for side in 0..2 {
+            let panels_str = if side == 0 {
+                &self.persisted.left_bottom_panels
+            } else {
+                &self.persisted.right_bottom_panels
+            };
+            if panels_str.is_empty() {
+                continue;
+            }
+
+            let dir = self.panels[side].current_dir.clone();
+            let area_width = 80u16; // initial estimate; corrected on first render
+            let area_height = 24u16;
+
+            for panel_type in panels_str.split(',') {
+                match panel_type.trim() {
+                    "ci" => {
+                        if let Some(ref gi) = self.panels[side].git_info {
+                            self.ci_panels[side] = Some(CiPanel::for_branch(&dir, &gi.branch));
+                            self.bottom_split_pct[side] = self.persisted.split_pct_ci;
+                        }
+                    }
+                    "shell" => {
+                        if let Ok(tp) = TerminalPanel::spawn_shell(
+                            &dir,
+                            area_width,
+                            area_height,
+                            wakeup.clone(),
+                        ) {
+                            self.shell_panels[side] = Some(tp);
+                            self.bottom_split_pct[side] = self.persisted.split_pct_shell;
+                        }
+                    }
+                    "claude" => {
+                        let claude_dir = if side == 0 {
+                            self.persisted.claude_dir_left.as_deref()
+                        } else {
+                            self.persisted.claude_dir_right.as_deref()
+                        }
+                        .map(PathBuf::from)
+                        .filter(|p| p.is_dir())
+                        .unwrap_or_else(|| dir.clone());
+                        if let Ok(tp) = TerminalPanel::spawn_claude_continue(
+                            &claude_dir,
+                            area_width,
+                            area_height,
+                            wakeup.clone(),
+                        ) {
+                            self.claude_panels[side] = Some(tp);
+                            self.bottom_maximized[side] = true;
+                            self.bottom_split_pct[side] = self.persisted.split_pct_claude;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Save current state to disk.
@@ -895,6 +971,34 @@ impl App {
         self.persisted.left_sort_ascending = self.panels[0].sort_ascending;
         self.persisted.right_sort_field = sort_field_to_u8(self.panels[1].sort_field);
         self.persisted.right_sort_ascending = self.panels[1].sort_ascending;
+        // Save split ratios and open bottom panels
+        for side in 0..2 {
+            let pct = self.bottom_split_pct[side];
+            let mut panels = Vec::new();
+            if self.ci_panels[side].is_some() {
+                self.persisted.split_pct_ci = pct;
+                panels.push("ci");
+            }
+            if self.shell_panels[side].is_some() {
+                self.persisted.split_pct_shell = pct;
+                panels.push("shell");
+            }
+            if let Some(ref cp) = self.claude_panels[side] {
+                self.persisted.split_pct_claude = pct;
+                panels.push("claude");
+                let dir = Some(cp.spawn_dir.to_string_lossy().to_string());
+                if side == 0 {
+                    self.persisted.claude_dir_left = dir;
+                } else {
+                    self.persisted.claude_dir_right = dir;
+                }
+            }
+            if side == 0 {
+                self.persisted.left_bottom_panels = panels.join(",");
+            } else {
+                self.persisted.right_bottom_panels = panels.join(",");
+            }
+        }
         self.persisted.save();
     }
 
@@ -1067,14 +1171,14 @@ impl App {
             };
         }
 
-        // Terminal panel intercepts keys when focused
-        if self.terminal_focused && self.terminal_panel.is_some() {
+        // Claude panel intercepts keys when focused
+        if self.claude_focused.is_some() {
             return match key.code {
                 // These keys are reserved for middle-manager
                 KeyCode::F(5) => Action::TerminalOpenFile,
-                KeyCode::F(12) => Action::ToggleTerminal,
+                KeyCode::F(12) => Action::ToggleClaude,
                 KeyCode::F(10) => Action::Quit,
-                // F1 switches focus away from terminal (Tab forwarded to claude)
+                // F1 switches focus away from Claude (Tab forwarded to claude)
                 KeyCode::F(1) => Action::SwitchPanel,
                 // Everything else (including Tab) is forwarded to the terminal
                 _ => Action::TerminalInput(crate::terminal::encode_key_event(key)),
@@ -1089,6 +1193,14 @@ impl App {
                 KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     Action::ToggleShell
                 }
+                // Alt+Up/Down/Enter for resize/maximize
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => Action::BottomResizeUp,
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                    Action::BottomResizeDown
+                }
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                    Action::BottomMaximize
+                }
                 _ => Action::TerminalInput(crate::terminal::encode_key_event(key)),
             };
         }
@@ -1096,6 +1208,13 @@ impl App {
         // CI panel intercepts keys when focused
         if self.ci_focused.is_some() {
             return match key.code {
+                KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => Action::BottomResizeUp,
+                KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                    Action::BottomResizeDown
+                }
+                KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                    Action::BottomMaximize
+                }
                 KeyCode::Up => Action::MoveUp,
                 KeyCode::Down => Action::MoveDown,
                 KeyCode::PageUp => Action::PageUp,
@@ -1168,7 +1287,7 @@ impl App {
             KeyCode::F(10) => Action::Quit,
             KeyCode::F(2) => Action::ToggleCi,
             KeyCode::F(11) => Action::OpenPr,
-            KeyCode::F(12) => Action::ToggleTerminal,
+            KeyCode::F(12) => Action::ToggleClaude,
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
             KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::CopyName,
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::CopyPath,
@@ -1533,9 +1652,9 @@ impl App {
             return;
         }
 
-        // Terminal panel intercepts when focused
-        if self.terminal_focused && self.terminal_panel.is_some() {
-            self.handle_terminal_action(action);
+        // Claude panel intercepts when focused
+        if self.claude_focused.is_some() {
+            self.handle_claude_action(action);
             return;
         }
 
@@ -1584,12 +1703,16 @@ impl App {
                         }
                     }
                 }
-                // Poll terminal panel
-                if let Some(ref mut tp) = self.terminal_panel {
-                    tp.poll();
-                    if tp.exited {
-                        self.terminal_panel = None;
-                        self.terminal_focused = false;
+                // Poll Claude panels
+                for side in 0..2 {
+                    if let Some(ref mut tp) = self.claude_panels[side] {
+                        tp.poll();
+                        if tp.exited {
+                            self.claude_panels[side] = None;
+                            if self.claude_focused == Some(side) {
+                                self.claude_focused = None;
+                            }
+                        }
                     }
                 }
                 // Poll shell panels
@@ -1618,7 +1741,7 @@ impl App {
             }
             Action::Quit => self.should_quit = true,
             Action::Resize(_, _) => {
-                self.resize_terminal();
+                self.resize_all_bottom_panels();
             }
             Action::Toggle => self.handle_toggle_viewer(),
             Action::GotoLinePrompt => {
@@ -1753,6 +1876,7 @@ impl App {
                     let dir = self.active_panel().current_dir.clone();
                     self.ci_panels[side] = Some(CiPanel::for_branch(&dir, &gi.branch));
                     self.ci_focused = Some(side);
+                    self.bottom_split_pct[side] = self.persisted.split_pct_ci;
                 } else {
                     self.status_message = Some("Not in a git repository".to_string());
                 }
@@ -1767,24 +1891,27 @@ impl App {
                 }
             }
 
-            // Terminal
-            Action::ToggleTerminal => {
-                if self.terminal_panel.is_some() {
-                    self.terminal_panel = None;
-                    self.terminal_focused = false;
+            // Terminal — opens maximized on the opposite panel's side
+            Action::ToggleClaude => {
+                let side = 1 - self.active_panel;
+                if self.claude_panels[side].is_some() {
+                    self.claude_panels[side] = None;
+                    self.bottom_maximized[side] = false;
+                    if self.claude_focused == Some(side) {
+                        self.claude_focused = None;
+                    }
                 } else if let Some(ref wakeup) = self.wakeup_sender {
-                    let spawn_side = 1 - self.active_panel;
                     let dir = self.panels[self.active_panel].current_dir.clone();
-                    let area = self.panel_areas[spawn_side];
+                    let area = self.panel_areas[side];
                     let cols = area.width.saturating_sub(2).max(1);
                     let rows = area.height.saturating_sub(2).max(1);
                     match TerminalPanel::spawn_claude(&dir, cols, rows, wakeup.clone()) {
                         Ok(tp) => {
-                            self.terminal_panel = Some(tp);
-                            self.terminal_side = spawn_side;
-                            self.terminal_focused = true;
+                            self.claude_panels[side] = Some(tp);
+                            self.claude_focused = Some(side);
                             self.ci_focused = None;
                             self.shell_focused = None;
+                            self.bottom_maximized[side] = true;
                         }
                         Err(e) => {
                             self.status_message = Some(format!("Failed to start terminal: {}", e));
@@ -1797,6 +1924,35 @@ impl App {
 
             // Shell
             Action::ToggleShell => self.toggle_shell(),
+
+            // Bottom panel resize/maximize
+            Action::BottomResizeUp => {
+                let side = self
+                    .claude_focused
+                    .or(self.shell_focused)
+                    .or(self.ci_focused)
+                    .unwrap_or(self.active_panel);
+                self.bottom_split_pct[side] = self.bottom_split_pct[side]
+                    .saturating_sub(SPLIT_RESIZE_STEP)
+                    .max(SPLIT_MIN_PCT);
+            }
+            Action::BottomResizeDown => {
+                let side = self
+                    .claude_focused
+                    .or(self.shell_focused)
+                    .or(self.ci_focused)
+                    .unwrap_or(self.active_panel);
+                self.bottom_split_pct[side] =
+                    (self.bottom_split_pct[side] + SPLIT_RESIZE_STEP).min(SPLIT_MAX_PCT);
+            }
+            Action::BottomMaximize => {
+                let side = self
+                    .claude_focused
+                    .or(self.shell_focused)
+                    .or(self.ci_focused)
+                    .unwrap_or(self.active_panel);
+                self.bottom_maximized[side] = !self.bottom_maximized[side];
+            }
 
             // Mouse
             Action::MouseClick(col, row) => self.handle_mouse_click(col, row),
@@ -1919,39 +2075,33 @@ impl App {
             Panel(usize),
             Ci(usize),
             Shell(usize),
-            Terminal,
+            Claude(usize),
         }
 
-        let has_terminal = self.terminal_panel.is_some();
-
-        let mut order: Vec<Target> = Vec::with_capacity(8);
+        let mut order: Vec<Target> = Vec::with_capacity(10);
 
         // Left side
-        if !(has_terminal && self.terminal_side == 0) {
-            order.push(Target::Panel(0));
-        }
+        order.push(Target::Panel(0));
         if self.ci_panels[0].is_some() {
             order.push(Target::Ci(0));
         }
         if self.shell_panels[0].is_some() {
             order.push(Target::Shell(0));
         }
-        if has_terminal && self.terminal_side == 0 {
-            order.push(Target::Terminal);
+        if self.claude_panels[0].is_some() {
+            order.push(Target::Claude(0));
         }
 
         // Right side
-        if !(has_terminal && self.terminal_side == 1) {
-            order.push(Target::Panel(1));
-        }
+        order.push(Target::Panel(1));
         if self.ci_panels[1].is_some() {
             order.push(Target::Ci(1));
         }
         if self.shell_panels[1].is_some() {
             order.push(Target::Shell(1));
         }
-        if has_terminal && self.terminal_side == 1 {
-            order.push(Target::Terminal);
+        if self.claude_panels[1].is_some() {
+            order.push(Target::Claude(1));
         }
 
         if order.is_empty() {
@@ -1965,12 +2115,12 @@ impl App {
             self.active_panel = 1 - self.active_panel;
             self.ci_focused = None;
             self.shell_focused = None;
-            self.terminal_focused = false;
+            self.claude_focused = None;
             return;
         }
 
-        let current = if self.terminal_focused {
-            order.iter().position(|t| *t == Target::Terminal)
+        let current = if let Some(side) = self.claude_focused {
+            order.iter().position(|t| *t == Target::Claude(side))
         } else if let Some(side) = self.shell_focused {
             order.iter().position(|t| *t == Target::Shell(side))
         } else if let Some(side) = self.ci_focused {
@@ -1997,20 +2147,20 @@ impl App {
                 self.active_panel = *side;
                 self.ci_focused = None;
                 self.shell_focused = None;
-                self.terminal_focused = false;
+                self.claude_focused = None;
             }
             Target::Ci(side) => {
                 self.ci_focused = Some(*side);
                 self.shell_focused = None;
-                self.terminal_focused = false;
+                self.claude_focused = None;
             }
             Target::Shell(side) => {
                 self.shell_focused = Some(*side);
                 self.ci_focused = None;
-                self.terminal_focused = false;
+                self.claude_focused = None;
             }
-            Target::Terminal => {
-                self.terminal_focused = true;
+            Target::Claude(side) => {
+                self.claude_focused = Some(*side);
                 self.ci_focused = None;
                 self.shell_focused = None;
             }
@@ -3117,6 +3267,18 @@ impl App {
                     }
                 }
             }
+            Action::BottomResizeUp => {
+                self.bottom_split_pct[side] = self.bottom_split_pct[side]
+                    .saturating_sub(SPLIT_RESIZE_STEP)
+                    .max(SPLIT_MIN_PCT);
+            }
+            Action::BottomResizeDown => {
+                self.bottom_split_pct[side] =
+                    (self.bottom_split_pct[side] + SPLIT_RESIZE_STEP).min(SPLIT_MAX_PCT);
+            }
+            Action::BottomMaximize => {
+                self.bottom_maximized[side] = !self.bottom_maximized[side];
+            }
             // Let mouse events through to the normal handler
             Action::MouseClick(col, row) => self.handle_mouse_click(col, row),
             Action::MouseDoubleClick(col, row) => self.handle_mouse_double_click(col, row),
@@ -3126,21 +3288,26 @@ impl App {
         }
     }
 
-    fn handle_terminal_action(&mut self, action: Action) {
+    fn handle_claude_action(&mut self, action: Action) {
+        let side = match self.claude_focused {
+            Some(s) => s,
+            None => return,
+        };
+
         match action {
             Action::None => {}
             Action::Tick | Action::Resize(_, _) => {
-                // Poll terminal output
-                if let Some(ref mut tp) = self.terminal_panel {
+                // Poll Claude panel output
+                if let Some(ref mut tp) = self.claude_panels[side] {
                     tp.poll();
                     if tp.exited {
-                        self.terminal_panel = None;
-                        self.terminal_focused = false;
+                        self.claude_panels[side] = None;
+                        self.claude_focused = None;
                     }
                 }
-                // Resize terminal to match panel area
+                // Resize Claude panels to match panel area
                 if matches!(action, Action::Resize(_, _)) {
-                    self.resize_terminal();
+                    self.resize_all_bottom_panels();
                 }
                 // Also poll CI, watchers, git
                 for ci in self.ci_panels.iter_mut().flatten() {
@@ -3157,7 +3324,7 @@ impl App {
                 }
             }
             Action::TerminalInput(bytes) => {
-                if let Some(ref mut tp) = self.terminal_panel {
+                if let Some(ref mut tp) = self.claude_panels[side] {
                     // Auto-scroll to bottom when user types
                     tp.scroll_to_bottom();
                     tp.write_bytes(&bytes);
@@ -3165,57 +3332,66 @@ impl App {
             }
             Action::SwitchPanel => self.handle_switch_panel(),
             Action::SwitchPanelReverse => self.handle_switch_panel_reverse(),
-            Action::ToggleTerminal => {
-                self.terminal_panel = None;
-                self.terminal_focused = false;
+            Action::ToggleClaude => {
+                self.claude_panels[side] = None;
+                self.claude_focused = None;
+                self.bottom_maximized[side] = false;
             }
             Action::TerminalOpenFile => self.handle_terminal_open_file(),
             Action::Quit => {
                 self.quit_confirm = Some(true);
             }
             Action::MouseClick(col, row) => {
-                if self.click_in_terminal(col, row) {
-                    // Click inside terminal — stay focused
+                if self.click_in_claude(col, row) {
+                    // Click inside Claude panel — stay focused
                 } else {
-                    self.terminal_focused = false;
+                    self.claude_focused = None;
                     self.handle_mouse_click(col, row);
                 }
             }
             Action::MouseDoubleClick(col, row) => {
-                if self.click_in_terminal(col, row) {
-                    // Double-click inside terminal — absorb
+                if self.click_in_claude(col, row) {
+                    // Double-click inside Claude panel — absorb
                 } else {
-                    self.terminal_focused = false;
+                    self.claude_focused = None;
                     self.handle_mouse_double_click(col, row);
                 }
             }
-            Action::MouseScrollUp(col, row) => {
-                self.forward_mouse_scroll_to_terminal(col, row, true);
+            Action::MouseScrollUp(_, _) => {
+                if let Some(ref mut tp) = self.claude_panels[side] {
+                    tp.scroll_up(3);
+                }
             }
-            Action::MouseScrollDown(col, row) => {
-                self.forward_mouse_scroll_to_terminal(col, row, false);
+            Action::MouseScrollDown(_, _) => {
+                if let Some(ref mut tp) = self.claude_panels[side] {
+                    tp.scroll_down(3);
+                }
             }
             _ => {}
         }
     }
 
-    fn click_in_terminal(&self, col: u16, row: u16) -> bool {
-        let area = self.panel_areas[self.terminal_side];
-        col >= area.x && col < area.x + area.width && row >= area.y && row < area.y + area.height
-    }
-
-    fn forward_mouse_scroll_to_terminal(&mut self, _col: u16, _row: u16, up: bool) {
-        if let Some(ref mut tp) = self.terminal_panel {
-            if up {
-                tp.scroll_up(3);
-            } else {
-                tp.scroll_down(3);
+    fn click_in_claude(&self, col: u16, row: u16) -> bool {
+        for side in 0..2 {
+            if let Some(area) = self.claude_panel_areas[side] {
+                if col >= area.x
+                    && col < area.x + area.width
+                    && row >= area.y
+                    && row < area.y + area.height
+                {
+                    return true;
+                }
             }
         }
+        false
     }
 
     fn handle_terminal_open_file(&mut self) {
-        let (path, line, col) = match self.terminal_panel {
+        let side = match self.claude_focused {
+            Some(s) => s,
+            None => return,
+        };
+        let (path, line, col) = match self.claude_panels[side] {
             Some(ref tp) => match tp.find_file_reference() {
                 Some(r) => r,
                 None => {
@@ -3240,13 +3416,23 @@ impl App {
         self.mode = AppMode::Editing(Box::new(editor));
     }
 
-    fn resize_terminal(&mut self) {
-        if let Some(ref mut tp) = self.terminal_panel {
-            let area = self.panel_areas[self.terminal_side];
-            let cols = area.width.saturating_sub(2).max(1);
-            let rows = area.height.saturating_sub(2).max(1);
-            tp.resize(cols, rows);
+    fn resize_claude_panels(&mut self) {
+        for side in 0..2 {
+            if let Some(ref mut tp) = self.claude_panels[side] {
+                if let Some(area) = self.claude_panel_areas[side] {
+                    let cols = area.width.saturating_sub(2).max(1);
+                    let rows = area.height.saturating_sub(2).max(1);
+                    tp.resize(cols, rows);
+                }
+            }
         }
+    }
+
+    /// Resize all bottom terminal panels to match their rendered areas.
+    /// Called after the first render to sync PTY dimensions.
+    pub fn resize_all_bottom_panels(&mut self) {
+        self.resize_claude_panels();
+        self.resize_shells();
     }
 
     fn toggle_shell(&mut self) {
@@ -3267,7 +3453,8 @@ impl App {
                     self.shell_panels[side] = Some(tp);
                     self.shell_focused = Some(side);
                     self.ci_focused = None;
-                    self.terminal_focused = false;
+                    self.claude_focused = None;
+                    self.bottom_split_pct[side] = self.persisted.split_pct_shell;
                 }
                 Err(e) => {
                     self.status_message = Some(format!("Failed to start shell: {}", e));
@@ -3293,7 +3480,7 @@ impl App {
                     }
                 }
                 if matches!(action, Action::Resize(_, _)) {
-                    self.resize_shells();
+                    self.resize_all_bottom_panels();
                 }
                 // Also poll CI, watchers, git
                 for ci in self.ci_panels.iter_mut().flatten() {
@@ -3320,6 +3507,18 @@ impl App {
             Action::ToggleShell => self.toggle_shell(),
             Action::Quit => {
                 self.quit_confirm = Some(true);
+            }
+            Action::BottomResizeUp => {
+                self.bottom_split_pct[side] = self.bottom_split_pct[side]
+                    .saturating_sub(SPLIT_RESIZE_STEP)
+                    .max(SPLIT_MIN_PCT);
+            }
+            Action::BottomResizeDown => {
+                self.bottom_split_pct[side] =
+                    (self.bottom_split_pct[side] + SPLIT_RESIZE_STEP).min(SPLIT_MAX_PCT);
+            }
+            Action::BottomMaximize => {
+                self.bottom_maximized[side] = !self.bottom_maximized[side];
             }
             Action::MouseClick(col, row) => self.handle_mouse_click(col, row),
             Action::MouseDoubleClick(col, row) => self.handle_mouse_double_click(col, row),
@@ -3751,18 +3950,20 @@ impl App {
             }
         }
 
-        // Check if click is in the terminal panel
-        if self.terminal_panel.is_some() {
-            let term_area = self.panel_areas[self.terminal_side];
-            if col >= term_area.x
-                && col < term_area.x + term_area.width
-                && row >= term_area.y
-                && row < term_area.y + term_area.height
-            {
-                self.terminal_focused = true;
-                self.ci_focused = None;
-                self.shell_focused = None;
-                return;
+        // Check if click is in a Claude panel
+        for side in 0..2 {
+            if let Some(claude_area) = self.claude_panel_areas[side] {
+                if self.claude_panels[side].is_some()
+                    && col >= claude_area.x
+                    && col < claude_area.x + claude_area.width
+                    && row >= claude_area.y
+                    && row < claude_area.y + claude_area.height
+                {
+                    self.claude_focused = Some(side);
+                    self.ci_focused = None;
+                    self.shell_focused = None;
+                    return;
+                }
             }
         }
 
@@ -3777,7 +3978,7 @@ impl App {
                 {
                     self.shell_focused = Some(side);
                     self.ci_focused = None;
-                    self.terminal_focused = false;
+                    self.claude_focused = None;
                     return;
                 }
             }
@@ -3786,7 +3987,7 @@ impl App {
         // Click on a file panel — unfocus everything
         if let Some(panel_idx) = self.panel_at(col, row) {
             self.ci_focused = None;
-            self.terminal_focused = false;
+            self.claude_focused = None;
             self.shell_focused = None;
             self.active_panel = panel_idx;
             if let Some(entry_idx) = self.row_to_entry_index(panel_idx, row) {

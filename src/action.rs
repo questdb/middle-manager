@@ -97,10 +97,13 @@ pub enum Action {
     ToggleCi,
 
     // Terminal / Shell
-    ToggleTerminal,
+    ToggleClaude,
     ToggleShell,
     TerminalInput(Vec<u8>),
     TerminalOpenFile,
+    BottomResizeUp,
+    BottomResizeDown,
+    BottomMaximize,
 
     // Help
     ShowHelp,

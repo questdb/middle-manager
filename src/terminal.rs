@@ -98,7 +98,7 @@ impl TerminalPanel {
         })
     }
 
-    /// Spawn `claude` in a PTY.
+    /// Spawn `claude` in a PTY (new session).
     pub fn spawn_claude(
         dir: &Path,
         cols: u16,
@@ -112,7 +112,26 @@ impl TerminalPanel {
             cols,
             rows,
             format!(" Claude — {} ", dir.display()),
-            false, // Claude Code renders its own cursor
+            false,
+            wakeup,
+        )
+    }
+
+    /// Spawn `claude -c` in a PTY (continue last session).
+    pub fn spawn_claude_continue(
+        dir: &Path,
+        cols: u16,
+        rows: u16,
+        wakeup: WakeupSender,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_cmd(
+            "claude",
+            &["-c"],
+            dir,
+            cols,
+            rows,
+            format!(" Claude -c — {} ", dir.display()),
+            false,
             wakeup,
         )
     }
