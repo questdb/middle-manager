@@ -43,6 +43,7 @@ pub struct App {
     pub status_message: Option<String>,
     pub panel_areas: [Rect; 2],
     pub ci_panel_areas: [Option<Rect>; 2],
+    pub shell_panel_areas: [Option<Rect>; 2],
     last_click: Option<(Instant, u16, u16)>,
     /// Go-to-line prompt state. When Some, an input overlay is shown.
     pub goto_line_input: Option<String>,
@@ -70,6 +71,10 @@ pub struct App {
     pub fuzzy_search: [Option<FuzzySearchState>; 2],
     /// Help dialog scroll offset.
     pub help_scroll: Option<usize>,
+    /// Shell panels (one per file panel side, like CI panels).
+    pub shell_panels: [Option<TerminalPanel>; 2],
+    /// Which shell panel has focus (None = not focused).
+    pub shell_focused: Option<usize>,
     /// Embedded terminal panel (runs `claude`).
     pub terminal_panel: Option<TerminalPanel>,
     /// Which panel side the terminal occupies (0=left, 1=right).
@@ -851,6 +856,7 @@ impl App {
             status_message: None,
             panel_areas: [Rect::default(); 2],
             ci_panel_areas: [None, None],
+            shell_panel_areas: [None, None],
             last_click: None,
             goto_line_input: None,
             needs_clear: false,
@@ -865,6 +871,8 @@ impl App {
             goto_path: [None, None],
             fuzzy_search: [None, None],
             help_scroll: None,
+            shell_panels: [None, None],
+            shell_focused: None,
             terminal_panel: None,
             terminal_side: 1,
             terminal_focused: false,
@@ -1073,6 +1081,18 @@ impl App {
             };
         }
 
+        // Shell panel intercepts keys when focused
+        if self.shell_focused.is_some() {
+            return match key.code {
+                KeyCode::F(1) => Action::SwitchPanel,
+                KeyCode::F(10) => Action::Quit,
+                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::ToggleShell
+                }
+                _ => Action::TerminalInput(crate::terminal::encode_key_event(key)),
+            };
+        }
+
         // CI panel intercepts keys when focused
         if self.ci_focused.is_some() {
             return match key.code {
@@ -1154,6 +1174,9 @@ impl App {
             KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::CopyPath,
             KeyCode::Char('g') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::GotoPathPrompt
+            }
+            KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::ToggleShell
             }
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::FuzzySearchPrompt
@@ -1516,6 +1539,12 @@ impl App {
             return;
         }
 
+        // Shell panel intercepts when focused
+        if self.shell_focused.is_some() {
+            self.handle_shell_action(action);
+            return;
+        }
+
         // Dialog, mkdir dialog, copy dialog, and editor have their own dispatch
         if matches!(self.mode, AppMode::Dialog(_)) {
             self.handle_dialog_action(action);
@@ -1561,6 +1590,18 @@ impl App {
                     if tp.exited {
                         self.terminal_panel = None;
                         self.terminal_focused = false;
+                    }
+                }
+                // Poll shell panels
+                for side in 0..2 {
+                    if let Some(ref mut sp) = self.shell_panels[side] {
+                        sp.poll();
+                        if sp.exited {
+                            self.shell_panels[side] = None;
+                            if self.shell_focused == Some(side) {
+                                self.shell_focused = None;
+                            }
+                        }
                     }
                 }
                 // Poll for async PR query results
@@ -1737,12 +1778,13 @@ impl App {
                     let area = self.panel_areas[spawn_side];
                     let cols = area.width.saturating_sub(2).max(1);
                     let rows = area.height.saturating_sub(2).max(1);
-                    match TerminalPanel::spawn(&dir, cols, rows, wakeup.clone()) {
+                    match TerminalPanel::spawn_claude(&dir, cols, rows, wakeup.clone()) {
                         Ok(tp) => {
                             self.terminal_panel = Some(tp);
                             self.terminal_side = spawn_side;
                             self.terminal_focused = true;
                             self.ci_focused = None;
+                            self.shell_focused = None;
                         }
                         Err(e) => {
                             self.status_message = Some(format!("Failed to start terminal: {}", e));
@@ -1752,6 +1794,9 @@ impl App {
                     self.status_message = Some("Event loop not ready".to_string());
                 }
             }
+
+            // Shell
+            Action::ToggleShell => self.toggle_shell(),
 
             // Mouse
             Action::MouseClick(col, row) => self.handle_mouse_click(col, row),
@@ -1869,25 +1914,27 @@ impl App {
     }
 
     fn handle_switch_panel_dir(&mut self, reverse: bool) {
-        // Focus targets: Panel(side), Ci(side), Terminal
         #[derive(PartialEq)]
         enum Target {
             Panel(usize),
             Ci(usize),
+            Shell(usize),
             Terminal,
         }
 
         let has_terminal = self.terminal_panel.is_some();
 
-        // Build tab order: left, left_ci?, terminal?(if left side), right, right_ci?, terminal?(if right side)
-        let mut order: Vec<Target> = Vec::with_capacity(6);
+        let mut order: Vec<Target> = Vec::with_capacity(8);
 
-        // Left side: skip file panel if terminal occupies it
+        // Left side
         if !(has_terminal && self.terminal_side == 0) {
             order.push(Target::Panel(0));
         }
         if self.ci_panels[0].is_some() {
             order.push(Target::Ci(0));
+        }
+        if self.shell_panels[0].is_some() {
+            order.push(Target::Shell(0));
         }
         if has_terminal && self.terminal_side == 0 {
             order.push(Target::Terminal);
@@ -1900,6 +1947,9 @@ impl App {
         if self.ci_panels[1].is_some() {
             order.push(Target::Ci(1));
         }
+        if self.shell_panels[1].is_some() {
+            order.push(Target::Shell(1));
+        }
         if has_terminal && self.terminal_side == 1 {
             order.push(Target::Terminal);
         }
@@ -1908,22 +1958,23 @@ impl App {
             return;
         }
 
-        // Simple case: only two file panels, no CI, no terminal
         if order.len() == 2
             && matches!(order[0], Target::Panel(_))
             && matches!(order[1], Target::Panel(_))
         {
             self.active_panel = 1 - self.active_panel;
             self.ci_focused = None;
+            self.shell_focused = None;
             self.terminal_focused = false;
             return;
         }
 
-        // Find current position
         let current = if self.terminal_focused {
             order.iter().position(|t| *t == Target::Terminal)
-        } else if let Some(ci_side) = self.ci_focused {
-            order.iter().position(|t| *t == Target::Ci(ci_side))
+        } else if let Some(side) = self.shell_focused {
+            order.iter().position(|t| *t == Target::Shell(side))
+        } else if let Some(side) = self.ci_focused {
+            order.iter().position(|t| *t == Target::Ci(side))
         } else {
             order
                 .iter()
@@ -1945,15 +1996,23 @@ impl App {
             Target::Panel(side) => {
                 self.active_panel = *side;
                 self.ci_focused = None;
+                self.shell_focused = None;
                 self.terminal_focused = false;
             }
             Target::Ci(side) => {
                 self.ci_focused = Some(*side);
+                self.shell_focused = None;
+                self.terminal_focused = false;
+            }
+            Target::Shell(side) => {
+                self.shell_focused = Some(*side);
+                self.ci_focused = None;
                 self.terminal_focused = false;
             }
             Target::Terminal => {
                 self.terminal_focused = true;
                 self.ci_focused = None;
+                self.shell_focused = None;
             }
         }
     }
@@ -3190,6 +3249,106 @@ impl App {
         }
     }
 
+    fn toggle_shell(&mut self) {
+        let side = self.active_panel;
+        if self.shell_panels[side].is_some() {
+            self.shell_panels[side] = None;
+            if self.shell_focused == Some(side) {
+                self.shell_focused = None;
+            }
+        } else if let Some(ref wakeup) = self.wakeup_sender {
+            let dir = self.panels[side].current_dir.clone();
+            // Use the CI area dimensions if available, otherwise estimate 40% height
+            let area = self.panel_areas[side];
+            let cols = area.width.saturating_sub(2).max(1);
+            let rows = (area.height * 40 / 100).saturating_sub(2).max(1);
+            match TerminalPanel::spawn_shell(&dir, cols, rows, wakeup.clone()) {
+                Ok(tp) => {
+                    self.shell_panels[side] = Some(tp);
+                    self.shell_focused = Some(side);
+                    self.ci_focused = None;
+                    self.terminal_focused = false;
+                }
+                Err(e) => {
+                    self.status_message = Some(format!("Failed to start shell: {}", e));
+                }
+            }
+        }
+    }
+
+    fn handle_shell_action(&mut self, action: Action) {
+        let side = match self.shell_focused {
+            Some(s) => s,
+            None => return,
+        };
+
+        match action {
+            Action::None => {}
+            Action::Tick | Action::Resize(_, _) => {
+                if let Some(ref mut sp) = self.shell_panels[side] {
+                    sp.poll();
+                    if sp.exited {
+                        self.shell_panels[side] = None;
+                        self.shell_focused = None;
+                    }
+                }
+                if matches!(action, Action::Resize(_, _)) {
+                    self.resize_shells();
+                }
+                // Also poll CI, watchers, git
+                for ci in self.ci_panels.iter_mut().flatten() {
+                    ci.poll();
+                }
+                if let Some(ref w) = self.dir_watcher {
+                    if w.has_changes() {
+                        self.reload_panels();
+                    }
+                }
+                if self.git_cache.poll_pending() {
+                    self.panels[0].refresh_git(&mut self.git_cache);
+                    self.panels[1].refresh_git(&mut self.git_cache);
+                }
+            }
+            Action::TerminalInput(bytes) => {
+                if let Some(ref mut sp) = self.shell_panels[side] {
+                    sp.scroll_to_bottom();
+                    sp.write_bytes(&bytes);
+                }
+            }
+            Action::SwitchPanel => self.handle_switch_panel(),
+            Action::SwitchPanelReverse => self.handle_switch_panel_reverse(),
+            Action::ToggleShell => self.toggle_shell(),
+            Action::Quit => {
+                self.quit_confirm = Some(true);
+            }
+            Action::MouseClick(col, row) => self.handle_mouse_click(col, row),
+            Action::MouseDoubleClick(col, row) => self.handle_mouse_double_click(col, row),
+            Action::MouseScrollUp(_, _) => {
+                if let Some(ref mut sp) = self.shell_panels[side] {
+                    sp.scroll_up(3);
+                }
+            }
+            Action::MouseScrollDown(_, _) => {
+                if let Some(ref mut sp) = self.shell_panels[side] {
+                    sp.scroll_down(3);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn resize_shells(&mut self) {
+        for side in 0..2 {
+            if let Some(ref mut sp) = self.shell_panels[side] {
+                if let Some(area) = self.shell_panel_areas[side] {
+                    let cols = area.width.saturating_sub(2).max(1);
+                    let rows = area.height.saturating_sub(2).max(1);
+                    sp.resize(cols, rows);
+                }
+            }
+        }
+    }
+
     fn start_ci_log_download(&mut self, side: usize, run_id: u64, step: &crate::ci::CiStep) {
         let ci = match &mut self.ci_panels[side] {
             Some(ci) => ci,
@@ -3602,14 +3761,33 @@ impl App {
             {
                 self.terminal_focused = true;
                 self.ci_focused = None;
+                self.shell_focused = None;
                 return;
             }
         }
 
-        // Click on a file panel — unfocus CI and terminal
+        // Check if click is in a shell panel
+        for side in 0..2 {
+            if let Some(shell_area) = self.shell_panel_areas[side] {
+                if self.shell_panels[side].is_some()
+                    && col >= shell_area.x
+                    && col < shell_area.x + shell_area.width
+                    && row >= shell_area.y
+                    && row < shell_area.y + shell_area.height
+                {
+                    self.shell_focused = Some(side);
+                    self.ci_focused = None;
+                    self.terminal_focused = false;
+                    return;
+                }
+            }
+        }
+
+        // Click on a file panel — unfocus everything
         if let Some(panel_idx) = self.panel_at(col, row) {
             self.ci_focused = None;
             self.terminal_focused = false;
+            self.shell_focused = None;
             self.active_panel = panel_idx;
             if let Some(entry_idx) = self.row_to_entry_index(panel_idx, row) {
                 self.panels[panel_idx].table_state.select(Some(entry_idx));

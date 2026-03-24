@@ -23,6 +23,39 @@ use ratatui::Frame;
 use crate::app::{App, AppMode};
 use crate::theme::theme;
 
+/// Split a panel column into file area + optional CI area + optional shell area.
+fn split_panel_column(
+    col: Rect,
+    has_ci: bool,
+    has_shell: bool,
+) -> (Rect, Option<Rect>, Option<Rect>) {
+    match (has_ci, has_shell) {
+        (true, true) => {
+            // Both CI and shell: 40% files, 30% CI, 30% shell
+            let [top, mid, bot] = Layout::vertical([
+                Constraint::Percentage(40),
+                Constraint::Percentage(30),
+                Constraint::Percentage(30),
+            ])
+            .areas(col);
+            (top, Some(mid), Some(bot))
+        }
+        (true, false) => {
+            let [top, bot] =
+                Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
+                    .areas(col);
+            (top, Some(bot), None)
+        }
+        (false, true) => {
+            let [top, bot] =
+                Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
+                    .areas(col);
+            (top, None, Some(bot))
+        }
+        (false, false) => (col, None, None),
+    }
+}
+
 pub fn render(frame: &mut Frame, app: &mut App) {
     match &app.mode {
         AppMode::Viewing(_) => render_viewer(frame, app),
@@ -60,34 +93,31 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
     let [left_col, right_col] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(panels_area);
 
-    let (left_area, left_ci_area) = if app.ci_panels[0].is_some() {
-        let [top, bottom] =
-            Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
-                .areas(left_col);
-        (top, Some(bottom))
-    } else {
-        (left_col, None)
-    };
-    let (right_area, right_ci_area) = if app.ci_panels[1].is_some() {
-        let [top, bottom] =
-            Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
-                .areas(right_col);
-        (top, Some(bottom))
-    } else {
-        (right_col, None)
-    };
+    // Split each column: file panel on top, CI or shell panel on bottom (if active)
+    let (left_area, left_ci_area, left_shell_area) = split_panel_column(
+        left_col,
+        app.ci_panels[0].is_some(),
+        app.shell_panels[0].is_some(),
+    );
+    let (right_area, right_ci_area, right_shell_area) = split_panel_column(
+        right_col,
+        app.ci_panels[1].is_some(),
+        app.shell_panels[1].is_some(),
+    );
 
     app.panel_areas = [left_area, right_area];
     app.ci_panel_areas = [left_ci_area, right_ci_area];
+    app.shell_panel_areas = [left_shell_area, right_shell_area];
 
     header::render(frame, header_area, app);
 
     // File panels are active only when no CI/terminal panel is focused
-    let (left_active, right_active) = if app.ci_focused.is_some() || app.terminal_focused {
-        (false, false)
-    } else {
-        (app.active_panel == 0, app.active_panel == 1)
-    };
+    let (left_active, right_active) =
+        if app.ci_focused.is_some() || app.terminal_focused || app.shell_focused.is_some() {
+            (false, false)
+        } else {
+            (app.active_panel == 0, app.active_panel == 1)
+        };
 
     let has_terminal = app.terminal_panel.is_some();
     let terminal_side = app.terminal_side;
@@ -139,8 +169,18 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
         ci_view::render(frame, ci_area, ci, app.ci_focused == Some(1));
     }
 
+    // Render shell panels
+    if let (Some(shell_area), Some(ref sp)) = (left_shell_area, &app.shell_panels[0]) {
+        terminal_view::render(frame, shell_area, sp, app.shell_focused == Some(0));
+    }
+    if let (Some(shell_area), Some(ref sp)) = (right_shell_area, &app.shell_panels[1]) {
+        terminal_view::render(frame, shell_area, sp, app.shell_focused == Some(1));
+    }
+
     // Show appropriate footer
-    if app.terminal_focused {
+    if app.shell_focused.is_some() {
+        footer::render_shell(frame, footer_area);
+    } else if app.terminal_focused {
         footer::render_terminal(frame, footer_area);
     } else if let Some(side) = app.ci_focused {
         if let Some(ref ci) = app.ci_panels[side] {

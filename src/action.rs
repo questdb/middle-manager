@@ -96,8 +96,9 @@ pub enum Action {
     OpenPr,
     ToggleCi,
 
-    // Terminal
+    // Terminal / Shell
     ToggleTerminal,
+    ToggleShell,
     TerminalInput(Vec<u8>),
     TerminalOpenFile,
 
