@@ -89,7 +89,9 @@ struct CacheEntry {
 }
 
 /// Minimum time between re-queries to the same repo.
-const REFRESH_INTERVAL_MS: u128 = 2000;
+/// The filesystem watcher handles real-time changes; this is a fallback
+/// for changes the watcher might miss (e.g., remote fetch, git internals).
+const REFRESH_INTERVAL_MS: u128 = 30_000;
 
 impl GitCache {
     pub fn new() -> Self {
@@ -322,7 +324,13 @@ fn query_repo(dir: &Path, _repo_root: &Path) -> Option<CacheEntry> {
     // `git status --branch --porcelain=v1` combines branch + status in one call.
     // Use -unormal (not -uall) to avoid listing every file in untracked dirs.
     let output = Command::new("git")
-        .args(["status", "--branch", "--porcelain=v1", "-unormal"])
+        .args([
+            "--no-optional-locks",
+            "status",
+            "--branch",
+            "--porcelain=v1",
+            "-unormal",
+        ])
         .current_dir(dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

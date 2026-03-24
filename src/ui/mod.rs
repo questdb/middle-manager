@@ -5,6 +5,7 @@ pub mod dialog_helpers;
 pub mod editor_view;
 pub mod footer;
 pub mod header;
+pub mod help_dialog;
 pub mod hex_view;
 pub mod mkdir_dialog;
 pub mod panel_view;
@@ -21,6 +22,72 @@ use ratatui::Frame;
 
 use crate::app::{App, AppMode};
 use crate::theme::theme;
+
+/// Split a panel column into file area + optional CI area + optional shell area + optional Claude area.
+///
+/// When `maximized` is true, the file panel gets 0 height and the bottom panels fill the column.
+/// `split_pct` controls the top/bottom ratio (percentage for the file panel).
+fn split_panel_column(
+    col: Rect,
+    has_ci: bool,
+    has_shell: bool,
+    has_claude: bool,
+    split_pct: u16,
+    maximized: bool,
+) -> (Rect, Option<Rect>, Option<Rect>, Option<Rect>) {
+    // When Claude is maximized, it takes the entire column
+    if maximized && has_claude {
+        let zero = Rect::new(col.x, col.y, col.width, 0);
+        return (zero, None, None, Some(col));
+    }
+
+    let bottom_count = has_ci as usize + has_shell as usize + has_claude as usize;
+    if bottom_count == 0 {
+        return (col, None, None, None);
+    }
+
+    // Split top (file panel) vs bottom (all sub-panels share equally)
+    let top_pct = if maximized { 0 } else { split_pct };
+    let bottom_pct = 100u16.saturating_sub(top_pct);
+
+    let [file_area, bottom_area] = Layout::vertical([
+        Constraint::Percentage(top_pct),
+        Constraint::Percentage(bottom_pct),
+    ])
+    .areas(col);
+
+    // Divide bottom area equally among active bottom panels
+    let mut constraints: Vec<Constraint> = Vec::with_capacity(bottom_count);
+    for _ in 0..bottom_count {
+        constraints.push(Constraint::Ratio(1, bottom_count as u32));
+    }
+    let areas: Vec<Rect> = Layout::vertical(constraints).split(bottom_area).to_vec();
+
+    let mut idx = 0;
+    let ci_area = if has_ci {
+        let a = areas[idx];
+        idx += 1;
+        Some(a)
+    } else {
+        None
+    };
+    let shell_area = if has_shell {
+        let a = areas[idx];
+        idx += 1;
+        Some(a)
+    } else {
+        None
+    };
+    let claude_area = if has_claude {
+        let a = areas[idx];
+        let _ = idx;
+        Some(a)
+    } else {
+        None
+    };
+
+    (file_area, ci_area, shell_area, claude_area)
+}
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     match &app.mode {
@@ -40,6 +107,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         let area = render_quit_dialog(frame, quit_focused);
         shadow::render_shadow(frame, area);
     }
+
+    // Render help dialog overlay
+    if let Some(scroll) = app.help_scroll {
+        let area = help_dialog::render(frame, scroll);
+        shadow::render_shadow(frame, area);
+    }
 }
 
 fn render_normal(frame: &mut Frame, app: &mut App) {
@@ -53,48 +126,44 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
     let [left_col, right_col] =
         Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(panels_area);
 
-    let (left_area, left_ci_area) = if app.ci_panels[0].is_some() {
-        let [top, bottom] =
-            Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
-                .areas(left_col);
-        (top, Some(bottom))
-    } else {
-        (left_col, None)
-    };
-    let (right_area, right_ci_area) = if app.ci_panels[1].is_some() {
-        let [top, bottom] =
-            Layout::vertical([Constraint::Percentage(60), Constraint::Percentage(40)])
-                .areas(right_col);
-        (top, Some(bottom))
-    } else {
-        (right_col, None)
-    };
+    // Split each column: file panel on top, bottom panels below
+    let (left_area, left_ci_area, left_shell_area, left_claude_area) = split_panel_column(
+        left_col,
+        app.ci_panels[0].is_some(),
+        app.shell_panels[0].is_some(),
+        app.claude_panels[0].is_some(),
+        app.bottom_split_pct[0],
+        app.bottom_maximized[0],
+    );
+    let (right_area, right_ci_area, right_shell_area, right_claude_area) = split_panel_column(
+        right_col,
+        app.ci_panels[1].is_some(),
+        app.shell_panels[1].is_some(),
+        app.claude_panels[1].is_some(),
+        app.bottom_split_pct[1],
+        app.bottom_maximized[1],
+    );
 
     app.panel_areas = [left_area, right_area];
     app.ci_panel_areas = [left_ci_area, right_ci_area];
+    app.shell_panel_areas = [left_shell_area, right_shell_area];
+    app.claude_panel_areas = [left_claude_area, right_claude_area];
 
     header::render(frame, header_area, app);
 
-    // File panels are active only when no CI/terminal panel is focused
-    let (left_active, right_active) = if app.ci_focused.is_some() || app.terminal_focused {
+    // File panels are active only when no CI/claude/shell panel is focused
+    let (left_active, right_active) = if app.ci_focused.is_some()
+        || app.claude_focused.is_some()
+        || app.shell_focused.is_some()
+    {
         (false, false)
     } else {
         (app.active_panel == 0, app.active_panel == 1)
     };
 
-    let has_terminal = app.terminal_panel.is_some();
-    let terminal_side = app.terminal_side;
-
-    // Left panel: render terminal or file panel
+    // Render file panels (skip if 0-height, e.g. when Claude is maximized)
     let [left_panel, right_panel] = app.panels.each_mut();
-    if has_terminal && terminal_side == 0 {
-        terminal_view::render(
-            frame,
-            left_area,
-            app.terminal_panel.as_ref().unwrap(),
-            app.terminal_focused,
-        );
-    } else {
+    if left_area.height > 0 {
         panel_view::render_with_overlays(
             frame,
             left_area,
@@ -104,16 +173,7 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
             app.fuzzy_search[0].as_ref(),
         );
     }
-
-    // Right panel: render terminal or file panel
-    if has_terminal && terminal_side == 1 {
-        terminal_view::render(
-            frame,
-            right_area,
-            app.terminal_panel.as_ref().unwrap(),
-            app.terminal_focused,
-        );
-    } else {
+    if right_area.height > 0 {
         panel_view::render_with_overlays(
             frame,
             right_area,
@@ -132,8 +192,26 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
         ci_view::render(frame, ci_area, ci, app.ci_focused == Some(1));
     }
 
+    // Render shell panels
+    if let (Some(shell_area), Some(ref sp)) = (left_shell_area, &app.shell_panels[0]) {
+        terminal_view::render(frame, shell_area, sp, app.shell_focused == Some(0));
+    }
+    if let (Some(shell_area), Some(ref sp)) = (right_shell_area, &app.shell_panels[1]) {
+        terminal_view::render(frame, shell_area, sp, app.shell_focused == Some(1));
+    }
+
+    // Render Claude panels
+    if let (Some(claude_area), Some(ref cp)) = (left_claude_area, &app.claude_panels[0]) {
+        terminal_view::render(frame, claude_area, cp, app.claude_focused == Some(0));
+    }
+    if let (Some(claude_area), Some(ref cp)) = (right_claude_area, &app.claude_panels[1]) {
+        terminal_view::render(frame, claude_area, cp, app.claude_focused == Some(1));
+    }
+
     // Show appropriate footer
-    if app.terminal_focused {
+    if app.shell_focused.is_some() {
+        footer::render_shell(frame, footer_area);
+    } else if app.claude_focused.is_some() {
         footer::render_terminal(frame, footer_area);
     } else if let Some(side) = app.ci_focused {
         if let Some(ref ci) = app.ci_panels[side] {

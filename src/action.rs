@@ -96,10 +96,17 @@ pub enum Action {
     OpenPr,
     ToggleCi,
 
-    // Terminal
-    ToggleTerminal,
+    // Terminal / Shell
+    ToggleClaude,
+    ToggleShell,
     TerminalInput(Vec<u8>),
     TerminalOpenFile,
+    BottomResizeUp,
+    BottomResizeDown,
+    BottomMaximize,
+
+    // Help
+    ShowHelp,
 
     // Application
     Quit,

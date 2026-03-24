@@ -79,6 +79,20 @@ pub fn render(frame: &mut Frame, area: Rect, tp: &TerminalPanel, is_active: bool
     }
 
     frame.render_widget(Paragraph::new(lines), inner);
+
+    // Show hardware cursor only for terminals that want it (shells), not TUI apps (Claude Code)
+    if is_active && tp.show_cursor {
+        let screen = tp.screen();
+        let (cursor_row, cursor_col) = screen.cursor_position();
+        // Only show if not in scrollback (scrollback == 0 means live view)
+        if screen.scrollback() == 0 {
+            let x = inner.x + cursor_col;
+            let y = inner.y + cursor_row;
+            if x < inner.x + inner.width && y < inner.y + inner.height {
+                frame.set_cursor_position((x, y));
+            }
+        }
+    }
 }
 
 fn vt100_cell_style(cell: &vt100::Cell) -> Style {

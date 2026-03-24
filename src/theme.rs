@@ -177,6 +177,14 @@ impl Theme {
             .add_modifier(Modifier::BOLD)
     }
 
+    /// Style for the cursor row when the item is also selected (multi-select).
+    pub fn selected_highlight_style(&self) -> Style {
+        Style::default()
+            .bg(self.highlight_bg)
+            .fg(Color::Rgb(100, 60, 0))
+            .add_modifier(Modifier::BOLD)
+    }
+
     pub fn dir_style(&self) -> Style {
         Style::default()
             .fg(self.dir_fg)

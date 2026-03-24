@@ -26,12 +26,22 @@ pub struct TerminalPanel {
     pub title: String,
     /// Directory the terminal was spawned in (for resolving relative paths).
     pub spawn_dir: PathBuf,
+    /// Whether to show the hardware cursor (false for apps that render their own, like Claude Code).
+    pub show_cursor: bool,
 }
 
 impl TerminalPanel {
-    /// Spawn `claude` in a PTY with the given working directory and dimensions.
-    /// The `wakeup` sender is used to wake up the main event loop when PTY output arrives.
-    pub fn spawn(dir: &Path, cols: u16, rows: u16, wakeup: WakeupSender) -> anyhow::Result<Self> {
+    /// Spawn a command in a PTY with the given working directory and dimensions.
+    fn spawn_cmd(
+        command: &str,
+        args: &[&str],
+        dir: &Path,
+        cols: u16,
+        rows: u16,
+        title: String,
+        show_cursor: bool,
+        wakeup: WakeupSender,
+    ) -> anyhow::Result<Self> {
         let pty_system = native_pty_system();
 
         let pair = pty_system.openpty(PtySize {
@@ -41,17 +51,18 @@ impl TerminalPanel {
             pixel_height: 0,
         })?;
 
-        let mut cmd = CommandBuilder::new("claude");
+        let mut cmd = CommandBuilder::new(command);
+        for arg in args {
+            cmd.arg(arg);
+        }
         cmd.cwd(dir);
         cmd.env("TERM", "xterm-256color");
 
         let child = pair.slave.spawn_command(cmd)?;
-        // Drop the slave side — the child owns it now.
         drop(pair.slave);
 
         let writer = pair.master.take_writer()?;
 
-        // Background reader thread
         let (tx, rx) = mpsc::channel();
         let mut reader = pair.master.try_clone_reader()?;
         std::thread::spawn(move || {
@@ -63,7 +74,6 @@ impl TerminalPanel {
                         if tx.send(buf[..n].to_vec()).is_err() {
                             break;
                         }
-                        // Wake up the main event loop (coalesced — no flood)
                         wakeup.wake();
                     }
                     Err(_) => break,
@@ -82,9 +92,69 @@ impl TerminalPanel {
             cols,
             rows,
             exited: false,
-            title: format!(" Claude — {} ", dir.display()),
+            title,
             spawn_dir: dir.to_path_buf(),
+            show_cursor,
         })
+    }
+
+    /// Spawn `claude` in a PTY (new session).
+    pub fn spawn_claude(
+        dir: &Path,
+        cols: u16,
+        rows: u16,
+        wakeup: WakeupSender,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_cmd(
+            "claude",
+            &[],
+            dir,
+            cols,
+            rows,
+            format!(" Claude — {} ", dir.display()),
+            false,
+            wakeup,
+        )
+    }
+
+    /// Spawn `claude -c` in a PTY (continue last session).
+    pub fn spawn_claude_continue(
+        dir: &Path,
+        cols: u16,
+        rows: u16,
+        wakeup: WakeupSender,
+    ) -> anyhow::Result<Self> {
+        Self::spawn_cmd(
+            "claude",
+            &["-c"],
+            dir,
+            cols,
+            rows,
+            format!(" Claude -c — {} ", dir.display()),
+            false,
+            wakeup,
+        )
+    }
+
+    /// Spawn the user's default shell in a PTY.
+    pub fn spawn_shell(
+        dir: &Path,
+        cols: u16,
+        rows: u16,
+        wakeup: WakeupSender,
+    ) -> anyhow::Result<Self> {
+        let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string());
+        let shell_name = shell.rsplit('/').next().unwrap_or("shell");
+        Self::spawn_cmd(
+            &shell,
+            &[],
+            dir,
+            cols,
+            rows,
+            format!(" {} — {} ", shell_name, dir.display()),
+            true, // shell needs hardware cursor
+            wakeup,
+        )
     }
 
     /// Poll for new PTY output and check if the child exited.
