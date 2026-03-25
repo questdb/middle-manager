@@ -17,6 +17,7 @@ use crate::editor::EditorState;
 use crate::file_search::SearchState;
 use crate::fs_ops;
 use crate::hex_viewer::HexViewerState;
+use crate::parquet_viewer::ParquetViewerState;
 use crate::panel::git::GitCache;
 use crate::panel::sort::SortField;
 use crate::panel::Panel;
@@ -308,6 +309,7 @@ pub enum AppMode {
     CopyDialog(CopyDialogState),
     Viewing(Box<ViewerState>),
     HexViewing(Box<HexViewerState>),
+    ParquetViewing(Box<ParquetViewerState>),
     Editing(Box<EditorState>),
 }
 
@@ -1321,6 +1323,7 @@ impl App {
             AppMode::MkdirDialog(state) => Self::map_mkdir_dialog_key(key, state.focused),
             AppMode::CopyDialog(state) => Self::map_copy_dialog_key(key, state.focused),
             AppMode::Viewing(_) | AppMode::HexViewing(_) => self.map_viewer_key(key),
+            AppMode::ParquetViewing(_) => self.map_parquet_key(key),
             AppMode::Editing(_) => Self::map_editor_key(key),
         }
     }
@@ -1743,6 +1746,24 @@ impl App {
         }
     }
 
+    fn map_parquet_key(&self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Up => Action::MoveUp,
+            KeyCode::Down => Action::MoveDown,
+            KeyCode::Left => Action::CursorLeft,
+            KeyCode::Right => Action::CursorRight,
+            KeyCode::Enter => Action::Enter,
+            KeyCode::PageUp => Action::PageUp,
+            KeyCode::PageDown => Action::PageDown,
+            KeyCode::Home => Action::MoveToTop,
+            KeyCode::End => Action::MoveToBottom,
+            KeyCode::Tab | KeyCode::F(4) => Action::Toggle,
+            KeyCode::Char('g') => Action::GotoLinePrompt,
+            KeyCode::Char('q') | KeyCode::Esc => Action::DialogCancel,
+            _ => Action::None,
+        }
+    }
+
     fn map_editor_key(key: KeyEvent) -> Action {
         let shift = key.modifiers.contains(KeyModifiers::SHIFT);
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -2085,18 +2106,29 @@ impl App {
             }
             Action::Toggle => self.handle_toggle_viewer(),
             Action::GotoLinePrompt => {
-                // Only works in viewer/hex/editor modes
+                // Only works in viewer/hex/editor/parquet modes
                 if matches!(
                     self.mode,
-                    AppMode::Viewing(_) | AppMode::HexViewing(_) | AppMode::Editing(_)
+                    AppMode::Viewing(_)
+                        | AppMode::HexViewing(_)
+                        | AppMode::ParquetViewing(_)
+                        | AppMode::Editing(_)
                 ) {
                     self.goto_line_input = Some(String::new());
                 }
             }
             Action::EditBuiltin => self.handle_edit_builtin(),
-            Action::CursorLeft
-            | Action::CursorRight
-            | Action::CursorLineStart
+            Action::CursorLeft => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.scroll_left();
+                }
+            }
+            Action::CursorRight => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.scroll_right();
+                }
+            }
+            Action::CursorLineStart
             | Action::CursorLineEnd
             | Action::EditorSave
             | Action::EditorNewline
@@ -2335,6 +2367,7 @@ impl App {
         match &mut self.mode {
             AppMode::Viewing(v) => v.scroll_up(1),
             AppMode::HexViewing(h) => h.scroll_up(1),
+            AppMode::ParquetViewing(p) => p.move_up(1),
             _ => self.active_panel_mut().move_selection(-1),
         }
     }
@@ -2343,6 +2376,7 @@ impl App {
         match &mut self.mode {
             AppMode::Viewing(v) => v.scroll_down(1),
             AppMode::HexViewing(h) => h.scroll_down(1),
+            AppMode::ParquetViewing(p) => p.move_down(1),
             _ => self.active_panel_mut().move_selection(1),
         }
     }
@@ -2351,6 +2385,7 @@ impl App {
         match &mut self.mode {
             AppMode::Viewing(v) => v.scroll_to_top(),
             AppMode::HexViewing(h) => h.scroll_to_top(),
+            AppMode::ParquetViewing(p) => p.move_to_top(),
             _ => self.active_panel_mut().move_to_top(),
         }
     }
@@ -2359,6 +2394,7 @@ impl App {
         match &mut self.mode {
             AppMode::Viewing(v) => v.scroll_to_bottom(),
             AppMode::HexViewing(h) => h.scroll_to_bottom(),
+            AppMode::ParquetViewing(p) => p.move_to_bottom(),
             _ => self.active_panel_mut().move_to_bottom(),
         }
     }
@@ -2373,6 +2409,7 @@ impl App {
                 let page = h.visible_rows.max(1);
                 h.scroll_up(page);
             }
+            AppMode::ParquetViewing(p) => p.page_up(),
             _ => self.active_panel_mut().move_selection(-20),
         }
     }
@@ -2387,11 +2424,18 @@ impl App {
                 let page = h.visible_rows.max(1);
                 h.scroll_down(page);
             }
+            AppMode::ParquetViewing(p) => p.page_down(),
             _ => self.active_panel_mut().move_selection(20),
         }
     }
 
     fn handle_enter(&mut self) {
+        // Parquet: Enter toggles expand/collapse
+        if let AppMode::ParquetViewing(ref mut p) = self.mode {
+            p.toggle_expand();
+            return;
+        }
+
         // Clear quick search if active
         self.panels[self.active_panel].quick_search = None;
         if matches!(self.mode, AppMode::QuickSearch) {
@@ -3087,6 +3131,9 @@ impl App {
                 h.scroll_offset = line;
                 h.scroll_down(0);
             }
+            AppMode::ParquetViewing(p) => {
+                p.goto_row(line);
+            }
             AppMode::Editing(e) => {
                 if !e.scan_complete {
                     e.scan_to_line(line + 100);
@@ -3398,7 +3445,7 @@ impl App {
     }
 
     fn handle_toggle_viewer(&mut self) {
-        match &self.mode {
+        match &mut self.mode {
             AppMode::Viewing(v) => {
                 let path = v.path.clone();
                 self.mode = AppMode::HexViewing(Box::new(HexViewerState::open(path)));
@@ -3407,11 +3454,26 @@ impl App {
                 let path = h.path.clone();
                 self.mode = AppMode::Viewing(Box::new(ViewerState::open(path)));
             }
+            AppMode::ParquetViewing(p) => {
+                p.switch_view();
+            }
             _ => {}
         }
     }
 
     fn open_file(&mut self, path: PathBuf) {
+        // Try parquet viewer for .parquet files
+        if path
+            .extension()
+            .map_or(false, |ext| ext.eq_ignore_ascii_case("parquet"))
+        {
+            if let Ok(pq) = ParquetViewerState::open(path.clone()) {
+                self.mode = AppMode::ParquetViewing(Box::new(pq));
+                return;
+            }
+            // Fall through to binary/text viewer on parse failure
+        }
+
         if HexViewerState::is_binary(&path) {
             self.mode = AppMode::HexViewing(Box::new(HexViewerState::open(path)));
         } else {
@@ -4427,7 +4489,10 @@ impl App {
             e.click_at(col, row);
             return;
         }
-        if matches!(self.mode, AppMode::Viewing(_) | AppMode::HexViewing(_)) {
+        if matches!(
+            self.mode,
+            AppMode::Viewing(_) | AppMode::HexViewing(_) | AppMode::ParquetViewing(_)
+        ) {
             return;
         }
         // Click inside dialogs: focus the clicked input field
@@ -4565,6 +4630,14 @@ impl App {
                     h.scroll_up((-delta) as usize);
                 } else {
                     h.scroll_down(delta as usize);
+                }
+                return;
+            }
+            AppMode::ParquetViewing(p) => {
+                if delta < 0 {
+                    p.move_up((-delta) as usize);
+                } else {
+                    p.move_down(delta as usize);
                 }
                 return;
             }
@@ -4707,7 +4780,7 @@ impl App {
 
     fn handle_dialog_cancel(&mut self) {
         match &self.mode {
-            AppMode::Viewing(_) | AppMode::HexViewing(_) => {
+            AppMode::Viewing(_) | AppMode::HexViewing(_) | AppMode::ParquetViewing(_) => {
                 self.mode = AppMode::Normal;
                 self.needs_clear = true;
             }
