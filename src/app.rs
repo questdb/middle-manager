@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 const DOUBLE_CLICK_MS: u128 = 400;
+
 const SPLIT_RESIZE_STEP: u16 = 2;
 const SPLIT_MIN_PCT: u16 = 20;
 const SPLIT_MAX_PCT: u16 = 80;
@@ -13,6 +14,7 @@ const SPLIT_DEFAULT_PCT: u16 = 60;
 use crate::action::Action;
 use crate::ci::CiPanel;
 use crate::editor::EditorState;
+use crate::file_search::SearchState;
 use crate::fs_ops;
 use crate::hex_viewer::HexViewerState;
 use crate::panel::git::GitCache;
@@ -20,6 +22,7 @@ use crate::panel::sort::SortField;
 use crate::panel::Panel;
 use crate::state::AppState;
 use crate::terminal::TerminalPanel;
+use crate::text_input::TextInput;
 use crate::watcher::DirWatcher;
 
 fn sort_field_from_u8(v: u8) -> SortField {
@@ -89,13 +92,26 @@ pub struct App {
     pub bottom_split_pct: [u16; 2],
     /// Per-side maximize toggle for bottom panels.
     pub bottom_maximized: [bool; 2],
+    /// File content search results (shown on opposite panel side).
+    pub file_search: Option<SearchState>,
+    /// Which side the search results are displayed on.
+    pub file_search_side: usize,
+    /// Whether the search results panel has focus.
+    pub file_search_focused: bool,
+    /// File content search dialog.
+    pub file_search_dialog: Option<FileSearchDialogState>,
     /// Wakeup sender for the event loop (given to terminal reader threads).
     wakeup_sender: Option<crate::event::WakeupSender>,
+    /// Previous frame's cursor position (to detect changes and avoid blink reset).
+    pub last_cursor_pos: Option<(u16, u16)>,
+    /// Whether the UI needs a redraw (set on any state change, cleared after draw).
+    pub dirty: bool,
+    /// Content area of the currently rendered dialog (set during render, used for click detection).
+    pub dialog_content_area: Option<Rect>,
 }
 
 pub struct GotoPathState {
-    pub input: String,
-    pub cursor: usize,
+    pub input: TextInput,
     /// Tab-completion candidates (directory names).
     pub completions: Vec<String>,
     /// Currently highlighted completion index.
@@ -117,8 +133,7 @@ struct FileEntry {
 }
 
 pub struct FuzzySearchState {
-    pub input: String,
-    pub cursor: usize,
+    pub input: TextInput,
     /// Pre-computed file entries.
     entries: Vec<FileEntry>,
     /// Filtered + ranked results: (index into entries, score).
@@ -151,8 +166,7 @@ impl FuzzySearchState {
             .collect();
 
         let mut state = Self {
-            input: String::new(),
-            cursor: 0,
+            input: TextInput::new(String::new()),
             entries,
             results: Vec::new(),
             selected: 0,
@@ -164,11 +178,11 @@ impl FuzzySearchState {
 
     fn update_results(&mut self) {
         self.results.clear();
-        if self.input.is_empty() {
+        if self.input.text.is_empty() {
             self.results = (0..self.entries.len().min(100)).map(|i| (i, 0)).collect();
         } else {
             // Pre-compute query chars once
-            let query_chars: Vec<char> = self.input.to_lowercase().chars().collect();
+            let query_chars: Vec<char> = self.input.text.to_lowercase().chars().collect();
             for (i, entry) in self.entries.iter().enumerate() {
                 if let Some(score) = fuzzy_score_precomputed(&query_chars, entry) {
                     self.results.push((i, score));
@@ -304,53 +318,9 @@ pub struct DialogState {
     pub kind: DialogKind,
     pub title: String,
     pub message: String,
-    pub input: String,
-    pub cursor: usize,
+    pub input: TextInput,
     pub has_input: bool,
     pub focused: DialogField,
-}
-
-impl DialogState {
-    pub fn insert_char(&mut self, c: char) {
-        let byte_pos = self.byte_offset(self.cursor);
-        self.input.insert(byte_pos, c);
-        self.cursor += 1;
-    }
-
-    pub fn delete_char_backward(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-            let byte_pos = self.byte_offset(self.cursor);
-            self.input.remove(byte_pos);
-        }
-    }
-
-    pub fn cursor_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    pub fn cursor_right(&mut self) {
-        let len = self.input.chars().count();
-        if self.cursor < len {
-            self.cursor += 1;
-        }
-    }
-
-    pub fn cursor_home(&mut self) {
-        self.cursor = 0;
-    }
-
-    pub fn cursor_end(&mut self) {
-        self.cursor = self.input.chars().count();
-    }
-
-    fn byte_offset(&self, char_pos: usize) -> usize {
-        self.input
-            .char_indices()
-            .nth(char_pos)
-            .map(|(i, _)| i)
-            .unwrap_or(self.input.len())
-    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -399,8 +369,7 @@ pub enum DialogKind {
 
 #[derive(Clone)]
 pub struct MkdirDialogState {
-    pub input: String,
-    pub cursor: usize,
+    pub input: TextInput,
     pub process_multiple: bool,
     pub focused: MkdirDialogField,
 }
@@ -408,52 +377,10 @@ pub struct MkdirDialogState {
 impl MkdirDialogState {
     pub fn new() -> Self {
         Self {
-            input: String::new(),
-            cursor: 0,
+            input: TextInput::new(String::new()),
             process_multiple: false,
             focused: MkdirDialogField::Input,
         }
-    }
-
-    pub fn insert_char(&mut self, c: char) {
-        let byte_pos = self.byte_offset(self.cursor);
-        self.input.insert(byte_pos, c);
-        self.cursor += 1;
-    }
-
-    pub fn delete_char_backward(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-            let byte_pos = self.byte_offset(self.cursor);
-            self.input.remove(byte_pos);
-        }
-    }
-
-    pub fn cursor_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    pub fn cursor_right(&mut self) {
-        let len = self.input.chars().count();
-        if self.cursor < len {
-            self.cursor += 1;
-        }
-    }
-
-    pub fn cursor_home(&mut self) {
-        self.cursor = 0;
-    }
-
-    pub fn cursor_end(&mut self) {
-        self.cursor = self.input.chars().count();
-    }
-
-    fn byte_offset(&self, char_pos: usize) -> usize {
-        self.input
-            .char_indices()
-            .nth(char_pos)
-            .map(|(i, _)| i)
-            .unwrap_or(self.input.len())
     }
 }
 
@@ -494,54 +421,10 @@ pub enum SearchDirection {
 
 #[derive(Clone)]
 pub struct SearchDialogState {
-    pub query: String,
-    pub cursor: usize,
+    pub query: TextInput,
     pub direction: SearchDirection,
     pub case_sensitive: bool,
     pub focused: SearchDialogField,
-}
-
-impl SearchDialogState {
-    pub fn insert_char(&mut self, c: char) {
-        let byte_pos = self.byte_offset(self.cursor);
-        self.query.insert(byte_pos, c);
-        self.cursor += 1;
-    }
-
-    pub fn delete_char_backward(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-            let byte_pos = self.byte_offset(self.cursor);
-            self.query.remove(byte_pos);
-        }
-    }
-
-    pub fn cursor_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    pub fn cursor_right(&mut self) {
-        let len = self.query.chars().count();
-        if self.cursor < len {
-            self.cursor += 1;
-        }
-    }
-
-    pub fn cursor_home(&mut self) {
-        self.cursor = 0;
-    }
-
-    pub fn cursor_end(&mut self) {
-        self.cursor = self.query.chars().count();
-    }
-
-    fn byte_offset(&self, char_pos: usize) -> usize {
-        self.query
-            .char_indices()
-            .nth(char_pos)
-            .map(|(i, _)| i)
-            .unwrap_or(self.query.len())
-    }
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -606,8 +489,7 @@ impl UnsavedDialogField {
 pub struct CopyDialogState {
     pub source_name: String,
     pub source_paths: Vec<PathBuf>,
-    pub destination: String,
-    pub cursor: usize,
+    pub destination: TextInput,
     pub is_move: bool,
     pub overwrite_mode: OverwriteMode,
     pub process_multiple: bool,
@@ -628,12 +510,10 @@ impl CopyDialogState {
         destination: String,
         is_move: bool,
     ) -> Self {
-        let cursor = destination.chars().count();
         Self {
             source_name,
             source_paths,
-            cursor,
-            destination,
+            destination: TextInput::new(destination),
             is_move,
             overwrite_mode: OverwriteMode::Ask,
             process_multiple: false,
@@ -646,47 +526,6 @@ impl CopyDialogState {
             use_filter: false,
             focused: CopyDialogField::Destination,
         }
-    }
-
-    pub fn insert_char(&mut self, c: char) {
-        let byte_pos = self.byte_offset(self.cursor);
-        self.destination.insert(byte_pos, c);
-        self.cursor += 1;
-    }
-
-    pub fn delete_char_backward(&mut self) {
-        if self.cursor > 0 {
-            self.cursor -= 1;
-            let byte_pos = self.byte_offset(self.cursor);
-            self.destination.remove(byte_pos);
-        }
-    }
-
-    pub fn cursor_left(&mut self) {
-        self.cursor = self.cursor.saturating_sub(1);
-    }
-
-    pub fn cursor_right(&mut self) {
-        let len = self.destination.chars().count();
-        if self.cursor < len {
-            self.cursor += 1;
-        }
-    }
-
-    pub fn cursor_home(&mut self) {
-        self.cursor = 0;
-    }
-
-    pub fn cursor_end(&mut self) {
-        self.cursor = self.destination.chars().count();
-    }
-
-    fn byte_offset(&self, char_pos: usize) -> usize {
-        self.destination
-            .char_indices()
-            .nth(char_pos)
-            .map(|(i, _)| i)
-            .unwrap_or(self.destination.len())
     }
 
     pub fn toggle_focused(&mut self) {
@@ -759,6 +598,80 @@ impl SymlinkMode {
             Self::Smart => Self::CopyContents,
             Self::CopyContents => Self::CopyAsLink,
             Self::CopyAsLink => Self::Smart,
+        }
+    }
+}
+
+// --- File search dialog ---
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum FileSearchField {
+    Path,
+    Term,
+    Filter,
+    Regex,
+    ButtonSearch,
+    ButtonCancel,
+}
+
+impl FileSearchField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Term => Self::Path,
+            Self::Path => Self::Filter,
+            Self::Filter => Self::Regex,
+            Self::Regex => Self::ButtonSearch,
+            Self::ButtonSearch => Self::ButtonCancel,
+            Self::ButtonCancel => Self::Term,
+        }
+    }
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Term => Self::ButtonCancel,
+            Self::Path => Self::Term,
+            Self::Filter => Self::Path,
+            Self::Regex => Self::Filter,
+            Self::ButtonSearch => Self::Regex,
+            Self::ButtonCancel => Self::ButtonSearch,
+        }
+    }
+    pub fn is_input(self) -> bool {
+        matches!(self, Self::Path | Self::Term | Self::Filter)
+    }
+}
+
+pub struct FileSearchDialogState {
+    pub path: crate::text_input::TextInput,
+    pub term: crate::text_input::TextInput,
+    pub filter: crate::text_input::TextInput,
+    pub is_regex: bool,
+    pub focused: FileSearchField,
+}
+
+impl FileSearchDialogState {
+    pub fn new(path: String, term: String, filter: String, is_regex: bool) -> Self {
+        Self {
+            path: crate::text_input::TextInput::new(path),
+            term: crate::text_input::TextInput::new(term),
+            filter: crate::text_input::TextInput::new(filter),
+            is_regex,
+            focused: FileSearchField::Term,
+        }
+    }
+
+    pub fn active_input(&mut self) -> Option<&mut crate::text_input::TextInput> {
+        match self.focused {
+            FileSearchField::Path => Some(&mut self.path),
+            FileSearchField::Term => Some(&mut self.term),
+            FileSearchField::Filter => Some(&mut self.filter),
+            _ => None,
+        }
+    }
+
+    /// Select all text in the newly focused input field.
+    pub fn select_focused(&mut self) {
+        if let Some(input) = self.active_input() {
+            input.select_all();
         }
     }
 }
@@ -886,7 +799,14 @@ impl App {
             claude_panel_areas: [None, None],
             bottom_split_pct: [SPLIT_DEFAULT_PCT, SPLIT_DEFAULT_PCT],
             bottom_maximized: [false, false],
+            file_search: None,
+            file_search_side: 1,
+            file_search_focused: false,
+            file_search_dialog: None,
             wakeup_sender: None,
+            last_cursor_pos: None,
+            dirty: true,
+            dialog_content_area: None,
         }
     }
 
@@ -962,6 +882,7 @@ impl App {
     }
 
     /// Save current state to disk.
+    /// Whether the cursor is in a dialog input field (uses block cursor for visibility).
     pub fn save_state(&mut self) {
         self.persisted.left_panel_path =
             Some(self.panels[0].current_dir.to_string_lossy().to_string());
@@ -1120,6 +1041,35 @@ impl App {
                 KeyCode::Esc => Action::DialogCancel,
                 KeyCode::Enter => Action::DialogConfirm,
                 KeyCode::Backspace => Action::DialogBackspace,
+                KeyCode::Char('z')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    Action::EditorRedo
+                }
+                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::EditorUndo
+                }
+                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::EditorDeleteLine
+                } // cut
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::SelectAll
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::CopySelection
+                }
+                KeyCode::Delete => Action::EditorDeleteForward,
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => Action::SelectLeft,
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Action::SelectRight
+                }
+                KeyCode::Home if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Action::SelectLineStart
+                }
+                KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Action::SelectLineEnd
+                }
                 KeyCode::Left => Action::CursorLeft,
                 KeyCode::Right => Action::CursorRight,
                 KeyCode::Home => Action::CursorLineStart,
@@ -1131,12 +1081,118 @@ impl App {
             };
         }
 
+        // File content search dialog intercepts keys
+        if let Some(ref state) = self.file_search_dialog {
+            let focused = state.focused;
+            let on_buttons = matches!(
+                focused,
+                FileSearchField::ButtonSearch | FileSearchField::ButtonCancel
+            );
+            return match key.code {
+                KeyCode::Esc => Action::DialogCancel,
+                KeyCode::Enter => Action::DialogConfirm,
+                KeyCode::Tab => Action::MoveDown,
+                KeyCode::BackTab => Action::MoveUp,
+                KeyCode::Up if !focused.is_input() || on_buttons => Action::MoveUp,
+                KeyCode::Down if on_buttons => Action::None,
+                KeyCode::Down if !focused.is_input() => Action::MoveDown,
+                KeyCode::Left if on_buttons => Action::SwitchPanel,
+                KeyCode::Right if on_buttons => Action::SwitchPanel,
+                KeyCode::Char(' ') if focused == FileSearchField::Regex => Action::Toggle,
+                // Text input with selection, undo/redo, cut support
+                KeyCode::Char('z')
+                    if focused.is_input()
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    Action::EditorRedo
+                }
+                KeyCode::Char('z')
+                    if focused.is_input() && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    Action::EditorUndo
+                }
+                KeyCode::Char('x')
+                    if focused.is_input() && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    Action::EditorDeleteLine
+                }
+                KeyCode::Char('a')
+                    if focused.is_input() && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    Action::SelectAll
+                }
+                KeyCode::Char('c')
+                    if focused.is_input() && key.modifiers.contains(KeyModifiers::CONTROL) =>
+                {
+                    Action::CopySelection
+                }
+                KeyCode::Char(c) if focused.is_input() => Action::DialogInput(c),
+                KeyCode::Backspace if focused.is_input() => Action::DialogBackspace,
+                KeyCode::Delete if focused.is_input() => Action::EditorDeleteForward,
+                KeyCode::Left
+                    if focused.is_input() && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    Action::SelectLeft
+                }
+                KeyCode::Right
+                    if focused.is_input() && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    Action::SelectRight
+                }
+                KeyCode::Home
+                    if focused.is_input() && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    Action::SelectLineStart
+                }
+                KeyCode::End
+                    if focused.is_input() && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    Action::SelectLineEnd
+                }
+                KeyCode::Left if focused.is_input() => Action::CursorLeft,
+                KeyCode::Right if focused.is_input() => Action::CursorRight,
+                KeyCode::Home if focused.is_input() => Action::CursorLineStart,
+                KeyCode::End if focused.is_input() => Action::CursorLineEnd,
+                _ => Action::None,
+            };
+        }
+
         // Fuzzy file search input intercepts keys
         if self.fuzzy_search[self.active_panel].is_some() {
             return match key.code {
                 KeyCode::Esc => Action::DialogCancel,
                 KeyCode::Enter => Action::DialogConfirm,
                 KeyCode::Backspace => Action::DialogBackspace,
+                KeyCode::Char('z')
+                    if key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    Action::EditorRedo
+                }
+                KeyCode::Char('z') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::EditorUndo
+                }
+                KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::EditorDeleteLine
+                } // cut
+                KeyCode::Char('a') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::SelectAll
+                }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::CopySelection
+                }
+                KeyCode::Delete => Action::EditorDeleteForward,
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => Action::SelectLeft,
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Action::SelectRight
+                }
+                KeyCode::Home if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Action::SelectLineStart
+                }
+                KeyCode::End if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Action::SelectLineEnd
+                }
                 KeyCode::Left => Action::CursorLeft,
                 KeyCode::Right => Action::CursorRight,
                 KeyCode::Home => Action::CursorLineStart,
@@ -1182,6 +1238,26 @@ impl App {
                 KeyCode::F(1) => Action::SwitchPanel,
                 // Everything else (including Tab) is forwarded to the terminal
                 _ => Action::TerminalInput(crate::terminal::encode_key_event(key)),
+            };
+        }
+
+        // File search results intercepts keys when focused
+        if self.file_search_focused && self.file_search.is_some() {
+            return match key.code {
+                KeyCode::Esc => Action::DialogCancel,
+                KeyCode::Enter => Action::DialogConfirm,
+                KeyCode::Up => Action::MoveUp,
+                KeyCode::Down => Action::MoveDown,
+                KeyCode::PageUp => Action::PageUp,
+                KeyCode::PageDown => Action::PageDown,
+                KeyCode::Home => Action::MoveToTop,
+                KeyCode::End => Action::MoveToBottom,
+                KeyCode::Right => Action::CursorRight, // expand
+                KeyCode::Left => Action::GoUp,         // collapse
+                KeyCode::Tab => Action::SwitchPanel,
+                KeyCode::BackTab => Action::SwitchPanelReverse,
+                KeyCode::F(10) => Action::Quit,
+                _ => Action::None,
             };
         }
 
@@ -1300,6 +1376,9 @@ impl App {
             KeyCode::Char('f') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::FuzzySearchPrompt
             }
+            KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::FileSearchPrompt
+            }
             KeyCode::Char(c) if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' => {
                 Action::QuickSearch(c)
             }
@@ -1330,8 +1409,60 @@ impl App {
             KeyCode::Down if !has_input || focused == DialogField::Input => Action::MoveDown,
             KeyCode::Left if on_buttons => Action::SwitchPanel,
             KeyCode::Right if on_buttons => Action::SwitchPanel,
+            KeyCode::Char('z')
+                if focused == DialogField::Input
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::EditorRedo
+            }
+            KeyCode::Char('z')
+                if focused == DialogField::Input
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::EditorUndo
+            }
+            KeyCode::Char('x')
+                if focused == DialogField::Input
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::EditorDeleteLine
+            }
+            KeyCode::Char('a')
+                if focused == DialogField::Input
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::SelectAll
+            }
+            KeyCode::Char('c')
+                if focused == DialogField::Input
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::CopySelection
+            }
             KeyCode::Char(c) if focused == DialogField::Input => Action::DialogInput(c),
             KeyCode::Backspace if focused == DialogField::Input => Action::DialogBackspace,
+            KeyCode::Delete if focused == DialogField::Input => Action::EditorDeleteForward,
+            KeyCode::Left
+                if focused == DialogField::Input && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SelectLeft
+            }
+            KeyCode::Right
+                if focused == DialogField::Input && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SelectRight
+            }
+            KeyCode::Home
+                if focused == DialogField::Input && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SelectLineStart
+            }
+            KeyCode::End
+                if focused == DialogField::Input && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SelectLineEnd
+            }
             KeyCode::Left if focused == DialogField::Input => Action::CursorLeft,
             KeyCode::Right if focused == DialogField::Input => Action::CursorRight,
             KeyCode::Home if focused == DialogField::Input => Action::CursorLineStart,
@@ -1356,8 +1487,64 @@ impl App {
             KeyCode::Left if on_buttons => Action::SwitchPanel, // swap between buttons
             KeyCode::Right if on_buttons => Action::SwitchPanel,
             KeyCode::Char(' ') if focused == MkdirDialogField::ProcessMultiple => Action::Toggle,
+            KeyCode::Char('z')
+                if focused == MkdirDialogField::Input
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::EditorRedo
+            }
+            KeyCode::Char('z')
+                if focused == MkdirDialogField::Input
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::EditorUndo
+            }
+            KeyCode::Char('x')
+                if focused == MkdirDialogField::Input
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::EditorDeleteLine
+            }
+            KeyCode::Char('a')
+                if focused == MkdirDialogField::Input
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::SelectAll
+            }
+            KeyCode::Char('c')
+                if focused == MkdirDialogField::Input
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::CopySelection
+            }
             KeyCode::Char(c) if focused == MkdirDialogField::Input => Action::DialogInput(c),
             KeyCode::Backspace if focused == MkdirDialogField::Input => Action::DialogBackspace,
+            KeyCode::Delete if focused == MkdirDialogField::Input => Action::EditorDeleteForward,
+            KeyCode::Left
+                if focused == MkdirDialogField::Input
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SelectLeft
+            }
+            KeyCode::Right
+                if focused == MkdirDialogField::Input
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SelectRight
+            }
+            KeyCode::Home
+                if focused == MkdirDialogField::Input
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SelectLineStart
+            }
+            KeyCode::End
+                if focused == MkdirDialogField::Input
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SelectLineEnd
+            }
             KeyCode::Left if focused == MkdirDialogField::Input => Action::CursorLeft,
             KeyCode::Right if focused == MkdirDialogField::Input => Action::CursorRight,
             KeyCode::Home if focused == MkdirDialogField::Input => Action::CursorLineStart,
@@ -1382,9 +1569,67 @@ impl App {
             KeyCode::Left if on_buttons => Action::SwitchPanel,
             KeyCode::Right if on_buttons => Action::SwitchPanel,
             KeyCode::Char(' ') if focused != CopyDialogField::Destination => Action::Toggle,
+            KeyCode::Char('z')
+                if focused == CopyDialogField::Destination
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::EditorRedo
+            }
+            KeyCode::Char('z')
+                if focused == CopyDialogField::Destination
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::EditorUndo
+            }
+            KeyCode::Char('x')
+                if focused == CopyDialogField::Destination
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::EditorDeleteLine
+            }
+            KeyCode::Char('a')
+                if focused == CopyDialogField::Destination
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::SelectAll
+            }
+            KeyCode::Char('c')
+                if focused == CopyDialogField::Destination
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::CopySelection
+            }
             KeyCode::Char(c) if focused == CopyDialogField::Destination => Action::DialogInput(c),
             KeyCode::Backspace if focused == CopyDialogField::Destination => {
                 Action::DialogBackspace
+            }
+            KeyCode::Delete if focused == CopyDialogField::Destination => {
+                Action::EditorDeleteForward
+            }
+            KeyCode::Left
+                if focused == CopyDialogField::Destination
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SelectLeft
+            }
+            KeyCode::Right
+                if focused == CopyDialogField::Destination
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SelectRight
+            }
+            KeyCode::Home
+                if focused == CopyDialogField::Destination
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SelectLineStart
+            }
+            KeyCode::End
+                if focused == CopyDialogField::Destination
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SelectLineEnd
             }
             KeyCode::Left if focused == CopyDialogField::Destination => Action::CursorLeft,
             KeyCode::Right if focused == CopyDialogField::Destination => Action::CursorRight,
@@ -1417,8 +1662,64 @@ impl App {
             {
                 Action::Toggle
             }
+            KeyCode::Char('z')
+                if focused == SearchDialogField::Query
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::EditorRedo
+            }
+            KeyCode::Char('z')
+                if focused == SearchDialogField::Query
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::EditorUndo
+            }
+            KeyCode::Char('x')
+                if focused == SearchDialogField::Query
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::EditorDeleteLine
+            }
+            KeyCode::Char('a')
+                if focused == SearchDialogField::Query
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::SelectAll
+            }
+            KeyCode::Char('c')
+                if focused == SearchDialogField::Query
+                    && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::CopySelection
+            }
             KeyCode::Char(c) if focused == SearchDialogField::Query => Action::DialogInput(c),
             KeyCode::Backspace if focused == SearchDialogField::Query => Action::DialogBackspace,
+            KeyCode::Delete if focused == SearchDialogField::Query => Action::EditorDeleteForward,
+            KeyCode::Left
+                if focused == SearchDialogField::Query
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SelectLeft
+            }
+            KeyCode::Right
+                if focused == SearchDialogField::Query
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SelectRight
+            }
+            KeyCode::Home
+                if focused == SearchDialogField::Query
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SelectLineStart
+            }
+            KeyCode::End
+                if focused == SearchDialogField::Query
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::SelectLineEnd
+            }
             KeyCode::Left if focused == SearchDialogField::Query => Action::CursorLeft,
             KeyCode::Right if focused == SearchDialogField::Query => Action::CursorRight,
             KeyCode::Home if focused == SearchDialogField::Query => Action::CursorLineStart,
@@ -1504,6 +1805,11 @@ impl App {
     // --- Action dispatch ---
 
     pub fn handle_action(&mut self, action: Action) {
+        // Mark dirty for any action that changes state (not idle ticks)
+        if !matches!(action, Action::Tick | Action::None) {
+            self.dirty = true;
+        }
+
         // Help dialog intercepts when active
         if self.help_scroll.is_some() {
             match action {
@@ -1544,12 +1850,6 @@ impl App {
         // Go-to-path input intercepts all input when active
         if self.goto_path[self.active_panel].is_some() {
             self.handle_goto_path_action(action);
-            return;
-        }
-
-        // Fuzzy file search intercepts all input when active
-        if self.fuzzy_search[self.active_panel].is_some() {
-            self.handle_fuzzy_search_action(action);
             return;
         }
 
@@ -1682,9 +1982,44 @@ impl App {
             return;
         }
 
+        // File content search dialog intercepts
+        if self.file_search_dialog.is_some() {
+            self.handle_file_search_dialog(action);
+            return;
+        }
+
+        // File search results intercepts when focused
+        if self.file_search_focused && self.file_search.is_some() {
+            self.handle_file_search_results(action);
+            return;
+        }
+
+        // Fuzzy file search intercepts all input when active
+        if self.fuzzy_search[self.active_panel].is_some() {
+            self.handle_fuzzy_search_action(action);
+            return;
+        }
+
         match action {
             Action::None => {}
             Action::Tick => {
+                // Mark dirty if any async data sources are active
+                let has_active_async = self.ci_panels.iter().any(|c| c.is_some())
+                    || self
+                        .file_search
+                        .as_ref()
+                        .map(|s| s.searching)
+                        .unwrap_or(false)
+                    || self.git_cache.has_pending();
+                if has_active_async {
+                    self.dirty = true;
+                }
+                if let Some(ref w) = self.dir_watcher {
+                    if w.has_changes() {
+                        self.dirty = true;
+                    }
+                }
+
                 // Poll all CI panels for async results and downloads
                 for ci in self.ci_panels.iter_mut().flatten() {
                     ci.poll();
@@ -1727,10 +2062,15 @@ impl App {
                         }
                     }
                 }
+                // Poll file search results
+                if let Some(ref mut state) = self.file_search {
+                    state.poll();
+                }
                 // Poll for async PR query results
                 if self.git_cache.poll_pending() {
                     self.panels[0].refresh_git(&mut self.git_cache);
                     self.panels[1].refresh_git(&mut self.git_cache);
+                    self.dirty = true;
                 }
                 // Check for filesystem changes (kqueue/inotify — zero cost if idle)
                 if let Some(ref w) = self.dir_watcher {
@@ -1828,10 +2168,10 @@ impl App {
                     .current_dir
                     .to_string_lossy()
                     .to_string();
-                let cursor = path.len();
+                let mut input = TextInput::new(path);
+                input.select_all();
                 self.goto_path[self.active_panel] = Some(GotoPathState {
-                    input: path,
-                    cursor,
+                    input,
                     completions: Vec::new(),
                     comp_index: None,
                     comp_base: None,
@@ -1841,6 +2181,23 @@ impl App {
             // Help
             Action::ShowHelp => {
                 self.help_scroll = Some(0);
+            }
+
+            // File content search dialog
+            Action::FileSearchPrompt => {
+                let path = self
+                    .active_panel()
+                    .current_dir
+                    .to_string_lossy()
+                    .to_string();
+                let mut dlg = FileSearchDialogState::new(
+                    path,
+                    self.persisted.file_search_term.clone(),
+                    self.persisted.file_search_filter.clone(),
+                    self.persisted.file_search_regex,
+                );
+                dlg.select_focused();
+                self.file_search_dialog = Some(dlg);
             }
 
             // Fuzzy file search
@@ -2076,12 +2433,16 @@ impl App {
             Ci(usize),
             Shell(usize),
             Claude(usize),
+            Search(usize),
         }
 
         let mut order: Vec<Target> = Vec::with_capacity(10);
+        let has_search = self.file_search.is_some();
 
-        // Left side
-        order.push(Target::Panel(0));
+        // Left side: skip file panel if search replaces it
+        if !(has_search && self.file_search_side == 0) {
+            order.push(Target::Panel(0));
+        }
         if self.ci_panels[0].is_some() {
             order.push(Target::Ci(0));
         }
@@ -2091,9 +2452,14 @@ impl App {
         if self.claude_panels[0].is_some() {
             order.push(Target::Claude(0));
         }
+        if has_search && self.file_search_side == 0 {
+            order.push(Target::Search(0));
+        }
 
-        // Right side
-        order.push(Target::Panel(1));
+        // Right side: skip file panel if search replaces it
+        if !(has_search && self.file_search_side == 1) {
+            order.push(Target::Panel(1));
+        }
         if self.ci_panels[1].is_some() {
             order.push(Target::Ci(1));
         }
@@ -2102,6 +2468,9 @@ impl App {
         }
         if self.claude_panels[1].is_some() {
             order.push(Target::Claude(1));
+        }
+        if has_search && self.file_search_side == 1 {
+            order.push(Target::Search(1));
         }
 
         if order.is_empty() {
@@ -2116,10 +2485,15 @@ impl App {
             self.ci_focused = None;
             self.shell_focused = None;
             self.claude_focused = None;
+            self.file_search_focused = false;
             return;
         }
 
-        let current = if let Some(side) = self.claude_focused {
+        let current = if self.file_search_focused {
+            order
+                .iter()
+                .position(|t| *t == Target::Search(self.file_search_side))
+        } else if let Some(side) = self.claude_focused {
             order.iter().position(|t| *t == Target::Claude(side))
         } else if let Some(side) = self.shell_focused {
             order.iter().position(|t| *t == Target::Shell(side))
@@ -2148,21 +2522,31 @@ impl App {
                 self.ci_focused = None;
                 self.shell_focused = None;
                 self.claude_focused = None;
+                self.file_search_focused = false;
             }
             Target::Ci(side) => {
                 self.ci_focused = Some(*side);
                 self.shell_focused = None;
                 self.claude_focused = None;
+                self.file_search_focused = false;
             }
             Target::Shell(side) => {
                 self.shell_focused = Some(*side);
                 self.ci_focused = None;
                 self.claude_focused = None;
+                self.file_search_focused = false;
             }
             Target::Claude(side) => {
                 self.claude_focused = Some(*side);
                 self.ci_focused = None;
                 self.shell_focused = None;
+                self.file_search_focused = false;
+            }
+            Target::Search(_) => {
+                self.file_search_focused = true;
+                self.ci_focused = None;
+                self.shell_focused = None;
+                self.claude_focused = None;
             }
         }
     }
@@ -2208,32 +2592,7 @@ impl App {
                     }
                 }
                 if let Some(state) = self.goto_path[side].take() {
-                    self.goto_path_navigate(side, &state.input);
-                }
-            }
-            Action::DialogInput(c) => {
-                if let Some(ref mut state) = self.goto_path[side] {
-                    state.input.insert(state.cursor, c);
-                    state.cursor += c.len_utf8();
-                    state.completions.clear();
-                    state.comp_index = None;
-                    state.comp_base = None;
-                }
-            }
-            Action::DialogBackspace => {
-                if let Some(ref mut state) = self.goto_path[side] {
-                    if state.cursor > 0 {
-                        let prev = state.input[..state.cursor]
-                            .char_indices()
-                            .last()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        state.input.remove(prev);
-                        state.cursor = prev;
-                        state.completions.clear();
-                        state.comp_index = None;
-                        state.comp_base = None;
-                    }
+                    self.goto_path_navigate(side, &state.input.text);
                 }
             }
             Action::MoveDown => {
@@ -2273,51 +2632,15 @@ impl App {
                     }
                 }
             }
-            Action::CursorLeft => {
+            _ => {
                 if let Some(ref mut state) = self.goto_path[side] {
-                    if state.cursor > 0 {
-                        state.cursor = state.input[..state.cursor]
-                            .char_indices()
-                            .last()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
+                    if state.input.handle_action(&action) {
+                        state.completions.clear();
+                        state.comp_index = None;
+                        state.comp_base = None;
                     }
-                    state.completions.clear();
-                    state.comp_index = None;
-                    state.comp_base = None;
                 }
             }
-            Action::CursorRight => {
-                if let Some(ref mut state) = self.goto_path[side] {
-                    if state.cursor < state.input.len() {
-                        state.cursor += state.input[state.cursor..]
-                            .chars()
-                            .next()
-                            .map(|c| c.len_utf8())
-                            .unwrap_or(0);
-                    }
-                    state.completions.clear();
-                    state.comp_index = None;
-                    state.comp_base = None;
-                }
-            }
-            Action::CursorLineStart => {
-                if let Some(ref mut state) = self.goto_path[side] {
-                    state.cursor = 0;
-                    state.completions.clear();
-                    state.comp_index = None;
-                    state.comp_base = None;
-                }
-            }
-            Action::CursorLineEnd => {
-                if let Some(ref mut state) = self.goto_path[side] {
-                    state.cursor = state.input.len();
-                    state.completions.clear();
-                    state.comp_index = None;
-                    state.comp_base = None;
-                }
-            }
-            _ => {}
         }
     }
 
@@ -2349,10 +2672,10 @@ impl App {
     }
 
     fn populate_completions(state: &mut GotoPathState) {
-        let (dir, prefix) = Self::expand_goto_input(&state.input);
+        let (dir, prefix) = Self::expand_goto_input(&state.input.text);
         let prefix_lower = prefix.to_lowercase();
 
-        state.comp_base = Some(state.input.clone());
+        state.comp_base = Some(state.input.text.clone());
         state.comp_index = None;
         state.completions.clear();
 
@@ -2385,7 +2708,7 @@ impl App {
             return false;
         }
 
-        let (_, prefix) = Self::expand_goto_input(&state.input);
+        let (_, prefix) = Self::expand_goto_input(&state.input.text);
 
         // Find longest common prefix among completions
         let first = &state.completions[0];
@@ -2406,8 +2729,8 @@ impl App {
         if common_chars > prefix_chars {
             // Append the characters beyond what was already typed
             let suffix: String = common.chars().skip(prefix_chars).collect();
-            state.input.insert_str(state.cursor, &suffix);
-            state.cursor += suffix.len();
+            state.input.text.insert_str(state.input.cursor, &suffix);
+            state.input.cursor += suffix.len();
             true
         } else {
             false
@@ -2415,7 +2738,7 @@ impl App {
     }
 
     fn apply_completion(state: &mut GotoPathState, name: &str) {
-        let (_, prefix) = Self::expand_goto_input(&state.input);
+        let (_, prefix) = Self::expand_goto_input(&state.input.text);
 
         // Append the characters beyond the typed prefix + trailing /
         let prefix_chars = prefix.chars().count();
@@ -2424,8 +2747,8 @@ impl App {
             .skip(prefix_chars)
             .chain(std::iter::once('/'))
             .collect();
-        state.input.insert_str(state.cursor, &suffix);
-        state.cursor += suffix.len();
+        state.input.text.insert_str(state.input.cursor, &suffix);
+        state.input.cursor += suffix.len();
         state.completions.clear();
         state.comp_index = None;
         state.comp_base = None;
@@ -2479,27 +2802,6 @@ impl App {
                 }
                 self.fuzzy_search[side] = None;
             }
-            Action::DialogInput(c) => {
-                if let Some(ref mut state) = self.fuzzy_search[side] {
-                    state.input.insert(state.cursor, c);
-                    state.cursor += c.len_utf8();
-                    state.update_results();
-                }
-            }
-            Action::DialogBackspace => {
-                if let Some(ref mut state) = self.fuzzy_search[side] {
-                    if state.cursor > 0 {
-                        let prev = state.input[..state.cursor]
-                            .char_indices()
-                            .last()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
-                        state.input.remove(prev);
-                        state.cursor = prev;
-                        state.update_results();
-                    }
-                }
-            }
             Action::MoveDown => {
                 if let Some(ref mut state) = self.fuzzy_search[side] {
                     let len = state.results.len().min(8);
@@ -2516,36 +2818,245 @@ impl App {
                     }
                 }
             }
-            Action::CursorLeft => {
+            _ => {
                 if let Some(ref mut state) = self.fuzzy_search[side] {
-                    if state.cursor > 0 {
-                        state.cursor = state.input[..state.cursor]
-                            .char_indices()
-                            .last()
-                            .map(|(i, _)| i)
-                            .unwrap_or(0);
+                    let old_text = state.input.text.clone();
+                    state.input.handle_action(&action);
+                    if state.input.text != old_text {
+                        state.update_results();
                     }
+                }
+            }
+        }
+    }
+
+    fn handle_file_search_dialog(&mut self, action: Action) {
+        match action {
+            Action::DialogCancel => {
+                self.file_search_dialog = None;
+            }
+            Action::DialogConfirm => {
+                if let Some(state) = self.file_search_dialog.take() {
+                    if state.focused == FileSearchField::ButtonCancel {
+                        return;
+                    }
+                    if !state.term.text.is_empty() {
+                        // Persist search params
+                        self.persisted.file_search_term = state.term.text.clone();
+                        self.persisted.file_search_filter = state.filter.text.clone();
+                        self.persisted.file_search_regex = state.is_regex;
+
+                        let dir = PathBuf::from(&state.path.text);
+                        let search_side = 1 - self.active_panel;
+                        let mut search = SearchState::new(
+                            dir,
+                            state.term.text.clone(),
+                            state.filter.text.clone(),
+                            state.is_regex,
+                        );
+                        search.poll(); // get initial results
+                        self.file_search = Some(search);
+                        self.file_search_side = search_side;
+                        self.file_search_focused = true;
+                        self.ci_focused = None;
+                        self.shell_focused = None;
+                        self.claude_focused = None;
+                    }
+                }
+            }
+            Action::MoveDown => {
+                if let Some(ref mut state) = self.file_search_dialog {
+                    state.term.clear_selection();
+                    state.path.clear_selection();
+                    state.filter.clear_selection();
+                    state.focused = state.focused.next();
+                    state.select_focused();
+                }
+            }
+            Action::MoveUp => {
+                if let Some(ref mut state) = self.file_search_dialog {
+                    state.term.clear_selection();
+                    state.path.clear_selection();
+                    state.filter.clear_selection();
+                    state.focused = state.focused.prev();
+                    state.select_focused();
+                }
+            }
+            Action::SwitchPanel | Action::SwitchPanelReverse => {
+                if let Some(ref mut state) = self.file_search_dialog {
+                    state.term.clear_selection();
+                    state.path.clear_selection();
+                    state.filter.clear_selection();
+                    state.focused = match state.focused {
+                        FileSearchField::ButtonSearch => FileSearchField::ButtonCancel,
+                        FileSearchField::ButtonCancel => FileSearchField::ButtonSearch,
+                        other => other,
+                    };
+                    state.select_focused();
+                }
+            }
+            Action::Toggle => {
+                if let Some(ref mut state) = self.file_search_dialog {
+                    if state.focused == FileSearchField::Regex {
+                        state.is_regex = !state.is_regex;
+                    }
+                }
+            }
+            Action::MouseClick(col, row) => self.handle_dialog_click_at(col, row),
+            _ => {
+                if let Some(ref mut state) = self.file_search_dialog {
+                    if let Some(input) = state.active_input() {
+                        input.handle_action(&action);
+                    }
+                }
+            }
+        }
+    }
+
+    fn handle_file_search_results(&mut self, action: Action) {
+        match action {
+            Action::DialogCancel => {
+                self.file_search = None;
+                self.file_search_focused = false;
+            }
+            Action::DialogConfirm => {
+                // Open selected match in editor and highlight search term
+                if let Some(ref state) = self.file_search {
+                    let query = state.query.clone();
+                    if let Some((path, line)) = state.selected_location() {
+                        let mut editor = EditorState::open(path);
+                        let target_line = (line as usize).saturating_sub(1);
+                        if !editor.scan_complete {
+                            editor.scan_to_line(target_line + 100);
+                        }
+                        editor.cursor_line = target_line;
+                        editor.cursor_col = 0;
+                        editor.desired_col = 0;
+                        // Set scroll_y directly since visible_lines is 0 pre-render
+                        editor.scroll_y = target_line;
+                        // Find and highlight the search term on this line
+                        let params = crate::editor::SearchParams {
+                            query,
+                            direction: SearchDirection::Forward,
+                            case_sensitive: false,
+                        };
+                        editor.find(&params);
+                        // Restore scroll position (find may have changed it)
+                        editor.scroll_y = target_line;
+                        editor.last_search = Some(params);
+                        self.file_search_focused = false;
+                        self.mode = AppMode::Editing(Box::new(editor));
+                    }
+                }
+            }
+            Action::MoveUp => {
+                if let Some(ref mut state) = self.file_search {
+                    state.move_up();
+                }
+            }
+            Action::MoveDown => {
+                if let Some(ref mut state) = self.file_search {
+                    state.move_down();
+                }
+            }
+            Action::PageUp => {
+                if let Some(ref mut state) = self.file_search {
+                    state.page_up(20);
+                }
+            }
+            Action::PageDown => {
+                if let Some(ref mut state) = self.file_search {
+                    state.page_down(20);
+                }
+            }
+            Action::MoveToTop => {
+                if let Some(ref mut state) = self.file_search {
+                    state.selected = 0;
+                }
+            }
+            Action::MoveToBottom => {
+                if let Some(ref mut state) = self.file_search {
+                    let count = state.visible_count();
+                    state.selected = count.saturating_sub(1);
                 }
             }
             Action::CursorRight => {
-                if let Some(ref mut state) = self.fuzzy_search[side] {
-                    if state.cursor < state.input.len() {
-                        state.cursor += state.input[state.cursor..]
-                            .chars()
-                            .next()
-                            .map(|c| c.len_utf8())
-                            .unwrap_or(0);
+                // Expand file
+                if let Some(ref mut state) = self.file_search {
+                    let items = state.visible_items();
+                    if let Some(crate::file_search::SearchItem::File(fi)) =
+                        items.get(state.selected)
+                    {
+                        state.files[*fi].expanded = true;
                     }
                 }
             }
-            Action::CursorLineStart => {
-                if let Some(ref mut state) = self.fuzzy_search[side] {
-                    state.cursor = 0;
+            Action::GoUp => {
+                // Left on child: jump to parent. Left on parent: collapse.
+                if let Some(ref mut state) = self.file_search {
+                    let items = state.visible_items();
+                    match items.get(state.selected) {
+                        Some(crate::file_search::SearchItem::Match(fi, _)) => {
+                            // Jump to the parent file entry
+                            if let Some(pos) = items.iter().position(|item| {
+                                matches!(item, crate::file_search::SearchItem::File(f) if *f == *fi)
+                            }) {
+                                state.selected = pos;
+                            }
+                        }
+                        Some(crate::file_search::SearchItem::File(fi)) => {
+                            // Collapse this file
+                            state.files[*fi].expanded = false;
+                        }
+                        None => {}
+                    }
                 }
             }
-            Action::CursorLineEnd => {
-                if let Some(ref mut state) = self.fuzzy_search[side] {
-                    state.cursor = state.input.len();
+            Action::SwitchPanel => self.handle_switch_panel(),
+            Action::SwitchPanelReverse => self.handle_switch_panel_reverse(),
+            Action::Tick | Action::Resize(_, _) => {
+                if let Some(ref mut state) = self.file_search {
+                    state.poll();
+                    if state.searching {
+                        self.dirty = true;
+                    }
+                }
+            }
+            Action::MouseClick(col, row) => {
+                // Check if click is inside the search results panel
+                let search_area = self.panel_areas[self.file_search_side];
+                if col >= search_area.x
+                    && col < search_area.x + search_area.width
+                    && row >= search_area.y
+                    && row < search_area.y + search_area.height
+                {
+                    // Click inside search panel — stay focused
+                    // Map click to a result row
+                    if let Some(ref mut state) = self.file_search {
+                        let inner_y = search_area.y + 1; // account for border
+                        if row >= inner_y {
+                            let click_offset = (row - inner_y) as usize;
+                            let target = state.scroll + click_offset;
+                            let count = state.visible_count();
+                            if target < count {
+                                state.selected = target;
+                            }
+                        }
+                    }
+                } else {
+                    // Click outside — unfocus search, pass to normal handler
+                    self.file_search_focused = false;
+                    self.handle_mouse_click(col, row);
+                }
+            }
+            Action::MouseScrollUp(_, _) => {
+                if let Some(ref mut state) = self.file_search {
+                    state.page_up(3);
+                }
+            }
+            Action::MouseScrollDown(_, _) => {
+                if let Some(ref mut state) = self.file_search {
+                    state.page_down(3);
                 }
             }
             _ => {}
@@ -2818,37 +3329,32 @@ impl App {
 
             // Search
             Action::SearchPrompt => {
-                let (query, cursor, direction, case_sensitive) =
-                    if let AppMode::Editing(ref e) = self.mode {
-                        if let Some(ref p) = e.last_search {
-                            (
-                                p.query.clone(),
-                                p.query.chars().count(),
-                                p.direction,
-                                p.case_sensitive,
-                            )
-                        } else if !self.persisted.search_query.is_empty() {
-                            // Restore from persisted state
-                            let dir = if self.persisted.search_direction_forward {
-                                SearchDirection::Forward
-                            } else {
-                                SearchDirection::Backward
-                            };
-                            (
-                                self.persisted.search_query.clone(),
-                                self.persisted.search_query.chars().count(),
-                                dir,
-                                self.persisted.search_case_sensitive,
-                            )
+                let (query, direction, case_sensitive) = if let AppMode::Editing(ref e) = self.mode
+                {
+                    if let Some(ref p) = e.last_search {
+                        (p.query.clone(), p.direction, p.case_sensitive)
+                    } else if !self.persisted.search_query.is_empty() {
+                        // Restore from persisted state
+                        let dir = if self.persisted.search_direction_forward {
+                            SearchDirection::Forward
                         } else {
-                            (String::new(), 0, SearchDirection::Forward, false)
-                        }
+                            SearchDirection::Backward
+                        };
+                        (
+                            self.persisted.search_query.clone(),
+                            dir,
+                            self.persisted.search_case_sensitive,
+                        )
                     } else {
-                        (String::new(), 0, SearchDirection::Forward, false)
-                    };
+                        (String::new(), SearchDirection::Forward, false)
+                    }
+                } else {
+                    (String::new(), SearchDirection::Forward, false)
+                };
+                let mut q = TextInput::new(query);
+                q.select_all();
                 self.search_dialog = Some(SearchDialogState {
-                    query,
-                    cursor,
+                    query: q,
                     direction,
                     case_sensitive,
                     focused: SearchDialogField::Query,
@@ -2936,7 +3442,9 @@ impl App {
         } else {
             format!("{} items", paths.len())
         };
-        self.mode = AppMode::CopyDialog(CopyDialogState::new(display_name, paths, dest, false));
+        let mut dlg = CopyDialogState::new(display_name, paths, dest, false);
+        dlg.destination.select_all();
+        self.mode = AppMode::CopyDialog(dlg);
     }
 
     fn handle_move(&mut self) {
@@ -2960,7 +3468,9 @@ impl App {
         } else {
             format!("{} items", paths.len())
         };
-        self.mode = AppMode::CopyDialog(CopyDialogState::new(display_name, paths, dest, true));
+        let mut dlg = CopyDialogState::new(display_name, paths, dest, true);
+        dlg.destination.select_all();
+        self.mode = AppMode::CopyDialog(dlg);
     }
 
     fn handle_rename(&mut self) {
@@ -2969,13 +3479,14 @@ impl App {
                 return;
             }
             let name = entry.name.clone();
-            let cursor = name.chars().count();
+            let message = format!("Rename '{}':", name);
+            let mut input = TextInput::new(name);
+            input.select_all();
             self.mode = AppMode::Dialog(DialogState {
                 kind: DialogKind::InputRename,
                 title: "Rename".to_string(),
-                message: format!("Rename '{}':", name),
-                input: name,
-                cursor,
+                message,
+                input,
                 has_input: true,
                 focused: DialogField::Input,
             });
@@ -3009,8 +3520,7 @@ impl App {
             kind: DialogKind::ConfirmDelete,
             title: "Delete".to_string(),
             message,
-            input: String::new(),
-            cursor: 0,
+            input: TextInput::new(String::new()),
             has_input: false,
             focused: DialogField::ButtonOk,
         });
@@ -3055,12 +3565,20 @@ impl App {
             }
             Action::MoveUp => {
                 if let Some(ref mut s) = self.search_dialog {
+                    s.query.clear_selection();
                     s.focused = s.focused.prev();
+                    if s.focused == SearchDialogField::Query {
+                        s.query.select_all();
+                    }
                 }
             }
             Action::MoveDown => {
                 if let Some(ref mut s) = self.search_dialog {
+                    s.query.clear_selection();
                     s.focused = s.focused.next();
+                    if s.focused == SearchDialogField::Query {
+                        s.query.select_all();
+                    }
                 }
             }
             Action::Toggle => {
@@ -3079,38 +3597,9 @@ impl App {
                     }
                 }
             }
-            Action::DialogInput(c) => {
-                if let Some(ref mut s) = self.search_dialog {
-                    s.insert_char(c);
-                }
-            }
-            Action::DialogBackspace => {
-                if let Some(ref mut s) = self.search_dialog {
-                    s.delete_char_backward();
-                }
-            }
-            Action::CursorLeft => {
-                if let Some(ref mut s) = self.search_dialog {
-                    s.cursor_left();
-                }
-            }
-            Action::CursorRight => {
-                if let Some(ref mut s) = self.search_dialog {
-                    s.cursor_right();
-                }
-            }
-            Action::CursorLineStart => {
-                if let Some(ref mut s) = self.search_dialog {
-                    s.cursor_home();
-                }
-            }
-            Action::CursorLineEnd => {
-                if let Some(ref mut s) = self.search_dialog {
-                    s.cursor_end();
-                }
-            }
             Action::SwitchPanel | Action::SwitchPanelReverse => {
                 if let Some(ref mut s) = self.search_dialog {
+                    s.query.clear_selection();
                     s.focused = match s.focused {
                         SearchDialogField::ButtonFind => SearchDialogField::ButtonCancel,
                         SearchDialogField::ButtonCancel => SearchDialogField::ButtonFind,
@@ -3118,7 +3607,12 @@ impl App {
                     };
                 }
             }
-            _ => {}
+            Action::MouseClick(col, row) => self.handle_dialog_click_at(col, row),
+            _ => {
+                if let Some(ref mut s) = self.search_dialog {
+                    s.query.handle_action(&action);
+                }
+            }
         }
     }
 
@@ -3128,13 +3622,13 @@ impl App {
             None => return,
         };
 
-        if state.query.is_empty() {
+        if state.query.text.is_empty() {
             return;
         }
 
         use crate::editor::SearchParams;
         let params = SearchParams {
-            query: state.query,
+            query: state.query.text,
             direction: state.direction,
             case_sensitive: state.case_sensitive,
         };
@@ -3646,12 +4140,20 @@ impl App {
             }
             Action::MoveUp => {
                 if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.input.clear_selection();
                     state.focused = state.focused.prev();
+                    if state.focused == MkdirDialogField::Input {
+                        state.input.select_all();
+                    }
                 }
             }
             Action::MoveDown => {
                 if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.input.clear_selection();
                     state.focused = state.focused.next();
+                    if state.focused == MkdirDialogField::Input {
+                        state.input.select_all();
+                    }
                 }
             }
             Action::Toggle => {
@@ -3659,43 +4161,10 @@ impl App {
                     state.process_multiple = !state.process_multiple;
                 }
             }
-            Action::DialogInput(c) => {
-                if let AppMode::MkdirDialog(ref mut state) = self.mode {
-                    if state.focused == MkdirDialogField::Input {
-                        state.insert_char(c);
-                    }
-                }
-            }
-            Action::DialogBackspace => {
-                if let AppMode::MkdirDialog(ref mut state) = self.mode {
-                    if state.focused == MkdirDialogField::Input {
-                        state.delete_char_backward();
-                    }
-                }
-            }
-            Action::CursorLeft => {
-                if let AppMode::MkdirDialog(ref mut state) = self.mode {
-                    state.cursor_left();
-                }
-            }
-            Action::CursorRight => {
-                if let AppMode::MkdirDialog(ref mut state) = self.mode {
-                    state.cursor_right();
-                }
-            }
-            Action::CursorLineStart => {
-                if let AppMode::MkdirDialog(ref mut state) = self.mode {
-                    state.cursor_home();
-                }
-            }
-            Action::CursorLineEnd => {
-                if let AppMode::MkdirDialog(ref mut state) = self.mode {
-                    state.cursor_end();
-                }
-            }
             Action::SwitchPanel | Action::SwitchPanelReverse => {
                 // Swap between OK and Cancel buttons
                 if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.input.clear_selection();
                     state.focused = match state.focused {
                         MkdirDialogField::ButtonOk => MkdirDialogField::ButtonCancel,
                         MkdirDialogField::ButtonCancel => MkdirDialogField::ButtonOk,
@@ -3703,13 +4172,18 @@ impl App {
                     };
                 }
             }
-            _ => {}
+            Action::MouseClick(col, row) => self.handle_dialog_click_at(col, row),
+            _ => {
+                if let AppMode::MkdirDialog(ref mut state) = self.mode {
+                    state.input.handle_action(&action);
+                }
+            }
         }
     }
 
     fn confirm_mkdir_dialog(&mut self) {
         let (input, process_multiple) = match &self.mode {
-            AppMode::MkdirDialog(s) => (s.input.clone(), s.process_multiple),
+            AppMode::MkdirDialog(s) => (s.input.text.clone(), s.process_multiple),
             _ => return,
         };
 
@@ -3771,12 +4245,20 @@ impl App {
             }
             Action::MoveUp => {
                 if let AppMode::CopyDialog(ref mut state) = self.mode {
+                    state.destination.clear_selection();
                     state.focused = state.focused.prev();
+                    if state.focused == CopyDialogField::Destination {
+                        state.destination.select_all();
+                    }
                 }
             }
             Action::MoveDown => {
                 if let AppMode::CopyDialog(ref mut state) = self.mode {
+                    state.destination.clear_selection();
                     state.focused = state.focused.next();
+                    if state.focused == CopyDialogField::Destination {
+                        state.destination.select_all();
+                    }
                 }
             }
             Action::Toggle => {
@@ -3784,42 +4266,9 @@ impl App {
                     state.toggle_focused();
                 }
             }
-            Action::DialogInput(c) => {
-                if let AppMode::CopyDialog(ref mut state) = self.mode {
-                    if state.focused == CopyDialogField::Destination {
-                        state.insert_char(c);
-                    }
-                }
-            }
-            Action::DialogBackspace => {
-                if let AppMode::CopyDialog(ref mut state) = self.mode {
-                    if state.focused == CopyDialogField::Destination {
-                        state.delete_char_backward();
-                    }
-                }
-            }
-            Action::CursorLeft => {
-                if let AppMode::CopyDialog(ref mut state) = self.mode {
-                    state.cursor_left();
-                }
-            }
-            Action::CursorRight => {
-                if let AppMode::CopyDialog(ref mut state) = self.mode {
-                    state.cursor_right();
-                }
-            }
-            Action::CursorLineStart => {
-                if let AppMode::CopyDialog(ref mut state) = self.mode {
-                    state.cursor_home();
-                }
-            }
-            Action::CursorLineEnd => {
-                if let AppMode::CopyDialog(ref mut state) = self.mode {
-                    state.cursor_end();
-                }
-            }
             Action::SwitchPanel | Action::SwitchPanelReverse => {
                 if let AppMode::CopyDialog(ref mut state) = self.mode {
+                    state.destination.clear_selection();
                     state.focused = match state.focused {
                         CopyDialogField::ButtonCopy => CopyDialogField::ButtonCancel,
                         CopyDialogField::ButtonCancel => CopyDialogField::ButtonCopy,
@@ -3827,7 +4276,12 @@ impl App {
                     };
                 }
             }
-            _ => {}
+            Action::MouseClick(col, row) => self.handle_dialog_click_at(col, row),
+            _ => {
+                if let AppMode::CopyDialog(ref mut state) = self.mode {
+                    state.destination.handle_action(&action);
+                }
+            }
         }
     }
 
@@ -3843,7 +4297,7 @@ impl App {
             }
             (
                 state.source_paths.clone(),
-                PathBuf::from(&state.destination),
+                PathBuf::from(&state.destination.text),
                 state.is_move,
             )
         };
@@ -3899,6 +4353,75 @@ impl App {
         }
     }
 
+    fn handle_dialog_click_at(&mut self, col: u16, row: u16) {
+        if let Some(content) = self.dialog_content_area {
+            if col >= content.x
+                && col < content.x + content.width
+                && row >= content.y
+                && row < content.y + content.height
+            {
+                let y_off = (row - content.y) as usize;
+                self.handle_dialog_click(y_off);
+                self.dirty = true;
+            }
+        }
+    }
+
+    fn handle_dialog_click(&mut self, y_off: usize) {
+        // File search dialog: term=2, path=5, filter=8, regex=10
+        if let Some(ref mut state) = self.file_search_dialog {
+            state.term.clear_selection();
+            state.path.clear_selection();
+            state.filter.clear_selection();
+            state.focused = match y_off {
+                0..=2 => FileSearchField::Term,
+                3..=5 => FileSearchField::Path,
+                6..=8 => FileSearchField::Filter,
+                9..=10 => FileSearchField::Regex,
+                _ => FileSearchField::ButtonSearch,
+            };
+            state.select_focused();
+            return;
+        }
+        // Search dialog: query at y=2
+        if let Some(ref mut s) = self.search_dialog {
+            s.query.clear_selection();
+            s.focused = if y_off <= 2 {
+                SearchDialogField::Query
+            } else {
+                s.focused // keep current
+            };
+            if s.focused == SearchDialogField::Query {
+                s.query.select_all();
+            }
+            return;
+        }
+        match &mut self.mode {
+            AppMode::Dialog(ref mut d) => {
+                d.input.clear_selection();
+                if d.has_input && y_off <= 2 {
+                    d.focused = DialogField::Input;
+                    d.input.select_all();
+                }
+            }
+            AppMode::MkdirDialog(ref mut state) => {
+                state.input.clear_selection();
+                if y_off <= 2 {
+                    state.focused = MkdirDialogField::Input;
+                    state.input.select_all();
+                }
+            }
+            AppMode::CopyDialog(ref mut state) => {
+                state.destination.clear_selection();
+                if y_off <= 2 {
+                    state.focused = CopyDialogField::Destination;
+                    state.destination.select_all();
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn handle_mouse_click(&mut self, col: u16, row: u16) {
         if let AppMode::Editing(ref mut e) = self.mode {
             e.click_at(col, row);
@@ -3907,10 +4430,9 @@ impl App {
         if matches!(self.mode, AppMode::Viewing(_) | AppMode::HexViewing(_)) {
             return;
         }
-        if matches!(
-            self.mode,
-            AppMode::Dialog(_) | AppMode::MkdirDialog(_) | AppMode::CopyDialog(_)
-        ) {
+        // Click inside dialogs: focus the clicked input field
+        if self.dialog_content_area.is_some() {
+            self.handle_dialog_click_at(col, row);
             return;
         }
 
@@ -3984,11 +4506,38 @@ impl App {
             }
         }
 
+        // Check if click is in the search results panel
+        if self.file_search.is_some() {
+            let search_area = self.panel_areas[self.file_search_side];
+            if col >= search_area.x
+                && col < search_area.x + search_area.width
+                && row >= search_area.y
+                && row < search_area.y + search_area.height
+            {
+                self.file_search_focused = true;
+                self.ci_focused = None;
+                self.claude_focused = None;
+                self.shell_focused = None;
+                // Select the clicked row
+                if let Some(ref mut state) = self.file_search {
+                    let inner_y = search_area.y + 1;
+                    if row >= inner_y {
+                        let target = state.scroll + (row - inner_y) as usize;
+                        if target < state.visible_count() {
+                            state.selected = target;
+                        }
+                    }
+                }
+                return;
+            }
+        }
+
         // Click on a file panel — unfocus everything
         if let Some(panel_idx) = self.panel_at(col, row) {
             self.ci_focused = None;
             self.claude_focused = None;
             self.shell_focused = None;
+            self.file_search_focused = false;
             self.active_panel = panel_idx;
             if let Some(entry_idx) = self.row_to_entry_index(panel_idx, row) {
                 self.panels[panel_idx].table_state.select(Some(entry_idx));
@@ -4080,50 +4629,25 @@ impl App {
             }
             Action::MoveUp => {
                 if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.input.clear_selection();
                     state.focused = state.focused.prev(state.has_input);
+                    if state.focused == DialogField::Input {
+                        state.input.select_all();
+                    }
                 }
             }
             Action::MoveDown => {
                 if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.input.clear_selection();
                     state.focused = state.focused.next(state.has_input);
-                }
-            }
-            Action::DialogInput(c) => {
-                if let AppMode::Dialog(ref mut state) = self.mode {
                     if state.focused == DialogField::Input {
-                        state.insert_char(c);
+                        state.input.select_all();
                     }
-                }
-            }
-            Action::DialogBackspace => {
-                if let AppMode::Dialog(ref mut state) = self.mode {
-                    if state.focused == DialogField::Input {
-                        state.delete_char_backward();
-                    }
-                }
-            }
-            Action::CursorLeft => {
-                if let AppMode::Dialog(ref mut state) = self.mode {
-                    state.cursor_left();
-                }
-            }
-            Action::CursorRight => {
-                if let AppMode::Dialog(ref mut state) = self.mode {
-                    state.cursor_right();
-                }
-            }
-            Action::CursorLineStart => {
-                if let AppMode::Dialog(ref mut state) = self.mode {
-                    state.cursor_home();
-                }
-            }
-            Action::CursorLineEnd => {
-                if let AppMode::Dialog(ref mut state) = self.mode {
-                    state.cursor_end();
                 }
             }
             Action::SwitchPanel | Action::SwitchPanelReverse => {
                 if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.input.clear_selection();
                     state.focused = match state.focused {
                         DialogField::ButtonOk => DialogField::ButtonCancel,
                         DialogField::ButtonCancel => DialogField::ButtonOk,
@@ -4131,7 +4655,12 @@ impl App {
                     };
                 }
             }
-            _ => {}
+            Action::MouseClick(col, row) => self.handle_dialog_click_at(col, row),
+            _ => {
+                if let AppMode::Dialog(ref mut state) = self.mode {
+                    state.input.handle_action(&action);
+                }
+            }
         }
     }
 
@@ -4157,10 +4686,10 @@ impl App {
                 }
             }
             DialogKind::InputRename => {
-                if dialog.input.is_empty() {
+                if dialog.input.text.is_empty() {
                     Ok(())
                 } else if let Some(entry) = self.active_panel().selected_entry() {
-                    fs_ops::rename_entry(&entry.path, &dialog.input)
+                    fs_ops::rename_entry(&entry.path, &dialog.input.text)
                 } else {
                     Ok(())
                 }
@@ -4359,8 +4888,7 @@ mod fuzzy_tests {
         assert_eq!(state.results.len(), 4);
 
         // Type "app" — should match app.rs
-        state.input = "app".to_string();
-        state.cursor = 3;
+        state.input = TextInput::new("app".to_string());
         state.update_results();
         assert!(!state.results.is_empty());
         let top_path = &state.all_paths[state.results[0].0];
@@ -4371,8 +4899,7 @@ mod fuzzy_tests {
         );
 
         // Type "xyz" — should match nothing
-        state.input = "xyz".to_string();
-        state.cursor = 3;
+        state.input = TextInput::new("xyz".to_string());
         state.update_results();
         assert!(state.results.is_empty());
     }
@@ -4441,8 +4968,7 @@ mod fuzzy_tests {
         // Create 200 matching files
         let paths: Vec<String> = (0..200).map(|i| format!("file{}.rs", i)).collect();
         let mut state = FuzzySearchState::new(paths);
-        state.input = "file".to_string();
-        state.cursor = 4;
+        state.input = TextInput::new("file".to_string());
         state.update_results();
         assert!(
             state.results.len() <= 100,
@@ -4461,8 +4987,7 @@ mod fuzzy_tests {
     fn all_files_match_no_panic() {
         let paths = vec!["a.rs".to_string(), "b.rs".to_string(), "c.rs".to_string()];
         let mut state = FuzzySearchState::new(paths);
-        state.input = "rs".to_string();
-        state.cursor = 2;
+        state.input = TextInput::new("rs".to_string());
         state.update_results();
         assert_eq!(state.results.len(), 3);
     }
@@ -4547,51 +5072,47 @@ mod fuzzy_tests {
     #[test]
     fn apply_completion_basic() {
         let mut state = GotoPathState {
-            input: "/usr/lo".to_string(),
-            cursor: 7,
+            input: TextInput::new("/usr/lo".to_string()),
             completions: vec!["local".to_string()],
             comp_index: None,
             comp_base: None,
         };
         App::apply_completion(&mut state, "local");
-        assert_eq!(state.input, "/usr/local/");
-        assert_eq!(state.cursor, 11);
+        assert_eq!(state.input.text, "/usr/local/");
+        assert_eq!(state.input.cursor, 11);
     }
 
     #[test]
     fn apply_completion_from_empty_prefix() {
         let mut state = GotoPathState {
-            input: "/usr/".to_string(),
-            cursor: 5,
+            input: TextInput::new("/usr/".to_string()),
             completions: vec!["local".to_string()],
             comp_index: None,
             comp_base: None,
         };
         App::apply_completion(&mut state, "local");
-        assert_eq!(state.input, "/usr/local/");
-        assert_eq!(state.cursor, 11);
+        assert_eq!(state.input.text, "/usr/local/");
+        assert_eq!(state.input.cursor, 11);
     }
 
     #[test]
     fn apply_common_prefix_extends() {
         let mut state = GotoPathState {
-            input: "/usr/lo".to_string(),
-            cursor: 7,
+            input: TextInput::new("/usr/lo".to_string()),
             completions: vec!["local".to_string(), "locale".to_string()],
             comp_index: None,
             comp_base: None,
         };
         let applied = App::apply_common_prefix(&mut state);
         assert!(applied);
-        assert_eq!(state.input, "/usr/local");
-        assert_eq!(state.cursor, 10);
+        assert_eq!(state.input.text, "/usr/local");
+        assert_eq!(state.input.cursor, 10);
     }
 
     #[test]
     fn apply_common_prefix_no_extension() {
         let mut state = GotoPathState {
-            input: "/usr/local".to_string(),
-            cursor: 10,
+            input: TextInput::new("/usr/local".to_string()),
             completions: vec!["local".to_string(), "locale".to_string()],
             comp_index: None,
             comp_base: None,
@@ -4604,8 +5125,7 @@ mod fuzzy_tests {
     #[test]
     fn apply_common_prefix_empty_completions() {
         let mut state = GotoPathState {
-            input: "/usr/xyz".to_string(),
-            cursor: 8,
+            input: TextInput::new("/usr/xyz".to_string()),
             completions: vec![],
             comp_index: None,
             comp_base: None,
@@ -4618,8 +5138,7 @@ mod fuzzy_tests {
     fn populate_completions_real_fs() {
         // Test against /usr which should exist and have subdirs
         let mut state = GotoPathState {
-            input: "/usr/".to_string(),
-            cursor: 5,
+            input: TextInput::new("/usr/".to_string()),
             completions: vec![],
             comp_index: None,
             comp_base: None,
@@ -4637,8 +5156,7 @@ mod fuzzy_tests {
     #[test]
     fn populate_completions_with_prefix() {
         let mut state = GotoPathState {
-            input: "/usr/lo".to_string(),
-            cursor: 7,
+            input: TextInput::new("/usr/lo".to_string()),
             completions: vec![],
             comp_index: None,
             comp_base: None,
@@ -4656,8 +5174,7 @@ mod fuzzy_tests {
     #[test]
     fn populate_completions_case_insensitive() {
         let mut state = GotoPathState {
-            input: "/usr/LO".to_string(),
-            cursor: 7,
+            input: TextInput::new("/usr/LO".to_string()),
             completions: vec![],
             comp_index: None,
             comp_base: None,
@@ -4677,8 +5194,7 @@ mod fuzzy_tests {
     #[test]
     fn populate_completions_invalid_dir() {
         let mut state = GotoPathState {
-            input: "/nonexistent_path_12345/".to_string(),
-            cursor: 23,
+            input: TextInput::new("/nonexistent_path_12345/".to_string()),
             completions: vec![],
             comp_index: None,
             comp_base: None,

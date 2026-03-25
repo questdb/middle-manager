@@ -74,6 +74,8 @@ pub struct GitCache {
     cache: HashMap<PathBuf, CacheEntry>,
     /// Pending async PR queries. Checked on each get_info call.
     pr_receivers: HashMap<PathBuf, std::sync::mpsc::Receiver<Option<super::github::PrInfo>>>,
+    /// Pending async git status queries. Resolved in poll_pending.
+    git_receivers: HashMap<PathBuf, std::sync::mpsc::Receiver<Option<CacheEntry>>>,
 }
 
 struct CacheEntry {
@@ -98,15 +100,18 @@ impl GitCache {
         Self {
             cache: HashMap::new(),
             pr_receivers: HashMap::new(),
+            git_receivers: HashMap::new(),
         }
     }
 
     /// Get git info for a directory view. Uses cached data if fresh enough.
+    /// Git queries run in background threads — returns stale/None on first call,
+    /// updated data on subsequent calls after the thread completes.
     pub fn get_info(&mut self, dir: &Path) -> Option<GitInfo> {
         // Canonicalize to handle symlinks (e.g., /tmp → /private/tmp on macOS)
         let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
 
-        let repo_root = get_repo_root(&dir)?;
+        let repo_root = get_repo_root_cached(&dir)?;
 
         // Check for completed async PR queries
         if let Some(rx) = self.pr_receivers.get(&repo_root) {
@@ -118,49 +123,23 @@ impl GitCache {
             }
         }
 
-        // Check cache freshness
+        // Check cache freshness — spawn async refresh if stale
         let needs_refresh = self
             .cache
             .get(&repo_root)
             .map(|e| e.last_refresh.elapsed().as_millis() > REFRESH_INTERVAL_MS)
             .unwrap_or(true);
 
-        if needs_refresh {
-            if let Some(mut entry) = query_repo(&dir, &repo_root) {
-                // Preserve PR info from old cache entry to avoid flicker
-                let old_branch = self.cache.get(&repo_root).map(|e| e.branch.clone());
-                let old_pr = self.cache.get(&repo_root).and_then(|e| e.pr.clone());
-
-                if let Some(ref old_pr_info) = old_pr {
-                    entry.pr = Some(old_pr_info.clone());
-                }
-
-                // Only re-query PR if branch changed or no PR info yet
-                let branch_changed = old_branch.as_deref() != Some(&entry.branch);
-                let no_pr = entry.pr.is_none() && !self.pr_receivers.contains_key(&repo_root);
-
-                if branch_changed || no_pr {
-                    let branch = entry.branch.clone();
-                    let dir_clone = dir.clone();
-                    let root_clone = repo_root.clone();
-                    let (tx, rx) = std::sync::mpsc::channel();
-                    std::thread::spawn(move || {
-                        let pr = super::github::query_pr_info(&dir_clone, &branch);
-                        let _ = tx.send(pr);
-                    });
-                    self.pr_receivers.insert(root_clone, rx);
-
-                    // Clear stale PR on branch change
-                    if branch_changed {
-                        entry.pr = None;
-                    }
-                }
-
-                self.cache.insert(repo_root.clone(), entry);
-            } else {
-                self.cache.remove(&repo_root);
-                return None;
-            }
+        if needs_refresh && !self.git_receivers.contains_key(&repo_root) {
+            // Spawn git status query in background thread
+            let dir_clone = dir.clone();
+            let root_clone = repo_root.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let result = query_repo(&dir_clone, &root_clone);
+                let _ = tx.send(result);
+            });
+            self.git_receivers.insert(repo_root.clone(), rx);
         }
 
         let entry = self.cache.get(&repo_root)?;
@@ -237,23 +216,73 @@ impl GitCache {
         })
     }
 
-    /// Check for completed async PR queries and update cache.
-    /// Returns true if any PR info was updated (panels should re-read).
+    /// Whether there are pending async queries (git status or PR).
+    pub fn has_pending(&self) -> bool {
+        !self.git_receivers.is_empty() || !self.pr_receivers.is_empty()
+    }
+
+    /// Check for completed async git status and PR queries.
+    /// Returns true if any data was updated (panels should re-read).
     pub fn poll_pending(&mut self) -> bool {
         let mut updated = false;
-        let mut completed = Vec::new();
 
+        // Check git status receivers
+        let mut git_completed = Vec::new();
+        for (root, rx) in &self.git_receivers {
+            if let Ok(result) = rx.try_recv() {
+                if let Some(mut entry) = result {
+                    // Preserve PR info from old cache entry
+                    let old_branch = self.cache.get(root).map(|e| e.branch.clone());
+                    let old_pr = self.cache.get(root).and_then(|e| e.pr.clone());
+
+                    if let Some(ref old_pr_info) = old_pr {
+                        entry.pr = Some(old_pr_info.clone());
+                    }
+
+                    // Re-query PR if branch changed or no PR info yet
+                    let branch_changed = old_branch.as_deref() != Some(&entry.branch);
+                    let no_pr = entry.pr.is_none() && !self.pr_receivers.contains_key(root);
+
+                    if branch_changed || no_pr {
+                        let branch = entry.branch.clone();
+                        let dir = root.clone();
+                        let root_clone = root.clone();
+                        let (tx, rx) = std::sync::mpsc::channel();
+                        std::thread::spawn(move || {
+                            let pr = super::github::query_pr_info(&dir, &branch);
+                            let _ = tx.send(pr);
+                        });
+                        self.pr_receivers.insert(root_clone, rx);
+
+                        if branch_changed {
+                            entry.pr = None;
+                        }
+                    }
+
+                    self.cache.insert(root.clone(), entry);
+                } else {
+                    self.cache.remove(root);
+                }
+                git_completed.push(root.clone());
+                updated = true;
+            }
+        }
+        for root in git_completed {
+            self.git_receivers.remove(&root);
+        }
+
+        // Check PR receivers
+        let mut pr_completed = Vec::new();
         for (root, rx) in &self.pr_receivers {
             if let Ok(pr_result) = rx.try_recv() {
                 if let Some(entry) = self.cache.get_mut(root) {
                     entry.pr = pr_result;
                 }
-                completed.push(root.clone());
+                pr_completed.push(root.clone());
                 updated = true;
             }
         }
-
-        for root in completed {
+        for root in pr_completed {
             self.pr_receivers.remove(&root);
         }
 
@@ -263,7 +292,7 @@ impl GitCache {
     /// Force refresh for a specific directory's repo.
     pub fn invalidate(&mut self, dir: &Path) {
         let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        if let Some(root) = get_repo_root(&dir) {
+        if let Some(root) = get_repo_root_cached(&dir) {
             self.cache.remove(&root);
         }
     }
@@ -302,6 +331,29 @@ fn query_ahead_behind(dir: &Path, branch: &str) -> Option<(usize, usize)> {
     }
 }
 
+/// Cached repo root lookups. Avoids spawning `git rev-parse` on every call.
+/// Maps canonicalized directory → repo root (or None if not a git repo).
+/// Only caches positive results (Some). Negative results (None) are not cached
+/// so that `git init` in a previously non-git directory is detected on next check.
+fn get_repo_root_cached(dir: &Path) -> Option<PathBuf> {
+    use std::sync::Mutex;
+    static CACHE: std::sync::LazyLock<Mutex<HashMap<PathBuf, PathBuf>>> =
+        std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    let key = dir.to_path_buf();
+    {
+        let cache = CACHE.lock().unwrap();
+        if let Some(result) = cache.get(&key) {
+            return Some(result.clone());
+        }
+    }
+
+    let result = get_repo_root(dir)?;
+    let mut cache = CACHE.lock().unwrap();
+    cache.insert(key, result.clone());
+    Some(result)
+}
+
 /// Get the repo root for a directory. Returns None if not in a git repo.
 fn get_repo_root(dir: &Path) -> Option<PathBuf> {
     let output = Command::new("git")
@@ -315,7 +367,6 @@ fn get_repo_root(dir: &Path) -> Option<PathBuf> {
         return None;
     }
     let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    // Canonicalize the root too for consistent comparison
     Some(std::fs::canonicalize(&root).unwrap_or_else(|_| PathBuf::from(root)))
 }
 

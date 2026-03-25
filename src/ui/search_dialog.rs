@@ -32,12 +32,15 @@ pub fn render(frame: &mut Frame, state: &SearchDialogState) -> Rect {
     } else {
         input_normal
     };
-    let query_text = format!("{:<width$}", state.query, width = layout.cw);
-    dh::render_line(
+
+    dh::render_text_input(
         frame,
         layout.content,
         2,
-        Line::from(Span::styled(query_text, query_style)),
+        &state.query,
+        query_focused,
+        query_style,
+        layout.cw,
     );
 
     // y=4: separator
@@ -111,15 +114,6 @@ pub fn render(frame: &mut Frame, state: &SearchDialogState) -> Rect {
         normal,
         highlight,
     );
-
-    // Blinking cursor
-    if query_focused {
-        let cursor_x = layout.content.x + state.cursor as u16;
-        let cursor_y = layout.content.y + 2;
-        if cursor_x < layout.content.x + layout.content.width {
-            frame.set_cursor_position((cursor_x, cursor_y));
-        }
-    }
 
     layout.outer
 }

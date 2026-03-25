@@ -20,6 +20,14 @@ pub struct AppState {
     #[serde(default)]
     pub search_case_sensitive: bool,
 
+    /// Last file content search parameters.
+    #[serde(default)]
+    pub file_search_term: String,
+    #[serde(default)]
+    pub file_search_filter: String,
+    #[serde(default)]
+    pub file_search_regex: bool,
+
     /// Last panel paths.
     #[serde(default)]
     pub left_panel_path: Option<String>,
@@ -64,6 +72,9 @@ impl Default for AppState {
             search_query: String::new(),
             search_direction_forward: false,
             search_case_sensitive: false,
+            file_search_term: String::new(),
+            file_search_filter: String::new(),
+            file_search_regex: false,
             left_panel_path: None,
             right_panel_path: None,
             split_pct_ci: 60,

@@ -26,9 +26,7 @@ pub fn render(frame: &mut Frame, dialog: &DialogState) -> Rect {
         )),
     );
 
-    let buttons_y;
-
-    if dialog.has_input {
+    let buttons_y = if dialog.has_input {
         // y=2: input field
         let input_focused = dialog.focused == DialogField::Input;
         let input_style = if input_focused {
@@ -36,12 +34,17 @@ pub fn render(frame: &mut Frame, dialog: &DialogState) -> Rect {
         } else {
             input_normal
         };
-        let input_text = format!("{:<width$}", dialog.input, width = layout.cw);
-        dh::render_line(
+
+        let input = &dialog.input;
+
+        dh::render_text_input(
             frame,
             layout.content,
             2,
-            Line::from(Span::styled(input_text, input_style)),
+            input,
+            input_focused,
+            input_style,
+            layout.cw,
         );
 
         // y=4: separator
@@ -51,15 +54,7 @@ pub fn render(frame: &mut Frame, dialog: &DialogState) -> Rect {
             layout.inner.y + 4,
             t.dialog_border_style(),
         );
-        buttons_y = 5;
-
-        if input_focused {
-            let cursor_x = layout.content.x + dialog.cursor as u16;
-            let cursor_y = layout.content.y + 2;
-            if cursor_x < layout.content.x + layout.content.width {
-                frame.set_cursor_position((cursor_x, cursor_y));
-            }
-        }
+        5
     } else {
         // y=3: separator
         dh::render_separator(
@@ -68,8 +63,8 @@ pub fn render(frame: &mut Frame, dialog: &DialogState) -> Rect {
             layout.inner.y + 3,
             t.dialog_border_style(),
         );
-        buttons_y = 4;
-    }
+        4
+    };
 
     let (ok_label, cancel_label) = if dialog.has_input {
         ("{ OK }", "[ Cancel ]")

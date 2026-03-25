@@ -105,6 +105,9 @@ pub enum Action {
     BottomResizeDown,
     BottomMaximize,
 
+    // File content search
+    FileSearchPrompt,
+
     // Help
     ShowHelp,
 
