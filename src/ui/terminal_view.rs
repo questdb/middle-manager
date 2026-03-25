@@ -64,6 +64,9 @@ pub fn render(frame: &mut Frame, area: Rect, tp: &TerminalPanel, is_active: bool
             }
 
             match cell {
+                Some(cell) if cell.is_wide_continuation() => {
+                    // Second half of a wide character — skip (already rendered by first half)
+                }
                 Some(cell) if cell.has_contents() => {
                     current_text.push_str(cell.contents());
                 }
@@ -89,7 +92,7 @@ pub fn render(frame: &mut Frame, area: Rect, tp: &TerminalPanel, is_active: bool
             let x = inner.x + cursor_col;
             let y = inner.y + cursor_row;
             if x < inner.x + inner.width && y < inner.y + inner.height {
-                frame.set_cursor_position((x, y));
+                crate::ui::set_cursor(x, y);
             }
         }
     }
@@ -102,6 +105,9 @@ fn vt100_cell_style(cell: &vt100::Cell) -> Style {
     }
     if cell.italic() {
         mods |= Modifier::ITALIC;
+    }
+    if cell.dim() {
+        mods |= Modifier::DIM;
     }
     if cell.underline() {
         mods |= Modifier::UNDERLINED;

@@ -3,6 +3,7 @@ pub mod copy_dialog;
 pub mod dialog;
 pub mod dialog_helpers;
 pub mod editor_view;
+pub mod file_search_dialog;
 pub mod footer;
 pub mod header;
 pub mod help_dialog;
@@ -10,6 +11,7 @@ pub mod hex_view;
 pub mod mkdir_dialog;
 pub mod panel_view;
 pub mod search_dialog;
+pub mod search_results_view;
 mod shadow;
 pub mod terminal_view;
 pub mod viewer_view;
@@ -20,8 +22,37 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
 
+use std::cell::Cell;
+
 use crate::app::{App, AppMode};
 use crate::theme::theme;
+
+thread_local! {
+    /// Cursor position set during rendering. Read by main loop after draw.
+    pub static CURSOR_POS: Cell<Option<(u16, u16)>> = const { Cell::new(None) };
+    /// Dialog content area set during rendering. Used for click-to-focus.
+    pub static DIALOG_CONTENT: Cell<Option<Rect>> = const { Cell::new(None) };
+}
+
+/// Set the cursor position from any render function. Use instead of frame.set_cursor_position.
+pub fn set_cursor(x: u16, y: u16) {
+    CURSOR_POS.set(Some((x, y)));
+}
+
+/// Read and clear the cursor position after draw.
+pub fn take_cursor() -> Option<(u16, u16)> {
+    CURSOR_POS.replace(None)
+}
+
+/// Set the dialog content area from a dialog renderer.
+pub fn set_dialog_content(area: Rect) {
+    DIALOG_CONTENT.set(Some(area));
+}
+
+/// Read and clear the dialog content area after draw.
+pub fn take_dialog_content() -> Option<Rect> {
+    DIALOG_CONTENT.replace(None)
+}
 
 /// Split a panel column into file area + optional CI area + optional shell area + optional Claude area.
 ///
@@ -151,19 +182,29 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
 
     header::render(frame, header_area, app);
 
-    // File panels are active only when no CI/claude/shell panel is focused
+    // File panels are active only when nothing else is focused
     let (left_active, right_active) = if app.ci_focused.is_some()
         || app.claude_focused.is_some()
         || app.shell_focused.is_some()
+        || app.file_search_focused
     {
         (false, false)
     } else {
         (app.active_panel == 0, app.active_panel == 1)
     };
 
-    // Render file panels (skip if 0-height, e.g. when Claude is maximized)
+    let has_search = app.file_search.is_some();
+    let search_side = app.file_search_side;
+
+    // Render file panels or search results
     let [left_panel, right_panel] = app.panels.each_mut();
-    if left_area.height > 0 {
+
+    // Left side
+    if has_search && search_side == 0 {
+        if let Some(ref mut state) = app.file_search {
+            search_results_view::render(frame, left_area, state, app.file_search_focused);
+        }
+    } else if left_area.height > 0 {
         panel_view::render_with_overlays(
             frame,
             left_area,
@@ -173,7 +214,13 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
             app.fuzzy_search[0].as_ref(),
         );
     }
-    if right_area.height > 0 {
+
+    // Right side
+    if has_search && search_side == 1 {
+        if let Some(ref mut state) = app.file_search {
+            search_results_view::render(frame, right_area, state, app.file_search_focused);
+        }
+    } else if right_area.height > 0 {
         panel_view::render_with_overlays(
             frame,
             right_area,
@@ -182,6 +229,12 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
             app.goto_path[1].as_ref(),
             app.fuzzy_search[1].as_ref(),
         );
+    }
+
+    // Render file search dialog overlay
+    if let Some(ref state) = app.file_search_dialog {
+        let area = file_search_dialog::render(frame, state);
+        shadow::render_shadow(frame, area);
     }
 
     // Render CI panels
@@ -209,7 +262,9 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
     }
 
     // Show appropriate footer
-    if app.shell_focused.is_some() {
+    if app.file_search_focused {
+        footer::render_search(frame, footer_area);
+    } else if app.shell_focused.is_some() {
         footer::render_shell(frame, footer_area);
     } else if app.claude_focused.is_some() {
         footer::render_terminal(frame, footer_area);

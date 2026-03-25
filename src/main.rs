@@ -3,12 +3,14 @@ mod app;
 mod ci;
 mod editor;
 mod event;
+mod file_search;
 mod fs_ops;
 mod hex_viewer;
 mod panel;
 mod state;
 mod syntax;
 mod terminal;
+mod text_input;
 mod theme;
 mod ui;
 mod viewer;
@@ -89,11 +91,38 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
         if app.needs_clear {
             terminal.clear()?;
             app.needs_clear = false;
+            app.dirty = true;
         }
 
-        // Render, then sync PTY sizes with rendered areas
-        terminal.draw(|frame| ui::render(frame, &mut app))?;
-        app.resize_all_bottom_panels();
+        // Only redraw when state has changed (dirty flag).
+        // Skipping draws on idle ticks lets the terminal's cursor blink undisturbed.
+        if app.dirty {
+            terminal.draw(|frame| ui::render(frame, &mut app))?;
+            app.resize_all_bottom_panels();
+            app.dialog_content_area = ui::take_dialog_content();
+            app.dirty = false;
+
+            // Manage cursor ourselves — ratatui always hides it (no set_cursor_position calls).
+            let new_cursor = ui::take_cursor();
+            match new_cursor {
+                Some(pos) => {
+                    let style = crate::theme::theme().editor_cursor;
+                    execute!(
+                        io::stdout(),
+                        crossterm::cursor::MoveTo(pos.0, pos.1),
+                        crossterm::cursor::Show,
+                        style
+                    )?;
+                    app.last_cursor_pos = Some(pos);
+                }
+                None => {
+                    if app.last_cursor_pos.is_some() {
+                        execute!(io::stdout(), crossterm::cursor::Hide)?;
+                        app.last_cursor_pos = None;
+                    }
+                }
+            }
+        }
 
         // Check for edit request
         if let Some(edit_path) = app.take_edit_request() {
@@ -119,6 +148,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
 
             // Reload panels
             app.reload_panels();
+            app.dirty = true;
             continue;
         }
 
@@ -133,6 +163,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                 app.handle_action(action);
             }
             AppEvent::Resize(w, h) => {
+                app.dirty = true;
                 app.handle_action(action::Action::Resize(w, h));
             }
             AppEvent::Tick => {
@@ -140,7 +171,7 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
             }
             AppEvent::Wakeup => {
                 // Terminal has output — poll it and re-render.
-                // ack_wakeup clears the flag so the next wake() can send again.
+                app.dirty = true;
                 app.handle_action(action::Action::Tick);
                 events.ack_wakeup();
             }

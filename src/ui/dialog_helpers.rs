@@ -68,6 +68,9 @@ pub fn render_dialog_frame(
     );
     let cw = content.width as usize;
 
+    // Store content area for click detection
+    super::set_dialog_content(content);
+
     DialogLayout {
         outer,
         area,
@@ -160,6 +163,102 @@ pub fn render_buttons(
     }
 
     render_line(frame, content, y_off, Line::from(spans));
+}
+
+/// Render a TextInput field with horizontal scrolling, selection highlighting,
+/// and cursor positioning. Shared across all dialogs.
+pub fn render_text_input(
+    frame: &mut Frame,
+    content: Rect,
+    y_off: u16,
+    input: &crate::text_input::TextInput,
+    focused: bool,
+    style: Style,
+    cw: usize,
+) {
+    let t = theme();
+    let text = &input.text;
+    let cursor = input.cursor;
+
+    // Compute visible window using char counts (safe for multi-byte UTF-8)
+    let before_cursor = &text[..cursor];
+    let before_chars = before_cursor.chars().count();
+    let total_chars = text.chars().count();
+
+    let skip_chars = if before_chars >= cw {
+        before_chars - cw + 1
+    } else {
+        0
+    };
+
+    // Convert char offset to byte offset for slicing
+    let visible_start = text
+        .char_indices()
+        .nth(skip_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let visible_end_char = (skip_chars + cw).min(total_chars);
+    let visible_end = text
+        .char_indices()
+        .nth(visible_end_char)
+        .map(|(i, _)| i)
+        .unwrap_or(text.len());
+    let visible_text = &text[visible_start..visible_end];
+    let cursor_in_view = before_chars.saturating_sub(skip_chars);
+
+    // Check for active selection
+    if let Some((sel_start, sel_end)) = input.selection_range() {
+        if sel_start != sel_end {
+            let sel_style = t.input_selection_style();
+            // Clamp selection to visible window (byte offsets relative to visible_text)
+            let vis_sel_start = sel_start.max(visible_start) - visible_start;
+            let vis_sel_end = sel_end.max(visible_start) - visible_start;
+            let vis_sel_start = vis_sel_start.min(visible_text.len());
+            let vis_sel_end = vis_sel_end.min(visible_text.len());
+
+            let before = &visible_text[..vis_sel_start];
+            let selected = &visible_text[vis_sel_start..vis_sel_end];
+            let after = &visible_text[vis_sel_end..];
+            let visible_chars = visible_text.chars().count();
+            let remaining = cw.saturating_sub(visible_chars);
+
+            let mut spans = vec![
+                Span::styled(before.to_string(), style),
+                Span::styled(selected.to_string(), sel_style),
+                Span::styled(after.to_string(), style),
+            ];
+            if remaining > 0 {
+                spans.push(Span::styled(" ".repeat(remaining), style));
+            }
+            render_line(frame, content, y_off, Line::from(spans));
+
+            if focused {
+                let cursor_x = content.x + cursor_in_view as u16;
+                crate::ui::set_cursor(cursor_x, content.y + y_off);
+            }
+            return;
+        }
+    }
+
+    // No selection — render visible portion of text
+    let visible_chars = visible_text.chars().count();
+    let remaining = cw.saturating_sub(visible_chars);
+    let display = if remaining > 0 {
+        format!("{}{}", visible_text, " ".repeat(remaining))
+    } else {
+        visible_text.to_string()
+    };
+    render_line(
+        frame,
+        content,
+        y_off,
+        Line::from(Span::styled(display, style)),
+    );
+
+    if focused {
+        let cursor_x = content.x + cursor_in_view as u16;
+        crate::ui::set_cursor(cursor_x, content.y + y_off);
+    }
 }
 
 fn centered_rect(width: u16, height: u16, area: Rect) -> Rect {

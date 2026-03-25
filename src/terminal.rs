@@ -32,6 +32,7 @@ pub struct TerminalPanel {
 
 impl TerminalPanel {
     /// Spawn a command in a PTY with the given working directory and dimensions.
+    #[allow(clippy::too_many_arguments)]
     fn spawn_cmd(
         command: &str,
         args: &[&str],

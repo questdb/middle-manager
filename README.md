@@ -16,7 +16,9 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Quick search — just start typing to jump to a file, Enter to open
 - Go-to-path (Ctrl+G) — type a path to navigate instantly, with zsh-style tab completion (case-insensitive, overlay dropdown)
 - Fuzzy file search (Ctrl+F) — recursively finds files by partial/misspelled names, ranked by match quality, opens in editor
+- Search in files (Ctrl+S) — ripgrep-powered content search with file filter, regex support, tree view results, Enter opens editor at match line with search term highlighted
 - Clipboard copy — Ctrl+C copies filename, Ctrl+P copies full path (OSC 52)
+- All dialog inputs support text selection (Shift+arrows), Ctrl+A select all, Ctrl+C copy, Ctrl+X cut, Ctrl+Z undo, Ctrl+Shift+Z redo
 - Sort by name, size, or date (F9), persisted across restarts
 - Mouse support — click to select, double-click to open, scroll wheel to navigate
 - Filesystem watcher — panels auto-refresh on external changes (kqueue/inotify, zero-cost idle)
@@ -28,7 +30,8 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Ahead/behind remote counts (`↑N ↓M`)
 - Repo-wide status summary in panel title (`● 6 + 3 ? 7`)
 - GitHub PR status with CI check indicators (`PR #42 ✓` / `✗` / `○`), merged (`●` magenta) and closed (`✘` red) states
-- Shared git cache across panels, async PR queries (never blocks UI)
+- Shared git cache across panels, fully async git status + PR queries (instant startup, never blocks UI)
+- Uses `--no-optional-locks` to avoid index.lock conflicts with other tools
 - File name coloring based on git status
 
 **CI Panel (F2)**
@@ -146,6 +149,7 @@ cargo build --release
 | Shift+Tab | Switch panel backward |
 | Ctrl+F | Fuzzy file search (opens in editor) |
 | Ctrl+G | Go to path (with tab completion) |
+| Ctrl+S | Search in files (ripgrep-powered) |
 | Ctrl+C | Copy filename to clipboard |
 | Ctrl+O | Toggle shell panel |
 | Ctrl+P | Copy full path to clipboard |
@@ -204,6 +208,36 @@ cargo build --release
 | F12 | Close Claude Code panel |
 | F10 | Quit (with confirmation) |
 
+### Search Results Panel
+
+| Key | Action |
+|-----|--------|
+| Up / Down | Navigate results |
+| PageUp / PageDown | Page through results |
+| Home / End | Jump to top / bottom |
+| Enter | Open file in editor at match line |
+| Right | Expand file matches |
+| Left | Collapse file / jump to parent from match |
+| Tab / Shift+Tab | Switch panel |
+| Esc | Close search results |
+| Scroll / Trackpad | Scroll results |
+| Mouse click | Select result and focus panel |
+| F10 | Quit (with confirmation) |
+
+### Dialog Inputs (all dialogs)
+
+| Key | Action |
+|-----|--------|
+| Shift+Left/Right | Select text |
+| Shift+Home/End | Select to start/end |
+| Ctrl+A | Select all |
+| Ctrl+C | Copy selection to clipboard |
+| Ctrl+X | Cut selection |
+| Ctrl+Z | Undo |
+| Ctrl+Shift+Z | Redo |
+| Delete | Delete forward |
+| Mouse click | Focus input field |
+
 ### Viewer / Hex Viewer
 
 | Key | Action |
@@ -249,6 +283,8 @@ src/
   action.rs         Action enum (every possible user intent)
   event.rs          Background thread event polling, coalescing wakeup mechanism
   terminal.rs       Embedded terminal: PTY lifecycle, vt100 parsing, key encoding (shell + Claude)
+  file_search.rs    File content search: ripgrep engine (ignore + grep-searcher), streaming results
+  text_input.rs     Reusable text input: selection, undo/redo, cut/copy, horizontal scroll
   ci.rs             CI panel: check/step fetching, log download, tree state
   state.rs          Persistent state (JSON, ~/.config/middle-manager/)
   syntax.rs         Tree-sitter syntax highlighting with hybrid caching
@@ -271,6 +307,8 @@ src/
     ci_view.rs      CI panel tree rendering with expand/collapse
     header.rs       Header margin
     terminal_view.rs  Terminal panel rendering (vt100 screen to ratatui spans)
+    file_search_dialog.rs  Search-in-files dialog (path, term, filter, regex)
+    search_results_view.rs  Search results tree view (files + matching lines)
     footer.rs       Contextual function key hints (normal / CI / terminal mode)
     dialog.rs       Simple dialogs (delete, rename) with cursor navigation
     dialog_helpers.rs  Shared dialog rendering (frame, buttons, checkboxes, separators)

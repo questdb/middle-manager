@@ -30,12 +30,15 @@ pub fn render(frame: &mut Frame, state: &MkdirDialogState) -> Rect {
     } else {
         input_normal
     };
-    let input_text = format!("{:<width$}", state.input, width = layout.cw);
-    dh::render_line(
+
+    dh::render_text_input(
         frame,
         layout.content,
         2,
-        Line::from(Span::styled(input_text, input_style)),
+        &state.input,
+        input_focused,
+        input_style,
+        layout.cw,
     );
 
     // y=4: separator
@@ -81,15 +84,6 @@ pub fn render(frame: &mut Frame, state: &MkdirDialogState) -> Rect {
         normal,
         highlight,
     );
-
-    // Blinking cursor
-    if input_focused {
-        let cursor_x = layout.content.x + state.cursor as u16;
-        let cursor_y = layout.content.y + 2;
-        if cursor_x < layout.content.x + layout.content.width {
-            frame.set_cursor_position((cursor_x, cursor_y));
-        }
-    }
 
     layout.outer
 }

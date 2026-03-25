@@ -59,7 +59,7 @@ pub struct Theme {
     pub syn_property: Color,
     pub syn_escape: Color,
     pub syn_constructor: Color,
-    // Editor
+    // Editor / dialog cursor
     pub editor_text_fg: Color,
     pub editor_cursor: SetCursorStyle,
     // Git
@@ -190,6 +190,11 @@ impl Theme {
             .fg(self.dir_fg)
             .bg(self.bg)
             .add_modifier(Modifier::BOLD)
+    }
+
+    /// Style for selected text in TextInput fields (dialog inputs, go-to-path, fuzzy search).
+    pub fn input_selection_style(&self) -> Style {
+        Style::default().fg(Color::White).bg(Color::Black)
     }
 
     pub fn file_style(&self) -> Style {

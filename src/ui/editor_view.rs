@@ -170,9 +170,7 @@ pub fn render(frame: &mut Frame, area: Rect, editor: &mut EditorState) {
     if cursor_screen_x < (inner.x + inner.width) as usize
         && cursor_screen_y < (inner.y + inner.height.saturating_sub(1)) as usize
     {
-        frame.set_cursor_position((cursor_screen_x as u16, cursor_screen_y as u16));
-        // Apply cursor shape from theme
-        let _ = crossterm::execute!(std::io::stdout(), t.editor_cursor);
+        crate::ui::set_cursor(cursor_screen_x as u16, cursor_screen_y as u16);
     }
 }
 
