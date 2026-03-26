@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use parquet2::encoding::hybrid_rle::HybridRleDecoder;
 use parquet2::encoding::Encoding;
-use parquet2::metadata::{ColumnChunkMetaData, FileMetaData};
+use parquet2::metadata::{ColumnChunkMetaData, FileMetaData, RowGroupMetaData};
 use parquet2::page::{split_buffer, DataPage, DataPageHeader, DataPageHeaderExt, DictPage, Page};
 use parquet2::read;
 use parquet2::schema::types::{PhysicalType, PrimitiveLogicalType, TimeUnit};
@@ -121,7 +121,8 @@ impl ParquetViewerState {
             error: None,
             metadata,
             view_mode: ViewMode::Tree,
-            tree_items: Vec::new(),
+            // Pre-allocate: root + properties + schema header + row group headers
+            tree_items: Vec::with_capacity(4 + table_columns.len() + num_rg * 3),
             tree_cursor: 0,
             tree_scroll: 0,
             tree_visible: 0,
@@ -373,14 +374,12 @@ impl ParquetViewerState {
             .sum();
 
         let rg = &self.metadata.row_groups[rg_idx];
-        let num_cols = rg.columns().len();
         let max_rows = rg.num_rows().min(TABLE_BUFFER_ROWS);
 
-        let mut columns: Vec<Vec<String>> = Vec::with_capacity(num_cols);
-        for col_idx in 0..num_cols {
-            let values = decode_column(&self.path, &rg.columns()[col_idx], max_rows);
-            columns.push(values);
-        }
+        let columns = match decode_row_group_columns(&self.path, rg, max_rows) {
+            Some(c) => c,
+            None => return,
+        };
 
         // Update column widths
         for (col_idx, col_data) in columns.iter().enumerate() {
@@ -391,18 +390,7 @@ impl ParquetViewerState {
             }
         }
 
-        // Transpose to rows
-        let actual_rows = columns.iter().map(|c| c.len()).max().unwrap_or(0);
-        let mut rows = Vec::with_capacity(actual_rows);
-        for row_idx in 0..actual_rows {
-            let row: Vec<String> = columns
-                .iter()
-                .map(|col| col.get(row_idx).cloned().unwrap_or_default())
-                .collect();
-            rows.push(row);
-        }
-
-        self.table_rows = rows;
+        self.table_rows = transpose_columns(&columns);
         self.table_loaded_rg = Some(rg_idx);
         self.table_loaded_offset = offset;
     }
@@ -421,6 +409,8 @@ impl ParquetViewerState {
     // -----------------------------------------------------------------------
 
     fn rebuild_tree(&mut self) {
+        // .clear() preserves allocated capacity, so repeated expand/collapse
+        // reuses the same buffer without reallocating.
         self.tree_items.clear();
 
         let fname = self
@@ -652,14 +642,12 @@ impl ParquetViewerState {
 
     fn load_data_preview(&mut self, rg_idx: usize) {
         let rg = &self.metadata.row_groups[rg_idx];
-        let num_cols = rg.columns().len();
         let max_rows = rg.num_rows().min(DATA_PREVIEW_MAX_ROWS);
 
-        let mut columns: Vec<Vec<String>> = Vec::with_capacity(num_cols);
-        for col_idx in 0..num_cols {
-            let values = decode_column(&self.path, &rg.columns()[col_idx], max_rows);
-            columns.push(values);
-        }
+        let columns = match decode_row_group_columns(&self.path, rg, max_rows) {
+            Some(c) => c,
+            None => return,
+        };
 
         // Compute column widths
         let mut col_widths: Vec<usize> = self
@@ -674,20 +662,9 @@ impl ParquetViewerState {
             }
         }
 
-        // Transpose
-        let actual_rows = columns.iter().map(|c| c.len()).max().unwrap_or(0);
-        let mut rows = Vec::with_capacity(actual_rows);
-        for row_idx in 0..actual_rows {
-            let row: Vec<String> = columns
-                .iter()
-                .map(|col| col.get(row_idx).cloned().unwrap_or_default())
-                .collect();
-            rows.push(row);
-        }
-
         self.data_previews[rg_idx] = Some(DataPreview {
             column_widths: col_widths,
-            rows,
+            rows: transpose_columns(&columns),
         });
     }
 }
@@ -713,13 +690,35 @@ fn push_item(
     });
 }
 
-fn decode_column(path: &PathBuf, col_meta: &ColumnChunkMetaData, max_rows: usize) -> Vec<String> {
-    let mut file = match File::open(path) {
-        Ok(f) => f,
-        Err(e) => return vec![format!("<err: {}>", e)],
-    };
+/// Open the file once and decode all columns for a row group.
+fn decode_row_group_columns(
+    path: &PathBuf,
+    rg: &RowGroupMetaData,
+    max_rows: usize,
+) -> Option<Vec<Vec<String>>> {
+    let mut file = File::open(path).ok()?;
+    let mut columns = Vec::with_capacity(rg.columns().len());
+    for col_meta in rg.columns() {
+        columns.push(decode_column(&mut file, col_meta, max_rows));
+    }
+    Some(columns)
+}
 
-    let pages = match read::get_page_iterator(col_meta, &mut file, None, vec![], usize::MAX) {
+/// Transpose column-major data to row-major.
+fn transpose_columns(columns: &[Vec<String>]) -> Vec<Vec<String>> {
+    let num_rows = columns.iter().map(|c| c.len()).max().unwrap_or(0);
+    (0..num_rows)
+        .map(|r| {
+            columns
+                .iter()
+                .map(|col| col.get(r).cloned().unwrap_or_default())
+                .collect()
+        })
+        .collect()
+}
+
+fn decode_column(file: &mut File, col_meta: &ColumnChunkMetaData, max_rows: usize) -> Vec<String> {
+    let pages = match read::get_page_iterator(col_meta, file, None, vec![], usize::MAX) {
         Ok(p) => p,
         Err(e) => return vec![format!("<err: {}>", e)],
     };
@@ -962,12 +961,12 @@ fn decode_plain_raw(
 
 fn decode_plain_boolean(buf: &[u8], max_values: usize) -> Vec<String> {
     let mut result = Vec::with_capacity(max_values);
-    for byte_idx in 0..buf.len() {
+    for &byte in buf {
         for bit in 0..8 {
             if result.len() >= max_values {
                 return result;
             }
-            let val = (buf[byte_idx] >> bit) & 1 == 1;
+            let val = (byte >> bit) & 1 == 1;
             result.push(if val { "true" } else { "false" }.into());
         }
     }

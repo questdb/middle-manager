@@ -179,8 +179,8 @@ fn render_table(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
     let col_start = state.table_scroll_col;
     let mut visible_end = col_start;
     let mut used_width = 0;
-    for i in col_start..col_widths.len() {
-        let w = col_widths[i] + 3; // " | " separator
+    for (i, &cw) in col_widths.iter().enumerate().skip(col_start) {
+        let w = cw + 3; // " | " separator
         if used_width + w > inner_width + 3 {
             break;
         }
@@ -196,7 +196,12 @@ fn render_table(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
         .fg(Color::Yellow)
         .bg(t.bg)
         .add_modifier(Modifier::BOLD);
-    let sep_style = Style::default().fg(Color::DarkGray).bg(t.bg);
+    let ts = TableStyles {
+        sep: Style::default().fg(Color::DarkGray).bg(t.bg),
+        bg: bg_style,
+        data: Style::default().fg(Color::LightCyan).bg(t.bg),
+        null: Style::default().fg(Color::DarkGray).bg(t.bg),
+    };
 
     let header_spans = build_row_spans(
         &state.table_columns,
@@ -205,18 +210,13 @@ fn render_table(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
         visible_end,
         inner_width,
         header_style,
-        sep_style,
-        bg_style,
+        &ts,
     );
     lines.push(Line::from(header_spans));
 
     // Separator
-    let sep_line = build_separator(col_widths, col_start, visible_end, inner_width, sep_style, bg_style);
+    let sep_line = build_separator(col_widths, col_start, visible_end, inner_width, &ts);
     lines.push(Line::from(sep_line));
-
-    // Data rows
-    let data_style = Style::default().fg(Color::LightCyan).bg(t.bg);
-    let null_style = Style::default().fg(Color::DarkGray).bg(t.bg);
 
     for i in 0..state.table_visible_rows {
         let global_row = state.table_scroll_row + i;
@@ -235,10 +235,7 @@ fn render_table(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
                 col_start,
                 visible_end,
                 inner_width,
-                data_style,
-                null_style,
-                sep_style,
-                bg_style,
+                &ts,
             );
             lines.push(Line::from(row_spans));
         } else {
@@ -279,6 +276,13 @@ fn render_table(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
 // Span builders
 // ---------------------------------------------------------------------------
 
+struct TableStyles {
+    sep: Style,
+    bg: Style,
+    data: Style,
+    null: Style,
+}
+
 fn build_row_spans(
     values: &[String],
     col_widths: &[usize],
@@ -286,14 +290,13 @@ fn build_row_spans(
     col_end: usize,
     inner_width: usize,
     value_style: Style,
-    sep_style: Style,
-    bg_style: Style,
+    ts: &TableStyles,
 ) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::styled(" ", bg_style));
+    spans.push(Span::styled(" ", ts.bg));
     for i in col_start..col_end {
         if i > col_start {
-            spans.push(Span::styled(" | ", sep_style));
+            spans.push(Span::styled(" | ", ts.sep));
         }
         let w = col_widths.get(i).copied().unwrap_or(8);
         let val = values.get(i).map(|s| s.as_str()).unwrap_or("");
@@ -302,7 +305,7 @@ fn build_row_spans(
 
     let used: usize = spans.iter().map(|s| s.width()).sum();
     if used < inner_width {
-        spans.push(Span::styled(" ".repeat(inner_width - used), bg_style));
+        spans.push(Span::styled(" ".repeat(inner_width - used), ts.bg));
     }
     spans
 }
@@ -313,26 +316,23 @@ fn build_data_row_spans(
     col_start: usize,
     col_end: usize,
     inner_width: usize,
-    data_style: Style,
-    null_style: Style,
-    sep_style: Style,
-    bg_style: Style,
+    ts: &TableStyles,
 ) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::styled(" ", bg_style));
+    spans.push(Span::styled(" ", ts.bg));
     for i in col_start..col_end {
         if i > col_start {
-            spans.push(Span::styled(" | ", sep_style));
+            spans.push(Span::styled(" | ", ts.sep));
         }
         let w = col_widths.get(i).copied().unwrap_or(8);
         let val = values.get(i).map(|s| s.as_str()).unwrap_or("");
-        let style = if val == "null" { null_style } else { data_style };
+        let style = if val == "null" { ts.null } else { ts.data };
         spans.push(Span::styled(fit(val, w), style));
     }
 
     let used: usize = spans.iter().map(|s| s.width()).sum();
     if used < inner_width {
-        spans.push(Span::styled(" ".repeat(inner_width - used), bg_style));
+        spans.push(Span::styled(" ".repeat(inner_width - used), ts.bg));
     }
     spans
 }
@@ -342,22 +342,21 @@ fn build_separator(
     col_start: usize,
     col_end: usize,
     inner_width: usize,
-    sep_style: Style,
-    bg_style: Style,
+    ts: &TableStyles,
 ) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
-    spans.push(Span::styled("-", sep_style));
+    spans.push(Span::styled("-", ts.sep));
     for i in col_start..col_end {
         if i > col_start {
-            spans.push(Span::styled("-+-", sep_style));
+            spans.push(Span::styled("-+-", ts.sep));
         }
         let w = col_widths.get(i).copied().unwrap_or(8);
-        spans.push(Span::styled("-".repeat(w), sep_style));
+        spans.push(Span::styled("-".repeat(w), ts.sep));
     }
 
     let used: usize = spans.iter().map(|s| s.width()).sum();
     if used < inner_width {
-        spans.push(Span::styled(" ".repeat(inner_width - used), bg_style));
+        spans.push(Span::styled(" ".repeat(inner_width - used), ts.bg));
     }
     spans
 }

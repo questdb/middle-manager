@@ -3465,7 +3465,7 @@ impl App {
         // Try parquet viewer for .parquet files
         if path
             .extension()
-            .map_or(false, |ext| ext.eq_ignore_ascii_case("parquet"))
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
         {
             if let Ok(pq) = ParquetViewerState::open(path.clone()) {
                 self.mode = AppMode::ParquetViewing(Box::new(pq));
