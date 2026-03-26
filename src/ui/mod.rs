@@ -9,6 +9,7 @@ pub mod header;
 pub mod help_dialog;
 pub mod hex_view;
 pub mod mkdir_dialog;
+pub mod parquet_view;
 pub mod panel_view;
 pub mod search_dialog;
 pub mod search_results_view;
@@ -124,6 +125,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
     match &app.mode {
         AppMode::Viewing(_) => render_viewer(frame, app),
         AppMode::HexViewing(_) => render_hex_viewer(frame, app),
+        AppMode::ParquetViewing(_) => render_parquet_viewer(frame, app),
         AppMode::Editing(_) => render_editor(frame, app),
         _ => render_normal(frame, app),
     }
@@ -298,6 +300,12 @@ fn render_viewer(frame: &mut Frame, app: &mut App) {
 fn render_hex_viewer(frame: &mut Frame, app: &mut App) {
     if let AppMode::HexViewing(ref mut hex) = app.mode {
         hex_view::render(frame, frame.area(), hex);
+    }
+}
+
+fn render_parquet_viewer(frame: &mut Frame, app: &mut App) {
+    if let AppMode::ParquetViewing(ref mut pq) = app.mode {
+        parquet_view::render(frame, frame.area(), pq);
     }
 }
 

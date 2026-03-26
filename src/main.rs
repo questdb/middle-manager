@@ -6,6 +6,7 @@ mod event;
 mod file_search;
 mod fs_ops;
 mod hex_viewer;
+mod parquet_viewer;
 mod panel;
 mod state;
 mod syntax;
