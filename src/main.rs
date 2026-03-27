@@ -6,8 +6,8 @@ mod event;
 mod file_search;
 mod fs_ops;
 mod hex_viewer;
-mod parquet_viewer;
 mod panel;
+mod parquet_viewer;
 mod state;
 mod syntax;
 mod terminal;
@@ -15,6 +15,7 @@ mod text_input;
 mod theme;
 mod ui;
 mod viewer;
+mod vt;
 mod watcher;
 
 use std::io;
