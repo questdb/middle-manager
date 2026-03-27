@@ -98,8 +98,7 @@ pub struct ParquetViewerState {
 impl ParquetViewerState {
     pub fn open(path: PathBuf) -> Result<Self, String> {
         let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-        let mut file =
-            File::open(&path).map_err(|e| format!("Cannot open file: {}", e))?;
+        let mut file = File::open(&path).map_err(|e| format!("Cannot open file: {}", e))?;
         let metadata = read::read_metadata(&mut file)
             .map_err(|e| format!("Not a valid Parquet file: {}", e))?;
 
@@ -112,8 +111,7 @@ impl ParquetViewerState {
             .collect();
         let table_column_widths: Vec<usize> =
             table_columns.iter().map(|n| n.len().max(8)).collect();
-        let table_total_rows: usize =
-            metadata.row_groups.iter().map(|rg| rg.num_rows()).sum();
+        let table_total_rows: usize = metadata.row_groups.iter().map(|rg| rg.num_rows()).sum();
 
         let mut state = Self {
             path,
@@ -229,7 +227,10 @@ impl ParquetViewerState {
 
     pub fn scroll_right(&mut self) {
         if self.view_mode == ViewMode::Table {
-            let max_col = self.table_columns.len().saturating_sub(self.table_visible_cols);
+            let max_col = self
+                .table_columns
+                .len()
+                .saturating_sub(self.table_visible_cols);
             self.table_scroll_col = (self.table_scroll_col + 1).min(max_col);
         } else {
             self.expand();
@@ -339,12 +340,15 @@ impl ParquetViewerState {
         if self.tree_cursor < self.tree_scroll {
             self.tree_scroll = self.tree_cursor;
         } else if self.tree_cursor >= self.tree_scroll + self.tree_visible {
-            self.tree_scroll = self.tree_cursor.saturating_sub(self.tree_visible.saturating_sub(1));
+            self.tree_scroll = self
+                .tree_cursor
+                .saturating_sub(self.tree_visible.saturating_sub(1));
         }
     }
 
     fn table_max_scroll(&self) -> usize {
-        self.table_total_rows.saturating_sub(self.table_visible_rows)
+        self.table_total_rows
+            .saturating_sub(self.table_visible_rows)
     }
 
     fn ensure_table_data(&mut self) {
@@ -366,9 +370,7 @@ impl ParquetViewerState {
     }
 
     fn load_table_row_group(&mut self, rg_idx: usize) {
-        let offset: usize = self
-            .metadata
-            .row_groups[..rg_idx]
+        let offset: usize = self.metadata.row_groups[..rg_idx]
             .iter()
             .map(|rg| rg.num_rows())
             .sum();
@@ -384,7 +386,12 @@ impl ParquetViewerState {
         // Update column widths
         for (col_idx, col_data) in columns.iter().enumerate() {
             if col_idx < self.table_column_widths.len() {
-                let max_w = col_data.iter().take(100).map(|v| v.len()).max().unwrap_or(0);
+                let max_w = col_data
+                    .iter()
+                    .take(100)
+                    .map(|v| v.len())
+                    .max()
+                    .unwrap_or(0);
                 self.table_column_widths[col_idx] =
                     self.table_column_widths[col_idx].max(max_w).min(40);
             }
@@ -413,13 +420,10 @@ impl ParquetViewerState {
         // reuses the same buffer without reallocating.
         self.tree_items.clear();
 
-        let fname = self
-            .path
-            .file_name()
-            .unwrap_or_default()
-            .to_string_lossy();
+        let fname = self.path.file_name().unwrap_or_default().to_string_lossy();
         let root_expanded = self.expanded.contains(&NodeId::Root);
-        push_item(&mut self.tree_items,
+        push_item(
+            &mut self.tree_items,
             0,
             format!(
                 "{} ({} rows, {})",
@@ -437,7 +441,8 @@ impl ParquetViewerState {
         }
 
         // File properties
-        push_item(&mut self.tree_items,
+        push_item(
+            &mut self.tree_items,
             1,
             format!("Version: {}", self.metadata.version),
             ItemKind::Property,
@@ -445,7 +450,8 @@ impl ParquetViewerState {
             None,
         );
         if let Some(ref created_by) = self.metadata.created_by {
-            push_item(&mut self.tree_items,
+            push_item(
+                &mut self.tree_items,
                 1,
                 format!("Created by: {}", created_by),
                 ItemKind::Property,
@@ -453,7 +459,8 @@ impl ParquetViewerState {
                 None,
             );
         }
-        push_item(&mut self.tree_items,
+        push_item(
+            &mut self.tree_items,
             1,
             format!("Row groups: {}", self.metadata.row_groups.len()),
             ItemKind::Property,
@@ -465,7 +472,8 @@ impl ParquetViewerState {
         if let Some(ref kv) = self.metadata.key_value_metadata {
             if !kv.is_empty() {
                 let kv_expanded = self.expanded.contains(&NodeId::KvMetadata);
-                push_item(&mut self.tree_items,
+                push_item(
+                    &mut self.tree_items,
                     1,
                     format!("Key-Value Metadata ({} entries)", kv.len()),
                     ItemKind::Header,
@@ -475,7 +483,8 @@ impl ParquetViewerState {
                 if kv_expanded {
                     for entry in kv.iter() {
                         let value = entry.value.as_deref().unwrap_or("<null>");
-                        push_item(&mut self.tree_items,
+                        push_item(
+                            &mut self.tree_items,
                             2,
                             format!("{} = {}", entry.key, truncate(value, 80)),
                             ItemKind::Property,
@@ -490,7 +499,8 @@ impl ParquetViewerState {
         // Schema
         let schema_expanded = self.expanded.contains(&NodeId::Schema);
         let num_cols = self.metadata.schema_descr.columns().len();
-        push_item(&mut self.tree_items,
+        push_item(
+            &mut self.tree_items,
             1,
             format!("Schema ({} columns)", num_cols),
             ItemKind::Header,
@@ -508,7 +518,8 @@ impl ParquetViewerState {
                     .map(|lt| format!(" / {}", format_logical_type(lt)))
                     .unwrap_or_default();
                 let rep = format!("{:?}", pt.field_info.repetition).to_lowercase();
-                push_item(&mut self.tree_items,
+                push_item(
+                    &mut self.tree_items,
                     2,
                     format!("{:<24} {}{:<20} ({})", name, phys, logical, rep),
                     ItemKind::SchemaField,
@@ -524,7 +535,8 @@ impl ParquetViewerState {
         for rg_idx in 0..num_row_groups {
             let rg = &self.metadata.row_groups[rg_idx];
             let rg_expanded = self.expanded.contains(&NodeId::RowGroup(rg_idx));
-            push_item(&mut self.tree_items,
+            push_item(
+                &mut self.tree_items,
                 1,
                 format!(
                     "Row Group {} ({} rows, {} compressed)",
@@ -543,7 +555,8 @@ impl ParquetViewerState {
 
             // Columns sub-section
             let cols_expanded = self.expanded.contains(&NodeId::RowGroupColumns(rg_idx));
-            push_item(&mut self.tree_items,
+            push_item(
+                &mut self.tree_items,
                 2,
                 format!("Columns ({})", rg.columns().len()),
                 ItemKind::Header,
@@ -557,7 +570,8 @@ impl ParquetViewerState {
                     let compression = format!("{:?}", col_meta.compression());
                     let uncompressed = format_size(col_meta.uncompressed_size() as u64);
                     let compressed = format_size(col_meta.compressed_size() as u64);
-                    push_item(&mut self.tree_items,
+                    push_item(
+                        &mut self.tree_items,
                         3,
                         format!(
                             "{:<24} {:<12} {} -> {}",
@@ -572,7 +586,8 @@ impl ParquetViewerState {
 
             // Data preview sub-section
             let data_expanded = self.expanded.contains(&NodeId::RowGroupData(rg_idx));
-            push_item(&mut self.tree_items,
+            push_item(
+                &mut self.tree_items,
                 2,
                 "Data Preview".to_string(),
                 ItemKind::DataHeader,
@@ -593,7 +608,14 @@ impl ParquetViewerState {
                         })
                         .collect::<Vec<_>>()
                         .join(" | ");
-                    push_item(&mut self.tree_items,3, header, ItemKind::DataHeader, false, None);
+                    push_item(
+                        &mut self.tree_items,
+                        3,
+                        header,
+                        ItemKind::DataHeader,
+                        false,
+                        None,
+                    );
 
                     // Separator
                     let sep: String = preview
@@ -602,7 +624,14 @@ impl ParquetViewerState {
                         .map(|&w| "-".repeat(w))
                         .collect::<Vec<_>>()
                         .join("-+-");
-                    push_item(&mut self.tree_items,3, sep, ItemKind::DataHeader, false, None);
+                    push_item(
+                        &mut self.tree_items,
+                        3,
+                        sep,
+                        ItemKind::DataHeader,
+                        false,
+                        None,
+                    );
 
                     // Data rows
                     for row in &preview.rows {
@@ -610,16 +639,23 @@ impl ParquetViewerState {
                             .iter()
                             .enumerate()
                             .map(|(i, val)| {
-                                let w =
-                                    preview.column_widths.get(i).copied().unwrap_or(8);
+                                let w = preview.column_widths.get(i).copied().unwrap_or(8);
                                 format!("{:<w$}", truncate(val, w), w = w)
                             })
                             .collect::<Vec<_>>()
                             .join(" | ");
-                        push_item(&mut self.tree_items,3, line, ItemKind::DataCell, false, None);
+                        push_item(
+                            &mut self.tree_items,
+                            3,
+                            line,
+                            ItemKind::DataCell,
+                            false,
+                            None,
+                        );
                     }
                 } else {
-                    push_item(&mut self.tree_items,
+                    push_item(
+                        &mut self.tree_items,
                         3,
                         "<loading failed>".to_string(),
                         ItemKind::Error,
@@ -650,11 +686,8 @@ impl ParquetViewerState {
         };
 
         // Compute column widths
-        let mut col_widths: Vec<usize> = self
-            .table_columns
-            .iter()
-            .map(|n| n.len().max(4))
-            .collect();
+        let mut col_widths: Vec<usize> =
+            self.table_columns.iter().map(|n| n.len().max(4)).collect();
         for (ci, col_data) in columns.iter().enumerate() {
             if ci < col_widths.len() {
                 let max_w = col_data.iter().map(|v| v.len()).max().unwrap_or(0);
@@ -837,10 +870,7 @@ fn decode_def_levels(buf: &[u8], num_values: usize, max_def_level: i16) -> Vec<u
     }
     let bit_width = bit_width_for(max_def_level as u32);
     match HybridRleDecoder::try_new(buf, bit_width, num_values) {
-        Ok(decoder) => decoder
-            .into_iter()
-            .map(|r| r.unwrap_or(0))
-            .collect(),
+        Ok(decoder) => decoder.into_iter().map(|r| r.unwrap_or(0)).collect(),
         Err(_) => vec![max_def_level as u32; num_values],
     }
 }
@@ -1088,7 +1118,10 @@ fn decode_plain_byte_array(
             } else {
                 result.push(format!(
                     "{}... ({} bytes)",
-                    bytes[..8].iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+                    bytes[..8]
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<String>(),
                     bytes.len()
                 ));
             }
@@ -1143,15 +1176,9 @@ fn format_i64(val: i64, logical_type: Option<&PrimitiveLogicalType>) -> String {
     match logical_type {
         Some(PrimitiveLogicalType::Timestamp { unit, .. }) => {
             let (secs, nanos) = match unit {
-                TimeUnit::Milliseconds => {
-                    (val / 1000, ((val % 1000) * 1_000_000) as u32)
-                }
-                TimeUnit::Microseconds => {
-                    (val / 1_000_000, ((val % 1_000_000) * 1000) as u32)
-                }
-                TimeUnit::Nanoseconds => {
-                    (val / 1_000_000_000, (val % 1_000_000_000) as u32)
-                }
+                TimeUnit::Milliseconds => (val / 1000, ((val % 1000) * 1_000_000) as u32),
+                TimeUnit::Microseconds => (val / 1_000_000, ((val % 1_000_000) * 1000) as u32),
+                TimeUnit::Nanoseconds => (val / 1_000_000_000, (val % 1_000_000_000) as u32),
             };
             format_timestamp_secs(secs, nanos)
         }

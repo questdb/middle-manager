@@ -21,10 +21,10 @@ use crate::file_search::SearchState;
 use crate::fs_ops;
 use crate::fs_ops::archive::ArchiveFormat;
 use crate::hex_viewer::HexViewerState;
-use crate::parquet_viewer::ParquetViewerState;
 use crate::panel::git::GitCache;
 use crate::panel::sort::SortField;
 use crate::panel::Panel;
+use crate::parquet_viewer::ParquetViewerState;
 use crate::state::AppState;
 use crate::terminal::TerminalPanel;
 use crate::text_input::TextInput;
@@ -781,7 +781,12 @@ pub struct ArchiveDialogState {
 }
 
 impl ArchiveDialogState {
-    pub fn new(source_name: String, source_paths: Vec<PathBuf>, dest_dir: String, format: ArchiveFormat) -> Self {
+    pub fn new(
+        source_name: String,
+        source_paths: Vec<PathBuf>,
+        dest_dir: String,
+        format: ArchiveFormat,
+    ) -> Self {
         let suggested = fs_ops::archive::suggest_archive_name(&source_paths, format);
         Self {
             source_paths,
@@ -1775,24 +1780,16 @@ impl App {
             {
                 Action::EditorRedo
             }
-            KeyCode::Char('z')
-                if on_input && key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Char('z') if on_input && key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::EditorUndo
             }
-            KeyCode::Char('x')
-                if on_input && key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Char('x') if on_input && key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::EditorDeleteLine
             }
-            KeyCode::Char('a')
-                if on_input && key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Char('a') if on_input && key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::SelectAll
             }
-            KeyCode::Char('c')
-                if on_input && key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
+            KeyCode::Char('c') if on_input && key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::CopySelection
             }
             KeyCode::Char(c) if on_input => Action::DialogInput(c),
@@ -4614,8 +4611,7 @@ impl App {
         if !dest.ends_with('/') {
             dest.push('/');
         }
-        let mut dlg =
-            ArchiveDialogState::new(display_name, paths, dest, ArchiveFormat::TarZst);
+        let mut dlg = ArchiveDialogState::new(display_name, paths, dest, ArchiveFormat::TarZst);
         dlg.archive_name.select_all();
         self.mode = AppMode::ArchiveDialog(dlg);
     }
@@ -4861,10 +4857,10 @@ impl App {
                 state.archive_name.clear_selection();
                 state.destination.clear_selection();
                 state.focused = match y_off {
-                    0..=4 => ArchiveDialogField::ArchiveName,   // y1=label, y2=label, y3=input
-                    5..=7 => ArchiveDialogField::Destination,   // y5=label, y6=input
-                    8..=9 => ArchiveDialogField::Format,        // y8=sep, y9=format
-                    _ => ArchiveDialogField::ButtonArchive,     // y10=sep, y11=buttons
+                    0..=4 => ArchiveDialogField::ArchiveName, // y1=label, y2=label, y3=input
+                    5..=7 => ArchiveDialogField::Destination, // y5=label, y6=input
+                    8..=9 => ArchiveDialogField::Format,      // y8=sep, y9=format
+                    _ => ArchiveDialogField::ButtonArchive,   // y10=sep, y11=buttons
                 };
                 match state.focused {
                     ArchiveDialogField::ArchiveName => state.archive_name.select_all(),

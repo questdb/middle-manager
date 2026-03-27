@@ -46,10 +46,7 @@ fn render_tree(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
     for i in 0..state.tree_visible {
         let idx = state.tree_scroll + i;
         if idx >= state.tree_items.len() {
-            lines.push(Line::from(Span::styled(
-                " ".repeat(inner_width),
-                bg_style,
-            )));
+            lines.push(Line::from(Span::styled(" ".repeat(inner_width), bg_style)));
             continue;
         }
 
@@ -114,11 +111,7 @@ fn render_tree(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
         if used < inner_width {
             spans.push(Span::styled(
                 " ".repeat(inner_width - used),
-                if is_cursor {
-                    style
-                } else {
-                    bg_style
-                },
+                if is_cursor { style } else { bg_style },
             ));
         }
 
@@ -221,22 +214,13 @@ fn render_table(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
     for i in 0..state.table_visible_rows {
         let global_row = state.table_scroll_row + i;
         if global_row >= state.table_total_rows {
-            lines.push(Line::from(Span::styled(
-                " ".repeat(inner_width),
-                bg_style,
-            )));
+            lines.push(Line::from(Span::styled(" ".repeat(inner_width), bg_style)));
             continue;
         }
 
         if let Some(row) = state.table_row(global_row) {
-            let row_spans = build_data_row_spans(
-                row,
-                col_widths,
-                col_start,
-                visible_end,
-                inner_width,
-                &ts,
-            );
+            let row_spans =
+                build_data_row_spans(row, col_widths, col_start, visible_end, inner_width, &ts);
             lines.push(Line::from(row_spans));
         } else {
             // Row not loaded

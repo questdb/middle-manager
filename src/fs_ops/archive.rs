@@ -46,7 +46,6 @@ impl ArchiveFormat {
             Self::Zip => Self::TarZst,
         }
     }
-
 }
 
 // ---------------------------------------------------------------------------
@@ -135,7 +134,9 @@ fn dominant_extension(paths: &[PathBuf]) -> Option<String> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for p in paths {
         if let Some(ext) = p.extension() {
-            *counts.entry(ext.to_string_lossy().to_lowercase()).or_default() += 1;
+            *counts
+                .entry(ext.to_string_lossy().to_lowercase())
+                .or_default() += 1;
         }
     }
     counts
@@ -269,7 +270,11 @@ fn create_tar(
             return Ok(());
         }
         // Skip symlinks at top level too
-        if path.symlink_metadata().map(|m| m.is_symlink()).unwrap_or(false) {
+        if path
+            .symlink_metadata()
+            .map(|m| m.is_symlink())
+            .unwrap_or(false)
+        {
             continue;
         }
         let rel = path.strip_prefix(base_dir).unwrap_or(path);
@@ -310,7 +315,11 @@ fn append_dir_recursive<W: Write>(
         }
         let path = entry.path();
         // Skip symlinks to prevent infinite loops
-        if path.symlink_metadata().map(|m| m.is_symlink()).unwrap_or(false) {
+        if path
+            .symlink_metadata()
+            .map(|m| m.is_symlink())
+            .unwrap_or(false)
+        {
             continue;
         }
         let rel = rel_base.join(entry.file_name());
@@ -346,7 +355,11 @@ fn create_zip(
             return Ok(());
         }
         // Skip symlinks at top level too
-        if path.symlink_metadata().map(|m| m.is_symlink()).unwrap_or(false) {
+        if path
+            .symlink_metadata()
+            .map(|m| m.is_symlink())
+            .unwrap_or(false)
+        {
             continue;
         }
         let rel = path.strip_prefix(base_dir).unwrap_or(path);
@@ -378,9 +391,7 @@ fn zip_dir_recursive<W: Write + io::Seek>(
     zip.add_directory(&dir_name, options)
         .with_context(|| format!("Failed to add directory {:?}", dir))?;
 
-    let mut entries: Vec<_> = std::fs::read_dir(dir)?
-        .filter_map(|e| e.ok())
-        .collect();
+    let mut entries: Vec<_> = std::fs::read_dir(dir)?.filter_map(|e| e.ok()).collect();
     entries.sort_by_key(|e| e.file_name());
 
     for entry in entries {
@@ -389,7 +400,11 @@ fn zip_dir_recursive<W: Write + io::Seek>(
         }
         let path = entry.path();
         // Skip symlinks to prevent infinite loops
-        if path.symlink_metadata().map(|m| m.is_symlink()).unwrap_or(false) {
+        if path
+            .symlink_metadata()
+            .map(|m| m.is_symlink())
+            .unwrap_or(false)
+        {
             continue;
         }
         let rel = rel_base.join(entry.file_name());

@@ -44,7 +44,11 @@ pub fn render(frame: &mut Frame, state: &ArchiveDialogState) -> Rect {
 
     // y=3: archive name TextInput
     let name_focused = state.focused == ArchiveDialogField::ArchiveName;
-    let name_style = if name_focused { highlight } else { input_normal };
+    let name_style = if name_focused {
+        highlight
+    } else {
+        input_normal
+    };
     dh::render_text_input(
         frame,
         layout.content,
@@ -68,7 +72,11 @@ pub fn render(frame: &mut Frame, state: &ArchiveDialogState) -> Rect {
 
     // y=6: destination TextInput
     let dest_focused = state.focused == ArchiveDialogField::Destination;
-    let dest_style = if dest_focused { highlight } else { input_normal };
+    let dest_style = if dest_focused {
+        highlight
+    } else {
+        input_normal
+    };
     dh::render_text_input(
         frame,
         layout.content,
@@ -91,9 +99,7 @@ pub fn render(frame: &mut Frame, state: &ArchiveDialogState) -> Rect {
     let fmt_focused = state.focused == ArchiveDialogField::Format;
     let fmt_label = state.format.label();
     let fmt_prefix = "Format: ";
-    let fmt_pad = layout
-        .cw
-        .saturating_sub(fmt_prefix.len() + fmt_label.len());
+    let fmt_pad = layout.cw.saturating_sub(fmt_prefix.len() + fmt_label.len());
     dh::render_line(
         frame,
         layout.content,
