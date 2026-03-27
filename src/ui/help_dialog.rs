@@ -38,6 +38,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("F6", "Move file/selection"),
             ("Shift+F6", "Rename"),
             ("F7", "Create directory"),
+            ("Shift+F5", "Create archive (tar.zst/gz/xz/zip)"),
             ("F8", "Delete file/selection"),
             ("F9", "Cycle sort (name/size/date)"),
         ],

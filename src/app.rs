@@ -11,11 +11,15 @@ const SPLIT_MIN_PCT: u16 = 20;
 const SPLIT_MAX_PCT: u16 = 80;
 const SPLIT_DEFAULT_PCT: u16 = 60;
 
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+
 use crate::action::Action;
 use crate::ci::CiPanel;
 use crate::editor::EditorState;
 use crate::file_search::SearchState;
 use crate::fs_ops;
+use crate::fs_ops::archive::ArchiveFormat;
 use crate::hex_viewer::HexViewerState;
 use crate::parquet_viewer::ParquetViewerState;
 use crate::panel::git::GitCache;
@@ -109,6 +113,8 @@ pub struct App {
     pub dirty: bool,
     /// Content area of the currently rendered dialog (set during render, used for click detection).
     pub dialog_content_area: Option<Rect>,
+    /// Background archive progress (shown in status bar).
+    pub archive_progress: Option<ArchiveProgress>,
 }
 
 pub struct GotoPathState {
@@ -307,6 +313,7 @@ pub enum AppMode {
     Dialog(DialogState),
     MkdirDialog(MkdirDialogState),
     CopyDialog(CopyDialogState),
+    ArchiveDialog(ArchiveDialogState),
     Viewing(Box<ViewerState>),
     HexViewing(Box<HexViewerState>),
     ParquetViewing(Box<ParquetViewerState>),
@@ -729,6 +736,100 @@ impl CopyDialogField {
     }
 }
 
+// --- Archive dialog ---
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum ArchiveDialogField {
+    ArchiveName,
+    Destination,
+    Format,
+    ButtonArchive,
+    ButtonCancel,
+}
+
+impl ArchiveDialogField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::ArchiveName => Self::Destination,
+            Self::Destination => Self::Format,
+            Self::Format => Self::ButtonArchive,
+            Self::ButtonArchive => Self::ButtonCancel,
+            Self::ButtonCancel => Self::ArchiveName,
+        }
+    }
+    pub fn prev(self) -> Self {
+        match self {
+            Self::ArchiveName => Self::ButtonCancel,
+            Self::Destination => Self::ArchiveName,
+            Self::Format => Self::Destination,
+            Self::ButtonArchive => Self::Format,
+            Self::ButtonCancel => Self::ButtonArchive,
+        }
+    }
+    pub fn is_input(self) -> bool {
+        matches!(self, Self::ArchiveName | Self::Destination)
+    }
+}
+
+pub struct ArchiveDialogState {
+    pub source_paths: Vec<PathBuf>,
+    pub source_name: String,
+    pub archive_name: TextInput,
+    pub destination: TextInput,
+    pub format: ArchiveFormat,
+    pub focused: ArchiveDialogField,
+}
+
+impl ArchiveDialogState {
+    pub fn new(source_name: String, source_paths: Vec<PathBuf>, dest_dir: String, format: ArchiveFormat) -> Self {
+        let suggested = fs_ops::archive::suggest_archive_name(&source_paths, format);
+        Self {
+            source_paths,
+            source_name,
+            archive_name: TextInput::new(suggested),
+            destination: TextInput::new(dest_dir),
+            format,
+            focused: ArchiveDialogField::ArchiveName,
+        }
+    }
+
+    pub fn active_input(&mut self) -> Option<&mut TextInput> {
+        match self.focused {
+            ArchiveDialogField::ArchiveName => Some(&mut self.archive_name),
+            ArchiveDialogField::Destination => Some(&mut self.destination),
+            _ => None,
+        }
+    }
+
+    /// Update the archive name extension when format changes.
+    pub fn update_name_extension(&mut self) {
+        let name = &self.archive_name.text;
+        // Strip any existing archive extension
+        let base = strip_archive_extension(name);
+        let new_name = format!("{}{}", base, self.format.extension());
+        self.archive_name = TextInput::new(new_name);
+        self.archive_name.select_all();
+    }
+}
+
+fn strip_archive_extension(name: &str) -> &str {
+    for ext in &[".tar.zst", ".tar.gz", ".tar.xz", ".zip"] {
+        if let Some(base) = name.strip_suffix(ext) {
+            return base;
+        }
+    }
+    // Try stripping just a single extension
+    name.rsplit_once('.').map(|(base, _)| base).unwrap_or(name)
+}
+
+pub struct ArchiveProgress {
+    pub total_bytes: u64,
+    pub done_bytes: Arc<AtomicU64>,
+    pub finished: Arc<AtomicBool>,
+    pub error: Arc<Mutex<Option<String>>>,
+    pub output_path: PathBuf,
+}
+
 // ============================================================
 // App implementation
 // ============================================================
@@ -809,6 +910,7 @@ impl App {
             last_cursor_pos: None,
             dirty: true,
             dialog_content_area: None,
+            archive_progress: None,
         }
     }
 
@@ -1322,6 +1424,7 @@ impl App {
             AppMode::Dialog(state) => Self::map_dialog_key(key, state.focused, state.has_input),
             AppMode::MkdirDialog(state) => Self::map_mkdir_dialog_key(key, state.focused),
             AppMode::CopyDialog(state) => Self::map_copy_dialog_key(key, state.focused),
+            AppMode::ArchiveDialog(state) => Self::map_archive_dialog_key(key, state.focused),
             AppMode::Viewing(_) | AppMode::HexViewing(_) => self.map_viewer_key(key),
             AppMode::ParquetViewing(_) => self.map_parquet_key(key),
             AppMode::Editing(_) => Self::map_editor_key(key),
@@ -1352,7 +1455,13 @@ impl App {
                     Action::EditBuiltin
                 }
             }
-            KeyCode::F(5) => Action::Copy,
+            KeyCode::F(5) => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    Action::Archive
+                } else {
+                    Action::Copy
+                }
+            }
             KeyCode::F(6) => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     Action::Rename
@@ -1638,6 +1747,73 @@ impl App {
             KeyCode::Right if focused == CopyDialogField::Destination => Action::CursorRight,
             KeyCode::Home if focused == CopyDialogField::Destination => Action::CursorLineStart,
             KeyCode::End if focused == CopyDialogField::Destination => Action::CursorLineEnd,
+            _ => Action::None,
+        }
+    }
+
+    fn map_archive_dialog_key(key: KeyEvent, focused: ArchiveDialogField) -> Action {
+        let on_buttons = matches!(
+            focused,
+            ArchiveDialogField::ButtonArchive | ArchiveDialogField::ButtonCancel
+        );
+        let on_input = focused.is_input();
+        match key.code {
+            KeyCode::Esc => Action::DialogCancel,
+            KeyCode::Enter => Action::DialogConfirm,
+            KeyCode::Tab => Action::MoveDown,
+            KeyCode::BackTab => Action::MoveUp,
+            KeyCode::Up => Action::MoveUp,
+            KeyCode::Down if on_buttons => Action::None,
+            KeyCode::Down => Action::MoveDown,
+            KeyCode::Left if on_buttons => Action::SwitchPanel,
+            KeyCode::Right if on_buttons => Action::SwitchPanel,
+            KeyCode::Char(' ') if focused == ArchiveDialogField::Format => Action::Toggle,
+            KeyCode::Char('z')
+                if on_input
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::EditorRedo
+            }
+            KeyCode::Char('z')
+                if on_input && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::EditorUndo
+            }
+            KeyCode::Char('x')
+                if on_input && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::EditorDeleteLine
+            }
+            KeyCode::Char('a')
+                if on_input && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::SelectAll
+            }
+            KeyCode::Char('c')
+                if on_input && key.modifiers.contains(KeyModifiers::CONTROL) =>
+            {
+                Action::CopySelection
+            }
+            KeyCode::Char(c) if on_input => Action::DialogInput(c),
+            KeyCode::Backspace if on_input => Action::DialogBackspace,
+            KeyCode::Delete if on_input => Action::EditorDeleteForward,
+            KeyCode::Left if on_input && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Action::SelectLeft
+            }
+            KeyCode::Right if on_input && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Action::SelectRight
+            }
+            KeyCode::Home if on_input && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Action::SelectLineStart
+            }
+            KeyCode::End if on_input && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Action::SelectLineEnd
+            }
+            KeyCode::Left if on_input => Action::CursorLeft,
+            KeyCode::Right if on_input => Action::CursorRight,
+            KeyCode::Home if on_input => Action::CursorLineStart,
+            KeyCode::End if on_input => Action::CursorLineEnd,
             _ => Action::None,
         }
     }
@@ -1998,6 +2174,10 @@ impl App {
             self.handle_copy_dialog_action(action);
             return;
         }
+        if matches!(self.mode, AppMode::ArchiveDialog(_)) {
+            self.handle_archive_dialog_action(action);
+            return;
+        }
         if matches!(self.mode, AppMode::Editing(_)) {
             self.handle_editor_action(action);
             return;
@@ -2031,7 +2211,8 @@ impl App {
                         .as_ref()
                         .map(|s| s.searching)
                         .unwrap_or(false)
-                    || self.git_cache.has_pending();
+                    || self.git_cache.has_pending()
+                    || self.archive_progress.is_some();
                 if has_active_async {
                     self.dirty = true;
                 }
@@ -2097,6 +2278,29 @@ impl App {
                 if let Some(ref w) = self.dir_watcher {
                     if w.has_changes() {
                         self.reload_panels();
+                    }
+                }
+                // Poll archive progress
+                if let Some(ref progress) = self.archive_progress {
+                    if progress.finished.load(Ordering::Acquire) {
+                        let err = progress.error.lock().unwrap().take();
+                        if let Some(e) = err {
+                            self.status_message = Some(format!("Archive error: {}", e));
+                        } else {
+                            let name = progress
+                                .output_path
+                                .file_name()
+                                .map(|n| n.to_string_lossy().into_owned())
+                                .unwrap_or_default();
+                            self.status_message = Some(format!("Created {}", name));
+                        }
+                        self.archive_progress = None;
+                        self.reload_panels();
+                    } else {
+                        let done = progress.done_bytes.load(Ordering::Relaxed);
+                        let total = progress.total_bytes.max(1);
+                        let pct = (done as f64 / total as f64 * 100.0) as u8;
+                        self.status_message = Some(format!("Archiving... {}%", pct));
                     }
                 }
             }
@@ -2170,6 +2374,7 @@ impl App {
 
             // File operations
             Action::Copy => self.handle_copy(),
+            Action::Archive => self.handle_archive(),
             Action::Move => self.handle_move(),
             Action::Rename => self.handle_rename(),
             Action::CreateDir => self.handle_create_dir(),
@@ -4386,6 +4591,178 @@ impl App {
         self.reload_panels();
     }
 
+    // --- Archive handlers ---
+
+    fn handle_archive(&mut self) {
+        let paths = self.active_panel().effective_selection_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let display_name = if paths.len() == 1 {
+            paths[0]
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            format!("{} items", paths.len())
+        };
+        let mut dest = self
+            .active_panel()
+            .current_dir
+            .to_string_lossy()
+            .to_string();
+        if !dest.ends_with('/') {
+            dest.push('/');
+        }
+        let mut dlg =
+            ArchiveDialogState::new(display_name, paths, dest, ArchiveFormat::TarZst);
+        dlg.archive_name.select_all();
+        self.mode = AppMode::ArchiveDialog(dlg);
+    }
+
+    fn handle_archive_dialog_action(&mut self, action: Action) {
+        match action {
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
+            Action::Quit => self.should_quit = true,
+            Action::DialogCancel => {
+                self.mode = AppMode::Normal;
+            }
+            Action::DialogConfirm => {
+                let is_cancel = matches!(
+                    self.mode,
+                    AppMode::ArchiveDialog(ArchiveDialogState {
+                        focused: ArchiveDialogField::ButtonCancel,
+                        ..
+                    })
+                );
+                if is_cancel {
+                    self.mode = AppMode::Normal;
+                } else {
+                    self.confirm_archive_dialog();
+                }
+            }
+            Action::MoveUp => {
+                if let AppMode::ArchiveDialog(ref mut state) = self.mode {
+                    state.archive_name.clear_selection();
+                    state.destination.clear_selection();
+                    state.focused = state.focused.prev();
+                    match state.focused {
+                        ArchiveDialogField::ArchiveName => state.archive_name.select_all(),
+                        ArchiveDialogField::Destination => state.destination.select_all(),
+                        _ => {}
+                    }
+                }
+            }
+            Action::MoveDown => {
+                if let AppMode::ArchiveDialog(ref mut state) = self.mode {
+                    state.archive_name.clear_selection();
+                    state.destination.clear_selection();
+                    state.focused = state.focused.next();
+                    match state.focused {
+                        ArchiveDialogField::ArchiveName => state.archive_name.select_all(),
+                        ArchiveDialogField::Destination => state.destination.select_all(),
+                        _ => {}
+                    }
+                }
+            }
+            Action::Toggle => {
+                if let AppMode::ArchiveDialog(ref mut state) = self.mode {
+                    if state.focused == ArchiveDialogField::Format {
+                        state.format = state.format.next();
+                        state.update_name_extension();
+                    }
+                }
+            }
+            Action::SwitchPanel | Action::SwitchPanelReverse => {
+                if let AppMode::ArchiveDialog(ref mut state) = self.mode {
+                    state.focused = match state.focused {
+                        ArchiveDialogField::ButtonArchive => ArchiveDialogField::ButtonCancel,
+                        ArchiveDialogField::ButtonCancel => ArchiveDialogField::ButtonArchive,
+                        other => other,
+                    };
+                }
+            }
+            Action::MouseClick(col, row) => self.handle_dialog_click_at(col, row),
+            _ => {
+                if let AppMode::ArchiveDialog(ref mut state) = self.mode {
+                    if let Some(input) = state.active_input() {
+                        input.handle_action(&action);
+                    }
+                }
+            }
+        }
+    }
+
+    fn confirm_archive_dialog(&mut self) {
+        let (paths, archive_name, dest_dir, format) = {
+            let state = match &self.mode {
+                AppMode::ArchiveDialog(s) => s,
+                _ => return,
+            };
+            if state.source_paths.is_empty() {
+                self.mode = AppMode::Normal;
+                return;
+            }
+            (
+                state.source_paths.clone(),
+                state.archive_name.text.clone(),
+                state.destination.text.clone(),
+                state.format,
+            )
+        };
+
+        let dest_path = PathBuf::from(&dest_dir);
+        let output_path = dest_path.join(&archive_name);
+
+        // Check if file already exists — auto-resolve collision
+        let final_path = if output_path.exists() {
+            let ext = format.extension();
+            let base = strip_archive_extension(&archive_name);
+            let resolved = fs_ops::archive::resolve_collision(&dest_path, base, ext);
+            dest_path.join(resolved)
+        } else {
+            output_path
+        };
+
+        let total_bytes = fs_ops::archive::compute_total_size(&paths);
+        let done_bytes = Arc::new(AtomicU64::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let progress = ArchiveProgress {
+            total_bytes,
+            done_bytes: Arc::clone(&done_bytes),
+            finished: Arc::clone(&finished),
+            error: Arc::clone(&error),
+            output_path: final_path.clone(),
+        };
+
+        // Spawn background thread
+        let done_bytes_t = Arc::clone(&done_bytes);
+        let finished_t = Arc::clone(&finished);
+        let error_t = Arc::clone(&error);
+        std::thread::spawn(move || {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                fs_ops::archive::create_archive(&paths, &final_path, format, done_bytes_t, cancel)
+            }));
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    *error_t.lock().unwrap() = Some(format!("{}", e));
+                }
+                Err(_) => {
+                    *error_t.lock().unwrap() = Some("Archive thread panicked".into());
+                }
+            }
+            finished_t.store(true, Ordering::Release);
+        });
+
+        self.archive_progress = Some(progress);
+        self.status_message = Some("Archiving...".into());
+        self.mode = AppMode::Normal;
+    }
+
     // --- Mouse handlers ---
 
     fn panel_at(&self, col: u16, row: u16) -> Option<usize> {
@@ -4478,6 +4855,21 @@ impl App {
                 if y_off <= 2 {
                     state.focused = CopyDialogField::Destination;
                     state.destination.select_all();
+                }
+            }
+            AppMode::ArchiveDialog(ref mut state) => {
+                state.archive_name.clear_selection();
+                state.destination.clear_selection();
+                state.focused = match y_off {
+                    0..=4 => ArchiveDialogField::ArchiveName,   // y1=label, y2=label, y3=input
+                    5..=7 => ArchiveDialogField::Destination,   // y5=label, y6=input
+                    8..=9 => ArchiveDialogField::Format,        // y8=sep, y9=format
+                    _ => ArchiveDialogField::ButtonArchive,     // y10=sep, y11=buttons
+                };
+                match state.focused {
+                    ArchiveDialogField::ArchiveName => state.archive_name.select_all(),
+                    ArchiveDialogField::Destination => state.destination.select_all(),
+                    _ => {}
                 }
             }
             _ => {}

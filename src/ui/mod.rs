@@ -1,3 +1,4 @@
+pub mod archive_dialog;
 pub mod ci_view;
 pub mod copy_dialog;
 pub mod dialog;
@@ -284,6 +285,7 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
         AppMode::Dialog(ref d) => Some(dialog::render(frame, d)),
         AppMode::MkdirDialog(ref s) => Some(mkdir_dialog::render(frame, s)),
         AppMode::CopyDialog(ref s) => Some(copy_dialog::render(frame, s)),
+        AppMode::ArchiveDialog(ref s) => Some(archive_dialog::render(frame, s)),
         _ => None,
     };
     if let Some(area) = dialog_area {
