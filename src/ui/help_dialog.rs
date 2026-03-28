@@ -118,6 +118,19 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Parquet Viewer",
+        &[
+            ("Up / Down", "Navigate tree / scroll table"),
+            ("Right / Enter", "Expand node"),
+            ("Left", "Collapse node / jump to parent"),
+            ("PageUp / PageDown", "Page through tree or table"),
+            ("Home / End", "Jump to top / bottom"),
+            ("Tab / F4", "Toggle tree / table view"),
+            ("g", "Go to row"),
+            ("q / Esc", "Close viewer"),
+        ],
+    ),
+    (
         "Editor",
         &[
             ("Arrow keys", "Move cursor"),
