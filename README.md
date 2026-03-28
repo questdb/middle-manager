@@ -4,7 +4,8 @@ A dual-panel file manager for the terminal, inspired by [Far Manager](https://ww
 
 Designed to handle **very large files** — the viewer, hex viewer, and editor all use sliding buffers and lazy scanning, so opening a 10 GB log file is instant.
 
-![Middle Manager screenshot](https://img.shields.io/badge/status-early%20development-orange)
+<img width="2051" height="1252" alt="image" src="https://github.com/user-attachments/assets/948abfb3-d7b2-49bc-9b4d-fa90397f7b7f" />
+
 
 ## Features
 
