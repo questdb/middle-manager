@@ -1,4 +1,4 @@
-# Middle Manager
+# Middle Manager TUI
 
 A dual-panel file manager for the terminal, inspired by [Far Manager](https://www.farmanager.com/) and Norton Commander. Built in Rust with [ratatui](https://ratatui.rs/).
 
