@@ -1,7 +1,7 @@
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::text::Span;
+use ratatui::widgets::{Block, Borders};
 use ratatui::Frame;
 
 use crate::terminal::TerminalPanel;
@@ -28,66 +28,55 @@ pub fn render(frame: &mut Frame, area: Rect, tp: &TerminalPanel, is_active: bool
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
+    // Write directly to ratatui's Buffer — no intermediate Lines/Spans/Paragraph.
+    // One pass: iterate vt screen rows → write cells to buffer positions.
     let screen = tp.screen();
-    let width = inner.width as u16;
-    let mut lines: Vec<Line> = Vec::with_capacity(inner.height as usize);
-    // Pre-allocate reusable buffers
-    let mut current_text = String::with_capacity(width as usize * 4);
-    let mut spans: Vec<Span> = Vec::with_capacity(width as usize);
+    let buf = frame.buffer_mut();
+    let width = inner.width as usize;
 
-    for row in 0..inner.height as u16 {
-        spans.clear();
-        current_text.clear();
-        let mut current_style = Style::default();
-        let mut first = true;
+    for screen_row in 0..inner.height {
+        let y = inner.y + screen_row;
+        let row_cells = screen.visible_row(screen_row);
 
-        for col in 0..width {
-            let cell = screen.cell(row, col);
+        for screen_col in 0..inner.width {
+            let x = inner.x + screen_col;
+            let col = screen_col as usize;
 
-            let style = match cell {
-                Some(cell) => vt100_cell_style(cell),
-                None => Style::default(),
+            let buf_cell = match buf.cell_mut((x, y)) {
+                Some(c) => c,
+                None => continue,
             };
 
-            if first {
-                current_style = style;
-                first = false;
-            }
+            let vt_cell = row_cells.and_then(|r| r.get(col));
 
-            if style != current_style {
-                if !current_text.is_empty() {
-                    // Clone text into span, keeping current_text's buffer for reuse
-                    spans.push(Span::styled(current_text.clone(), current_style));
-                    current_text.clear();
-                }
-                current_style = style;
-            }
-
-            match cell {
+            match vt_cell {
                 Some(cell) if cell.is_wide_continuation() => {
-                    // Second half of a wide character — skip (already rendered by first half)
+                    // ratatui handles wide chars via the first cell's width;
+                    // set continuation cell to empty so it doesn't overwrite.
+                    buf_cell.set_symbol("");
+                    buf_cell.set_style(cell_style(cell));
                 }
                 Some(cell) if cell.has_contents() => {
-                    current_text.push_str(cell.contents());
+                    buf_cell.set_symbol(cell.contents());
+                    buf_cell.set_style(cell_style(cell));
                 }
-                _ => current_text.push(' '),
+                Some(cell) => {
+                    buf_cell.set_symbol(" ");
+                    buf_cell.set_style(cell_style(cell));
+                }
+                None => {
+                    if col < width {
+                        buf_cell.set_symbol(" ");
+                        buf_cell.set_style(Style::default());
+                    }
+                }
             }
         }
-        if !current_text.is_empty() {
-            spans.push(Span::styled(current_text.clone(), current_style));
-            current_text.clear();
-        }
-        lines.push(Line::from(spans.clone()));
-        spans.clear();
     }
-
-    frame.render_widget(Paragraph::new(lines), inner);
 
     // Show hardware cursor only for terminals that want it (shells), not TUI apps (Claude Code)
     if is_active && tp.show_cursor {
-        let screen = tp.screen();
         let (cursor_row, cursor_col) = screen.cursor_position();
-        // Only show if not in scrollback (scrollback == 0 means live view)
         if screen.scrollback() == 0 {
             let x = inner.x + cursor_col;
             let y = inner.y + cursor_row;
@@ -98,7 +87,8 @@ pub fn render(frame: &mut Frame, area: Rect, tp: &TerminalPanel, is_active: bool
     }
 }
 
-fn vt100_cell_style(cell: &vt100::Cell) -> Style {
+#[inline]
+fn cell_style(cell: &crate::vt::Cell) -> Style {
     let mut mods = Modifier::empty();
     if cell.bold() {
         mods |= Modifier::BOLD;
@@ -117,15 +107,16 @@ fn vt100_cell_style(cell: &vt100::Cell) -> Style {
     }
 
     Style::default()
-        .fg(vt100_color(cell.fgcolor()))
-        .bg(vt100_color(cell.bgcolor()))
+        .fg(map_color(cell.fgcolor()))
+        .bg(map_color(cell.bgcolor()))
         .add_modifier(mods)
 }
 
-fn vt100_color(color: vt100::Color) -> Color {
+#[inline]
+fn map_color(color: crate::vt::Color) -> Color {
     match color {
-        vt100::Color::Default => Color::Reset,
-        vt100::Color::Idx(i) => Color::Indexed(i),
-        vt100::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+        crate::vt::Color::Default => Color::Reset,
+        crate::vt::Color::Idx(i) => Color::Indexed(i),
+        crate::vt::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
     }
 }

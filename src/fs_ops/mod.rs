@@ -1,3 +1,5 @@
+pub mod archive;
+
 use std::fs;
 use std::path::Path;
 

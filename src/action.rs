@@ -31,6 +31,7 @@ pub enum Action {
     Delete,
     ViewFile,
     EditFile,
+    Archive,
 
     // Sorting
     CycleSort,

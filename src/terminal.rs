@@ -8,9 +8,9 @@ use crate::event::WakeupSender;
 
 pub struct TerminalPanel {
     /// VT100 parser holding the terminal screen state.
-    parser: vt100::Parser,
+    parser: crate::vt::Parser,
     /// Channel receiving bytes from the PTY reader thread.
-    rx: mpsc::Receiver<Vec<u8>>,
+    rx: mpsc::Receiver<Box<[u8]>>,
     /// Writer to the PTY master (for forwarding keystrokes).
     writer: Box<dyn Write + Send>,
     /// Child process handle.
@@ -67,12 +67,14 @@ impl TerminalPanel {
         let (tx, rx) = mpsc::channel();
         let mut reader = pair.master.try_clone_reader()?;
         std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
+            let mut buf = [0u8; 16384];
             loop {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        if tx.send(buf[..n].to_vec()).is_err() {
+                        // Use Box<[u8]> instead of Vec to avoid capacity overhead
+                        let data = buf[..n].into();
+                        if tx.send(data).is_err() {
                             break;
                         }
                         wakeup.wake();
@@ -82,7 +84,7 @@ impl TerminalPanel {
             }
         });
 
-        let parser = vt100::Parser::new(rows, cols, 10000);
+        let parser = crate::vt::Parser::new(rows, cols, 10000);
 
         Ok(Self {
             parser,
@@ -196,7 +198,7 @@ impl TerminalPanel {
     }
 
     /// Get the current terminal screen.
-    pub fn screen(&self) -> &vt100::Screen {
+    pub fn screen(&self) -> &crate::vt::Screen {
         self.parser.screen()
     }
 

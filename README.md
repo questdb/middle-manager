@@ -10,7 +10,7 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 
 **File Manager**
 - Dual-panel layout with directory listings (name, size, date, permissions)
-- File operations: copy (F5), move (F6), rename (Shift+F6), mkdir (F7), delete (F8)
+- File operations: copy (F5), move (F6), rename (Shift+F6), mkdir (F7), delete (F8), archive (Shift+F5)
 - Multi-file selection with Shift+Up/Down (toggle) and Insert key for batch operations
 - Far Manager-style dialogs with keyboard navigation (copy, mkdir, delete, rename)
 - Quick search — just start typing to jump to a file, Enter to open
@@ -57,9 +57,25 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Auto-closes when the shell exits
 - Restored on restart
 
+**Archive (Shift+F5)**
+- Create tar.zst, tar.gz, tar.xz, or zip archives from selected files
+- Smart auto-naming: common prefix detection, dominant extension, parent dir fallback
+- Format picker: Space to cycle through formats
+- Background compression with progress bar in status bar
+- Symlink-safe traversal, collision resolution, UTF-8 safe naming
+
+**Parquet Viewer**
+- Auto-detected when opening `.parquet` files (F3 / Enter)
+- Tree view: file metadata, key-value metadata (JSON pretty-printed), schema, row groups with column details
+- Column statistics: null count, distinct count, min/max values formatted with logical types
+- Tabular alignment for schema fields, column info, and metadata keys
+- Table view (Tab / F4): scrollable data grid with row group lazy loading
+- Encoding names displayed as `Plain`, `RleDictionary`, `DeltaBinaryPacked`, etc.
+- Handles pre-epoch timestamps correctly
+
 **Claude Code Panel (F12)**
 - Spawns `claude` maximized on the opposite panel, using the active panel's directory
-- Full PTY emulation via `portable-pty` + `vt100` — colors, cursor, alternate screen all work
+- Full PTY emulation via custom VT terminal emulator — colors, cursor, alternate screen all work
 - All keystrokes (including Tab) forwarded to Claude Code
 - 10,000-line scrollback buffer with trackpad/mouse scroll (like Ghostty/iTerm2)
 - F5 opens file:line references from terminal output in the built-in editor
@@ -67,7 +83,7 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Restored on restart with `claude -c` (continues last session)
 - Auto-closes when Claude exits
 - Coalescing wakeup mechanism — terminal output renders immediately without flooding the event loop
-- Zero-allocation render loop (vt100 0.16 `&str` cells, reused buffers)
+- Zero-allocation render loop with direct buffer writes
 
 **Text Viewer (F3 / Enter)**
 - Sliding buffer: only ~10K lines in memory at a time
@@ -158,6 +174,7 @@ cargo build --release
 | F4 | Edit file (built-in) |
 | Shift+F4 | Edit file ($EDITOR) |
 | F5 | Copy (operates on selection if active) |
+| Shift+F5 | Create archive (tar.zst/gz/xz/zip) |
 | F6 | Move (operates on selection if active) |
 | Shift+F6 | Rename |
 | F7 | Create directory |
@@ -249,6 +266,19 @@ cargo build --release
 | Tab / F4 | Toggle text / hex |
 | q / Esc | Close |
 
+### Parquet Viewer
+
+| Key | Action |
+|-----|--------|
+| Up / Down | Navigate tree / scroll table |
+| Right / Enter | Expand node |
+| Left | Collapse node / jump to parent |
+| PgUp / PgDn | Page through tree or table |
+| Home / End | Jump to top / bottom |
+| Tab / F4 | Toggle tree / table view |
+| g | Go to row |
+| q / Esc | Close |
+
 ### Editor
 
 | Key | Action |
@@ -282,7 +312,8 @@ src/
   app.rs            App state machine, action dispatch, all modes
   action.rs         Action enum (every possible user intent)
   event.rs          Background thread event polling, coalescing wakeup mechanism
-  terminal.rs       Embedded terminal: PTY lifecycle, vt100 parsing, key encoding (shell + Claude)
+  terminal.rs       Embedded terminal: PTY lifecycle, key encoding (shell + Claude)
+  parquet_viewer.rs Parquet file viewer: metadata tree, column stats, table data decoding
   file_search.rs    File content search: ripgrep engine (ignore + grep-searcher), streaming results
   text_input.rs     Reusable text input: selection, undo/redo, cut/copy, horizontal scroll
   ci.rs             CI panel: check/step fetching, log download, tree state
@@ -299,14 +330,23 @@ src/
     sort.rs         Sort by name/size/date
     git.rs          Git status cache, branch/ahead-behind, async PR queries
     github.rs       GitHub PR info via gh CLI
+  vt/
+    mod.rs          Custom VT terminal emulator (replaces vt100 crate)
+    parser.rs       ANSI/VT escape sequence parser (CSI, OSC, DEC private modes)
+    screen.rs       Terminal screen state: cursor, scrollback, resize
+    grid.rs         Cell grid with O(1) scroll via ring buffer
+    cell.rs         Cell storage with attributes
+    attrs.rs        SGR text attributes and color handling
+    color.rs        Color types (16, 256, RGB)
   fs_ops/
     mod.rs          Copy, move, delete, mkdir, rename (with nested path support)
+    archive.rs      Archive creation (tar.zst, tar.gz, tar.xz, zip) with progress
   ui/
     mod.rs          Top-level layout, mode routing, split CI panels
     panel_view.rs   Panel table rendering with git status column and tree title
     ci_view.rs      CI panel tree rendering with expand/collapse
     header.rs       Header margin
-    terminal_view.rs  Terminal panel rendering (vt100 screen to ratatui spans)
+    terminal_view.rs  Terminal panel rendering (VT screen to ratatui spans)
     file_search_dialog.rs  Search-in-files dialog (path, term, filter, regex)
     search_results_view.rs  Search results tree view (files + matching lines)
     footer.rs       Contextual function key hints (normal / CI / terminal mode)
@@ -318,6 +358,8 @@ src/
     editor_view.rs  Editor rendering with syntax highlighting and selection
     viewer_view.rs  Text viewer rendering with tab expansion
     hex_view.rs     Hex viewer rendering
+    parquet_view.rs Parquet viewer rendering (tree + table modes)
+    archive_dialog.rs  Archive format picker dialog
     shadow.rs       Transparent dialog drop shadows
 ```
 
