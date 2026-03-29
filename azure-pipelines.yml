@@ -1,0 +1,29 @@
+trigger:
+  branches:
+    include:
+      - master
+      - main
+
+pr:
+  branches:
+    include:
+      - master
+      - main
+
+pool:
+  vmImage: ubuntu-latest
+
+steps:
+  - script: |
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --component clippy rustfmt
+      echo "##vso[task.prependpath]$HOME/.cargo/bin"
+    displayName: Install Rust
+
+  - script: cargo fmt -- --check
+    displayName: Check formatting
+
+  - script: cargo clippy -- -D warnings
+    displayName: Run clippy
+
+  - script: cargo test
+    displayName: Run tests
