@@ -1998,10 +1998,122 @@ impl App {
 
     // --- Action dispatch ---
 
+    /// Poll all async data sources. Called once per tick/resize, before input dispatch.
+    fn poll_async(&mut self) {
+        // Mark dirty if any async data sources are active
+        let has_active_async = self.ci_panels.iter().any(|c| c.is_some())
+            || self
+                .file_search
+                .as_ref()
+                .map(|s| s.searching)
+                .unwrap_or(false)
+            || self.git_cache.has_pending()
+            || self.archive_progress.is_some();
+        if has_active_async {
+            self.dirty = true;
+        }
+        if let Some(ref w) = self.dir_watcher {
+            if w.has_changes() {
+                self.dirty = true;
+            }
+        }
+
+        // Poll CI panels for async results and downloads
+        for ci in self.ci_panels.iter_mut().flatten() {
+            ci.poll();
+            if let Some(result) = ci.poll_download() {
+                match result {
+                    Ok(path) => {
+                        self.ci_focused = None;
+                        self.mode = AppMode::Editing(Box::new(
+                            crate::editor::EditorState::open(path),
+                        ));
+                        return;
+                    }
+                    Err(e) => {
+                        self.status_message = Some(format!("Download failed: {}", e));
+                    }
+                }
+            }
+        }
+        // Poll Claude panels
+        for side in 0..2 {
+            if let Some(ref mut tp) = self.claude_panels[side] {
+                tp.poll();
+                if tp.exited {
+                    self.claude_panels[side] = None;
+                    if self.claude_focused == Some(side) {
+                        self.claude_focused = None;
+                    }
+                }
+            }
+        }
+        // Poll shell panels
+        for side in 0..2 {
+            if let Some(ref mut sp) = self.shell_panels[side] {
+                sp.poll();
+                if sp.exited {
+                    self.shell_panels[side] = None;
+                    if self.shell_focused == Some(side) {
+                        self.shell_focused = None;
+                    }
+                }
+            }
+        }
+        // Poll file search results
+        if let Some(ref mut state) = self.file_search {
+            state.poll();
+        }
+        // Poll for async PR query results
+        if self.git_cache.poll_pending() {
+            self.panels[0].refresh_git(&mut self.git_cache);
+            self.panels[1].refresh_git(&mut self.git_cache);
+            self.dirty = true;
+        }
+        // Check for filesystem changes (kqueue/inotify — zero cost if idle)
+        if let Some(ref w) = self.dir_watcher {
+            if w.has_changes() {
+                self.reload_panels();
+            }
+        }
+        // Poll archive progress
+        if let Some(ref progress) = self.archive_progress {
+            if progress.finished.load(Ordering::Acquire) {
+                let err = progress.error.lock().unwrap().take();
+                if let Some(e) = err {
+                    self.status_message = Some(format!("Archive error: {}", e));
+                } else {
+                    let name = progress
+                        .output_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    self.status_message = Some(format!("Created {}", name));
+                }
+                self.archive_progress = None;
+                self.reload_panels();
+            } else {
+                let done = progress.done_bytes.load(Ordering::Relaxed);
+                let total = progress.total_bytes.max(1);
+                let pct = (done as f64 / total as f64 * 100.0) as u8;
+                self.status_message = Some(format!("Archiving... {}%", pct));
+            }
+        }
+    }
+
     pub fn handle_action(&mut self, action: Action) {
         // Mark dirty for any action that changes state (not idle ticks)
         if !matches!(action, Action::Tick | Action::None) {
             self.dirty = true;
+        }
+
+        // Global tick: poll all async sources regardless of focus
+        if matches!(action, Action::Tick | Action::Resize(_, _)) {
+            self.poll_async();
+            if matches!(action, Action::Resize(_, _)) {
+                self.resize_all_bottom_panels();
+            }
+            return;
         }
 
         // Help dialog intercepts when active
@@ -2199,112 +2311,8 @@ impl App {
         }
 
         match action {
-            Action::None => {}
-            Action::Tick => {
-                // Mark dirty if any async data sources are active
-                let has_active_async = self.ci_panels.iter().any(|c| c.is_some())
-                    || self
-                        .file_search
-                        .as_ref()
-                        .map(|s| s.searching)
-                        .unwrap_or(false)
-                    || self.git_cache.has_pending()
-                    || self.archive_progress.is_some();
-                if has_active_async {
-                    self.dirty = true;
-                }
-                if let Some(ref w) = self.dir_watcher {
-                    if w.has_changes() {
-                        self.dirty = true;
-                    }
-                }
-
-                // Poll all CI panels for async results and downloads
-                for ci in self.ci_panels.iter_mut().flatten() {
-                    ci.poll();
-                    if let Some(result) = ci.poll_download() {
-                        match result {
-                            Ok(path) => {
-                                self.ci_focused = None;
-                                self.mode = AppMode::Editing(Box::new(
-                                    crate::editor::EditorState::open(path),
-                                ));
-                                return;
-                            }
-                            Err(e) => {
-                                self.status_message = Some(format!("Download failed: {}", e));
-                            }
-                        }
-                    }
-                }
-                // Poll Claude panels
-                for side in 0..2 {
-                    if let Some(ref mut tp) = self.claude_panels[side] {
-                        tp.poll();
-                        if tp.exited {
-                            self.claude_panels[side] = None;
-                            if self.claude_focused == Some(side) {
-                                self.claude_focused = None;
-                            }
-                        }
-                    }
-                }
-                // Poll shell panels
-                for side in 0..2 {
-                    if let Some(ref mut sp) = self.shell_panels[side] {
-                        sp.poll();
-                        if sp.exited {
-                            self.shell_panels[side] = None;
-                            if self.shell_focused == Some(side) {
-                                self.shell_focused = None;
-                            }
-                        }
-                    }
-                }
-                // Poll file search results
-                if let Some(ref mut state) = self.file_search {
-                    state.poll();
-                }
-                // Poll for async PR query results
-                if self.git_cache.poll_pending() {
-                    self.panels[0].refresh_git(&mut self.git_cache);
-                    self.panels[1].refresh_git(&mut self.git_cache);
-                    self.dirty = true;
-                }
-                // Check for filesystem changes (kqueue/inotify — zero cost if idle)
-                if let Some(ref w) = self.dir_watcher {
-                    if w.has_changes() {
-                        self.reload_panels();
-                    }
-                }
-                // Poll archive progress
-                if let Some(ref progress) = self.archive_progress {
-                    if progress.finished.load(Ordering::Acquire) {
-                        let err = progress.error.lock().unwrap().take();
-                        if let Some(e) = err {
-                            self.status_message = Some(format!("Archive error: {}", e));
-                        } else {
-                            let name = progress
-                                .output_path
-                                .file_name()
-                                .map(|n| n.to_string_lossy().into_owned())
-                                .unwrap_or_default();
-                            self.status_message = Some(format!("Created {}", name));
-                        }
-                        self.archive_progress = None;
-                        self.reload_panels();
-                    } else {
-                        let done = progress.done_bytes.load(Ordering::Relaxed);
-                        let total = progress.total_bytes.max(1);
-                        let pct = (done as f64 / total as f64 * 100.0) as u8;
-                        self.status_message = Some(format!("Archiving... {}%", pct));
-                    }
-                }
-            }
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
             Action::Quit => self.should_quit = true,
-            Action::Resize(_, _) => {
-                self.resize_all_bottom_panels();
-            }
             Action::Toggle => self.handle_toggle_viewer(),
             Action::GotoLinePrompt => {
                 // Only works in viewer/hex/editor/parquet modes
@@ -3261,12 +3269,6 @@ impl App {
             Action::SwitchPanel => self.handle_switch_panel(),
             Action::SwitchPanelReverse => self.handle_switch_panel_reverse(),
             Action::Tick | Action::Resize(_, _) => {
-                if let Some(ref mut state) = self.file_search {
-                    state.poll();
-                    if state.searching {
-                        self.dirty = true;
-                    }
-                }
             }
             Action::MouseClick(col, row) => {
                 // Check if click is inside the search results panel
@@ -3920,36 +3922,7 @@ impl App {
         };
 
         match action {
-            Action::None | Action::Tick | Action::Resize(_, _) => {
-                // Poll all CI panels and check downloads
-                for ci in self.ci_panels.iter_mut().flatten() {
-                    ci.poll();
-                    if let Some(result) = ci.poll_download() {
-                        match result {
-                            Ok(path) => {
-                                // Open downloaded log in editor
-                                self.ci_focused = None;
-                                self.mode = AppMode::Editing(Box::new(
-                                    crate::editor::EditorState::open(path),
-                                ));
-                                return;
-                            }
-                            Err(e) => {
-                                self.status_message = Some(format!("Download failed: {}", e));
-                            }
-                        }
-                    }
-                }
-                if let Some(ref w) = self.dir_watcher {
-                    if w.has_changes() {
-                        self.reload_panels();
-                    }
-                }
-                if self.git_cache.poll_pending() {
-                    self.panels[0].refresh_git(&mut self.git_cache);
-                    self.panels[1].refresh_git(&mut self.git_cache);
-                }
-            }
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
             Action::MoveUp => {
                 if let Some(ref mut ci) = self.ci_panels[side] {
                     ci.move_up();
@@ -4053,34 +4026,7 @@ impl App {
         };
 
         match action {
-            Action::None => {}
-            Action::Tick | Action::Resize(_, _) => {
-                // Poll Claude panel output
-                if let Some(ref mut tp) = self.claude_panels[side] {
-                    tp.poll();
-                    if tp.exited {
-                        self.claude_panels[side] = None;
-                        self.claude_focused = None;
-                    }
-                }
-                // Resize Claude panels to match panel area
-                if matches!(action, Action::Resize(_, _)) {
-                    self.resize_all_bottom_panels();
-                }
-                // Also poll CI, watchers, git
-                for ci in self.ci_panels.iter_mut().flatten() {
-                    ci.poll();
-                }
-                if let Some(ref w) = self.dir_watcher {
-                    if w.has_changes() {
-                        self.reload_panels();
-                    }
-                }
-                if self.git_cache.poll_pending() {
-                    self.panels[0].refresh_git(&mut self.git_cache);
-                    self.panels[1].refresh_git(&mut self.git_cache);
-                }
-            }
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
             Action::TerminalInput(bytes) => {
                 if let Some(ref mut tp) = self.claude_panels[side] {
                     // Auto-scroll to bottom when user types
@@ -4228,32 +4174,7 @@ impl App {
         };
 
         match action {
-            Action::None => {}
-            Action::Tick | Action::Resize(_, _) => {
-                if let Some(ref mut sp) = self.shell_panels[side] {
-                    sp.poll();
-                    if sp.exited {
-                        self.shell_panels[side] = None;
-                        self.shell_focused = None;
-                    }
-                }
-                if matches!(action, Action::Resize(_, _)) {
-                    self.resize_all_bottom_panels();
-                }
-                // Also poll CI, watchers, git
-                for ci in self.ci_panels.iter_mut().flatten() {
-                    ci.poll();
-                }
-                if let Some(ref w) = self.dir_watcher {
-                    if w.has_changes() {
-                        self.reload_panels();
-                    }
-                }
-                if self.git_cache.poll_pending() {
-                    self.panels[0].refresh_git(&mut self.git_cache);
-                    self.panels[1].refresh_git(&mut self.git_cache);
-                }
-            }
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
             Action::TerminalInput(bytes) => {
                 if let Some(ref mut sp) = self.shell_panels[side] {
                     sp.scroll_to_bottom();
