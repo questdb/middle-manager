@@ -2025,9 +2025,8 @@ impl App {
                 match result {
                     Ok(path) => {
                         self.ci_focused = None;
-                        self.mode = AppMode::Editing(Box::new(
-                            crate::editor::EditorState::open(path),
-                        ));
+                        self.mode =
+                            AppMode::Editing(Box::new(crate::editor::EditorState::open(path)));
                         return;
                     }
                     Err(e) => {
@@ -3268,8 +3267,7 @@ impl App {
             }
             Action::SwitchPanel => self.handle_switch_panel(),
             Action::SwitchPanelReverse => self.handle_switch_panel_reverse(),
-            Action::Tick | Action::Resize(_, _) => {
-            }
+            Action::Tick | Action::Resize(_, _) => {}
             Action::MouseClick(col, row) => {
                 // Check if click is inside the search results panel
                 let search_area = self.panel_areas[self.file_search_side];
