@@ -5,11 +5,36 @@ pub mod sort;
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use ratatui::widgets::TableState;
 
 use entry::FileEntry;
 use sort::{sort_entries, SortField};
+
+/// The data source for a panel — local filesystem or remote.
+pub enum PanelSource {
+    Local,
+    Remote {
+        connection: Rc<dyn crate::remote_fs::RemoteFs>,
+    },
+}
+
+impl PanelSource {
+    pub fn is_remote(&self) -> bool {
+        matches!(self, PanelSource::Remote { .. })
+    }
+
+    /// Display label for the panel header.
+    pub fn label(&self) -> Option<String> {
+        match self {
+            PanelSource::Local => None,
+            PanelSource::Remote { connection } => {
+                Some(format!("{} [experimental]", connection.display_label()))
+            }
+        }
+    }
+}
 
 pub struct Panel {
     pub current_dir: PathBuf,
@@ -21,6 +46,7 @@ pub struct Panel {
     pub error: Option<String>,
     pub selected_indices: BTreeSet<usize>,
     pub git_info: Option<git::GitInfo>,
+    pub source: PanelSource,
 }
 
 impl Panel {
@@ -35,12 +61,31 @@ impl Panel {
             error: None,
             selected_indices: BTreeSet::new(),
             git_info: None,
+            source: PanelSource::Local,
         };
         panel.reload();
         if !panel.entries.is_empty() {
             panel.table_state.select(Some(0));
         }
         panel
+    }
+
+    /// Switch this panel to a remote source.
+    pub fn switch_to_remote(&mut self, connection: Rc<dyn crate::remote_fs::RemoteFs>) {
+        let home = connection.home_dir();
+        self.source = PanelSource::Remote { connection };
+        self.current_dir = home;
+        self.git_info = None;
+        self.reload();
+        self.table_state.select(Some(0));
+    }
+
+    /// Switch this panel back to local filesystem.
+    pub fn switch_to_local(&mut self, path: PathBuf) {
+        self.source = PanelSource::Local;
+        self.current_dir = path;
+        self.reload();
+        self.table_state.select(Some(0));
     }
 
     pub fn reload(&mut self) {
@@ -64,18 +109,31 @@ impl Panel {
                 .push(FileEntry::parent_entry(parent.to_path_buf()));
         }
 
-        match std::fs::read_dir(&self.current_dir) {
-            Ok(read_dir) => {
-                for entry in read_dir.flatten() {
-                    match FileEntry::from_dir_entry(&entry) {
-                        Ok(fe) => self.entries.push(fe),
-                        Err(_) => continue,
+        match &self.source {
+            PanelSource::Local => {
+                match std::fs::read_dir(&self.current_dir) {
+                    Ok(read_dir) => {
+                        for entry in read_dir.flatten() {
+                            match FileEntry::from_dir_entry(&entry) {
+                                Ok(fe) => self.entries.push(fe),
+                                Err(_) => continue,
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.error = Some(format!("Cannot read directory: {}", e));
+                        return;
                     }
                 }
             }
-            Err(e) => {
-                self.error = Some(format!("Cannot read directory: {}", e));
-                return;
+            PanelSource::Remote { connection } => {
+                match connection.read_dir(&self.current_dir) {
+                    Ok(entries) => self.entries.extend(entries),
+                    Err(e) => {
+                        self.error = Some(format!("Remote error: {}", e));
+                        return;
+                    }
+                }
             }
         }
 

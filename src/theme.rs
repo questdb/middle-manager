@@ -1,6 +1,48 @@
 use crossterm::cursor::SetCursorStyle;
 use ratatui::style::{Color, Modifier, Style};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeName {
+    FarManager,
+    QuestdbDark,
+}
+
+impl ThemeName {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::FarManager => "Far Manager (Classic)",
+            Self::QuestdbDark => "QuestDB Dark",
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn all() -> &'static [ThemeName] {
+        &[ThemeName::FarManager, ThemeName::QuestdbDark]
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        match s {
+            "questdb_dark" => Self::QuestdbDark,
+            _ => Self::FarManager,
+        }
+    }
+
+    pub fn to_str(&self) -> &'static str {
+        match self {
+            Self::FarManager => "far_manager",
+            Self::QuestdbDark => "questdb_dark",
+        }
+    }
+
+    pub fn next(&self) -> Self {
+        match self {
+            Self::FarManager => Self::QuestdbDark,
+            Self::QuestdbDark => Self::FarManager,
+        }
+    }
+}
+
+#[derive(Clone)]
 pub struct Theme {
     pub bg: Color,
     pub border: Color,
@@ -73,6 +115,13 @@ pub struct Theme {
 }
 
 impl Theme {
+    pub fn for_name(name: ThemeName) -> Self {
+        match name {
+            ThemeName::FarManager => Self::far_manager(),
+            ThemeName::QuestdbDark => Self::questdb_dark(),
+        }
+    }
+
     pub fn far_manager() -> Self {
         let bg = Color::Rgb(0, 0, 128);
         Self {
@@ -142,6 +191,89 @@ impl Theme {
             git_branch_fg: Color::LightGreen,
         }
     }
+
+    pub fn questdb_dark() -> Self {
+        let bg = Color::Rgb(26, 21, 32);          // #1a1520 deep purple-black
+        let surface = Color::Rgb(36, 30, 46);      // #241e2e panel surfaces
+        let rose = Color::Rgb(209, 70, 113);        // #d14671 QuestDB primary
+        let magenta = Color::Rgb(137, 44, 108);     // #892c6c QuestDB deep
+        let pink_light = Color::Rgb(232, 121, 154); // #e8799a soft pink
+        let text = Color::Rgb(232, 228, 237);        // #e8e4ed cool light grey
+        let text_dim = Color::Rgb(154, 143, 176);    // #9a8fb0 muted lavender
+        let text_very_dim = Color::Rgb(107, 90, 132);// #6b5a84 dim purple
+        let selection = Color::Rgb(46, 39, 64);       // #2e2740 selection bg
+        let green = Color::Rgb(130, 210, 150);        // #82d296 soft green
+        let blue = Color::Rgb(130, 160, 230);          // #82a0e6 soft blue
+        let red = Color::Rgb(240, 100, 100);           // #f06464 soft red
+        let purple_light = Color::Rgb(195, 140, 220); // #c38cdc light purple
+
+        Self {
+            bg,
+            border: rose,
+            border_inactive: Color::Rgb(74, 56, 96), // #4a3860
+            title: rose,
+            header_fg: pink_light,
+            dir_fg: text,
+            file_fg: Color::Rgb(186, 178, 201),       // #bab2c9 light lavender
+            symlink_fg: text_dim,
+            exec_fg: green,
+            size_fg: text_dim,
+            date_fg: text_dim,
+            perm_fg: text_very_dim,
+            highlight_bg: magenta,
+            highlight_fg: Color::White,
+            error_fg: red,
+            search_label_fg: Color::White,
+            search_label_bg: rose,
+            search_text_fg: text,
+            path_active_fg: text,
+            path_inactive_fg: text_very_dim,
+            footer_key_fg: Color::Rgb(26, 21, 32),         // dark bg text on pink buttons
+            footer_key_bg: Color::Rgb(209, 70, 113),        // rose button background
+            footer_fkey_fg: Color::Rgb(255, 230, 240),       // #ffe6f0 near-white pink for "F1" etc.
+            footer_sep_fg: Color::Rgb(137, 44, 108),         // magenta separator
+            footer_sep_bg: Color::Rgb(18, 14, 24),           // #120e18 very dark bar background
+            dialog_bg: surface,
+            dialog_border_fg: rose,
+            dialog_title_fg: pink_light,
+            dialog_text_fg: text,
+            dialog_input_fg: text,
+            dialog_prompt_fg: rose,
+            dialog_cursor_fg: text,
+            dialog_input_fg_focused: Color::White,
+            dialog_input_bg: selection,
+            dialog_hint_fg: text_very_dim,
+            selected_fg: pink_light,
+            viewer_line_num_fg: magenta,
+            viewer_text_fg: text,
+            viewer_hint_fg: bg,
+            viewer_hint_bg: rose,
+            syn_keyword: rose,
+            syn_function: blue,
+            syn_type: Color::Rgb(195, 65, 112),       // #c34170 QuestDB pink alt
+            syn_string: green,
+            syn_number: pink_light,
+            syn_comment: text_very_dim,
+            syn_variable: text,
+            syn_constant: purple_light,
+            syn_operator: Color::Rgb(186, 178, 201),
+            syn_punctuation: text_dim,
+            syn_attribute: pink_light,
+            syn_tag: red,
+            syn_property: Color::Rgb(186, 178, 201),
+            syn_escape: red,
+            syn_constructor: pink_light,
+            editor_text_fg: text,
+            editor_cursor: SetCursorStyle::BlinkingBar,
+            git_modified_fg: pink_light,
+            git_added_fg: green,
+            git_deleted_fg: red,
+            git_untracked_fg: text_very_dim,
+            git_conflict_fg: red,
+            git_renamed_fg: purple_light,
+            git_branch_fg: green,
+        }
+    }
 }
 
 // Convenience style builders
@@ -151,11 +283,7 @@ impl Theme {
     }
 
     pub fn border_style(&self, active: bool) -> Style {
-        let color = if active {
-            self.border
-        } else {
-            self.border_inactive
-        };
+        let color = if active { self.border } else { self.border_inactive };
         Style::default().fg(color).bg(self.bg)
     }
 
@@ -164,35 +292,21 @@ impl Theme {
     }
 
     pub fn header_style(&self) -> Style {
-        Style::default()
-            .fg(self.header_fg)
-            .bg(self.bg)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(self.header_fg).bg(self.bg).add_modifier(Modifier::BOLD)
     }
 
     pub fn highlight_style(&self) -> Style {
-        Style::default()
-            .bg(self.highlight_bg)
-            .fg(self.highlight_fg)
-            .add_modifier(Modifier::BOLD)
+        Style::default().bg(self.highlight_bg).fg(self.highlight_fg).add_modifier(Modifier::BOLD)
     }
 
-    /// Style for the cursor row when the item is also selected (multi-select).
     pub fn selected_highlight_style(&self) -> Style {
-        Style::default()
-            .bg(self.highlight_bg)
-            .fg(Color::Rgb(100, 60, 0))
-            .add_modifier(Modifier::BOLD)
+        Style::default().bg(self.highlight_bg).fg(Color::Rgb(100, 60, 0)).add_modifier(Modifier::BOLD)
     }
 
     pub fn dir_style(&self) -> Style {
-        Style::default()
-            .fg(self.dir_fg)
-            .bg(self.bg)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(self.dir_fg).bg(self.bg).add_modifier(Modifier::BOLD)
     }
 
-    /// Style for selected text in TextInput fields (dialog inputs, go-to-path, fuzzy search).
     pub fn input_selection_style(&self) -> Style {
         Style::default().fg(Color::White).bg(Color::Black)
     }
@@ -210,10 +324,7 @@ impl Theme {
     }
 
     pub fn selected_style(&self) -> Style {
-        Style::default()
-            .fg(self.selected_fg)
-            .bg(self.bg)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(self.selected_fg).bg(self.bg).add_modifier(Modifier::BOLD)
     }
 
     pub fn git_status_color(&self, status: crate::panel::git::GitFileStatus) -> Color {
@@ -233,16 +344,11 @@ impl Theme {
     }
 
     pub fn dialog_border_style(&self) -> Style {
-        Style::default()
-            .fg(self.dialog_border_fg)
-            .bg(self.dialog_bg)
+        Style::default().fg(self.dialog_border_fg).bg(self.dialog_bg)
     }
 
     pub fn dialog_title_style(&self) -> Style {
-        Style::default()
-            .fg(self.dialog_title_fg)
-            .bg(self.dialog_bg)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(self.dialog_title_fg).bg(self.dialog_bg).add_modifier(Modifier::BOLD)
     }
 
     #[allow(dead_code)]
@@ -251,9 +357,64 @@ impl Theme {
     }
 }
 
-/// Global theme accessor. Call `theme()` from any UI module.
-pub fn theme() -> &'static Theme {
-    use std::sync::OnceLock;
-    static THEME: OnceLock<Theme> = OnceLock::new();
-    THEME.get_or_init(Theme::far_manager)
+// --- Global theme state ---
+
+use std::sync::RwLock;
+
+static THEME: RwLock<Option<Theme>> = RwLock::new(None);
+static THEME_NAME: RwLock<ThemeName> = RwLock::new(ThemeName::FarManager);
+static THEME_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set the active theme.
+pub fn set_theme(name: ThemeName) {
+    let t = Theme::for_name(name);
+    *THEME_NAME.write().unwrap() = name;
+    *THEME.write().unwrap() = Some(t);
+    THEME_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Get the current theme name.
+pub fn current_theme_name() -> ThemeName {
+    *THEME_NAME.read().unwrap()
+}
+
+/// Get a clone of the active theme.
+/// Uses a thread-local cache to avoid RwLock acquisition on every call within the same frame.
+pub fn theme() -> Theme {
+    use std::cell::RefCell;
+    use std::sync::atomic::Ordering;
+
+    thread_local! {
+        static CACHED: RefCell<(u64, Option<Theme>)> = RefCell::new((0, None));
+    }
+
+    let gen = THEME_GENERATION.load(Ordering::Relaxed);
+    let cached = CACHED.with(|c| {
+        let borrow = c.borrow();
+        if borrow.0 == gen {
+            borrow.1.clone()
+        } else {
+            None
+        }
+    });
+
+    if let Some(t) = cached {
+        return t;
+    }
+
+    // Cache miss -- read from RwLock
+    let t = if let Some(ref t) = *THEME.read().unwrap() {
+        t.clone()
+    } else {
+        drop(THEME.read());
+        set_theme(ThemeName::FarManager);
+        THEME.read().unwrap().as_ref().unwrap().clone()
+    };
+
+    // Re-read generation (set_theme may have incremented it)
+    let current_gen = THEME_GENERATION.load(Ordering::Relaxed);
+    CACHED.with(|c| {
+        *c.borrow_mut() = (current_gen, Some(t.clone()));
+    });
+    t
 }

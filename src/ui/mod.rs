@@ -14,6 +14,9 @@ pub mod panel_view;
 pub mod parquet_view;
 pub mod search_dialog;
 pub mod search_results_view;
+pub mod session_dialog;
+pub mod settings_dialog;
+pub mod ssh_dialog;
 mod shadow;
 pub mod terminal_view;
 pub mod viewer_view;
@@ -56,7 +59,7 @@ pub fn take_dialog_content() -> Option<Rect> {
     DIALOG_CONTENT.replace(None)
 }
 
-/// Split a panel column into file area + optional CI area + optional shell area + optional Claude area.
+/// Split a panel column into file area + optional bottom panels (CI, shell, Claude, SSH).
 ///
 /// When `maximized` is true, the file panel gets 0 height and the bottom panels fill the column.
 /// `split_pct` controls the top/bottom ratio (percentage for the file panel).
@@ -65,18 +68,20 @@ fn split_panel_column(
     has_ci: bool,
     has_shell: bool,
     has_claude: bool,
+    has_ssh: bool,
     split_pct: u16,
     maximized: bool,
-) -> (Rect, Option<Rect>, Option<Rect>, Option<Rect>) {
+) -> (Rect, Option<Rect>, Option<Rect>, Option<Rect>, Option<Rect>) {
     // When Claude is maximized, it takes the entire column
     if maximized && has_claude {
         let zero = Rect::new(col.x, col.y, col.width, 0);
-        return (zero, None, None, Some(col));
+        return (zero, None, None, Some(col), None);
     }
 
-    let bottom_count = has_ci as usize + has_shell as usize + has_claude as usize;
+    let bottom_count =
+        has_ci as usize + has_shell as usize + has_claude as usize + has_ssh as usize;
     if bottom_count == 0 {
-        return (col, None, None, None);
+        return (col, None, None, None, None);
     }
 
     // Split top (file panel) vs bottom (all sub-panels share equally)
@@ -113,13 +118,20 @@ fn split_panel_column(
     };
     let claude_area = if has_claude {
         let a = areas[idx];
+        idx += 1;
+        Some(a)
+    } else {
+        None
+    };
+    let ssh_area = if has_ssh {
+        let a = areas[idx];
         let _ = idx;
         Some(a)
     } else {
         None
     };
 
-    (file_area, ci_area, shell_area, claude_area)
+    (file_area, ci_area, shell_area, claude_area, ssh_area)
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -161,27 +173,32 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
         Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(panels_area);
 
     // Split each column: file panel on top, bottom panels below
-    let (left_area, left_ci_area, left_shell_area, left_claude_area) = split_panel_column(
-        left_col,
-        app.ci_panels[0].is_some(),
-        app.shell_panels[0].is_some(),
-        app.claude_panels[0].is_some(),
-        app.bottom_split_pct[0],
-        app.bottom_maximized[0],
-    );
-    let (right_area, right_ci_area, right_shell_area, right_claude_area) = split_panel_column(
-        right_col,
-        app.ci_panels[1].is_some(),
-        app.shell_panels[1].is_some(),
-        app.claude_panels[1].is_some(),
-        app.bottom_split_pct[1],
-        app.bottom_maximized[1],
-    );
+    let (left_area, left_ci_area, left_shell_area, left_claude_area, left_ssh_area) =
+        split_panel_column(
+            left_col,
+            app.ci_panels[0].is_some(),
+            app.shell_panels[0].is_some(),
+            app.claude_panels[0].is_some(),
+            app.ssh_panels[0].is_some(),
+            app.bottom_split_pct[0],
+            app.bottom_maximized[0],
+        );
+    let (right_area, right_ci_area, right_shell_area, right_claude_area, right_ssh_area) =
+        split_panel_column(
+            right_col,
+            app.ci_panels[1].is_some(),
+            app.shell_panels[1].is_some(),
+            app.claude_panels[1].is_some(),
+            app.ssh_panels[1].is_some(),
+            app.bottom_split_pct[1],
+            app.bottom_maximized[1],
+        );
 
     app.panel_areas = [left_area, right_area];
     app.ci_panel_areas = [left_ci_area, right_ci_area];
     app.shell_panel_areas = [left_shell_area, right_shell_area];
     app.claude_panel_areas = [left_claude_area, right_claude_area];
+    app.ssh_panel_areas = [left_ssh_area, right_ssh_area];
 
     header::render(frame, header_area, app);
 
@@ -189,6 +206,7 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
     let (left_active, right_active) = if app.ci_focused.is_some()
         || app.claude_focused.is_some()
         || app.shell_focused.is_some()
+        || app.ssh_focused.is_some()
         || app.file_search_focused
     {
         (false, false)
@@ -264,9 +282,31 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
         terminal_view::render(frame, claude_area, cp, app.claude_focused == Some(1));
     }
 
-    // Show appropriate footer
-    if app.file_search_focused {
+    // Render SSH panels
+    if let (Some(ssh_area), Some(ref sp)) = (left_ssh_area, &app.ssh_panels[0]) {
+        terminal_view::render(frame, ssh_area, sp, app.ssh_focused == Some(0));
+    }
+    if let (Some(ssh_area), Some(ref sp)) = (right_ssh_area, &app.ssh_panels[1]) {
+        terminal_view::render(frame, ssh_area, sp, app.ssh_focused == Some(1));
+    }
+
+    // Render SSH dialog overlay
+    if let Some(ref state) = app.ssh_dialog {
+        ssh_dialog::render(frame, state);
+    }
+
+    // Render session dialog overlay
+    if let Some(ref state) = app.session_dialog {
+        session_dialog::render(frame, state);
+    }
+
+    // Show status message if set, otherwise show context-appropriate footer
+    if let Some(ref msg) = app.status_message {
+        render_status_message(frame, footer_area, msg);
+    } else if app.file_search_focused {
         footer::render_search(frame, footer_area);
+    } else if app.ssh_focused.is_some() {
+        footer::render_ssh(frame, footer_area);
     } else if app.shell_focused.is_some() {
         footer::render_shell(frame, footer_area);
     } else if app.claude_focused.is_some() {
@@ -291,6 +331,86 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
     if let Some(area) = dialog_area {
         shadow::render_shadow(frame, area);
     }
+
+    // Settings dialog
+    if let Some(selected) = app.settings_open {
+        let area = settings_dialog::render(frame, selected);
+        shadow::render_shadow(frame, area);
+    }
+
+    // Popup overlay (rendered last, on top of everything)
+    if let Some((ref title, ref msg)) = app.popup {
+        render_popup(frame, title, msg);
+    }
+}
+
+fn render_status_message(frame: &mut Frame, area: Rect, msg: &str) {
+    let t = crate::theme::theme();
+    let style = Style::default()
+        .fg(t.header_fg)
+        .bg(t.footer_sep_bg)
+        .add_modifier(Modifier::BOLD);
+    let padded = format!(" {} ", msg);
+    let cw = area.width as usize;
+    let display = if padded.len() > cw {
+        format!("{}", &padded[..cw])
+    } else {
+        format!("{:<width$}", padded, width = cw)
+    };
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(display, style))),
+        area,
+    );
+}
+
+fn render_popup(frame: &mut Frame, title: &str, msg: &str) {
+    let t = crate::theme::theme();
+    let lines: Vec<&str> = msg.lines().collect();
+    let max_line_width = lines.iter().map(|l| l.len()).max().unwrap_or(20);
+    let width = (max_line_width as u16 + 6).min(frame.area().width.saturating_sub(4)).max(30);
+    let height = (lines.len() as u16 + 4).min(frame.area().height.saturating_sub(4)).max(5);
+
+    let x = (frame.area().width.saturating_sub(width)) / 2;
+    let y = (frame.area().height.saturating_sub(height)) / 2;
+    let area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, area);
+
+    let is_error = title.to_lowercase().contains("error");
+    let border_color = if is_error {
+        ratatui::style::Color::Red
+    } else {
+        ratatui::style::Color::Green
+    };
+
+    let block = Block::default()
+        .title(Span::styled(format!(" {} ", title), Style::default().fg(border_color).add_modifier(Modifier::BOLD)))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(t.dialog_bg));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Render message lines
+    let text_style = Style::default().fg(t.dialog_text_fg).bg(t.dialog_bg);
+    for (i, line) in lines.iter().enumerate() {
+        if i as u16 >= inner.height.saturating_sub(1) {
+            break;
+        }
+        let rect = Rect::new(inner.x + 1, inner.y + i as u16, inner.width.saturating_sub(2), 1);
+        frame.render_widget(Paragraph::new(Line::from(Span::styled(*line, text_style))), rect);
+    }
+
+    // "Press any key" hint at bottom
+    let hint_y = inner.y + inner.height.saturating_sub(1);
+    let hint = "Press any key to dismiss";
+    let hint_style = Style::default()
+        .fg(t.dialog_text_fg)
+        .bg(t.dialog_bg)
+        .add_modifier(Modifier::DIM);
+    let rect = Rect::new(inner.x + 1, hint_y, inner.width.saturating_sub(2), 1);
+    frame.render_widget(Paragraph::new(Line::from(Span::styled(hint, hint_style))), rect);
 }
 
 fn render_viewer(frame: &mut Frame, app: &mut App) {

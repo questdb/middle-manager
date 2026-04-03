@@ -35,6 +35,34 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Uses `--no-optional-locks` to avoid index.lock conflicts with other tools
 - File name coloring based on git status
 
+**Connectivity (Ctrl+T) [experimental]**
+- Browse remote filesystems in the dual-panel file manager
+- 8 protocols: SSH, SFTP, SMB, WebDAV, S3/S3-compatible, GCS, Azure Blob Storage, NFS
+- Unified connection dialog with protocol tabs (Alt+Left/Right to cycle)
+- Cross-panel copy/move between local and any remote (F5/F6)
+- Remote file editing: F3/F4 downloads to temp, edits locally, uploads on save
+- Create files (Shift+F7) and directories (F7) on remote
+- Delete (F8), rename (Shift+F6) on remote
+- Saved connections: F2 in dialog saves for quick reconnect
+- Background connections with progress display and 30-second timeout
+- Auto-disconnect: Ctrl+T on a remote panel returns to local
+- All protocols shell out to system CLI tools (`ssh`, `sftp`, `smbclient`, `curl`, `aws`, `gcloud`, `az`, `mount`)
+- S3-compatible: MinIO, Backblaze B2, Cloudflare R2, DigitalOcean Spaces via `--endpoint-url`
+- Azure: connection string support, container browsing, Azurite-compatible
+- Debug logging: set `MM_DEBUG=1` for shell command tracing
+
+**Session Persistence (--session)**
+- `middle-manager --session <name>` creates/attaches to persistent tmux sessions
+- Survive terminal disconnects; reattach from any device via SSH
+- Session manager dialog (Ctrl+Y): create, attach, kill sessions
+- Detach with backtick then d (tmux prefix set to `` ` `` to avoid conflicts)
+- Nested session detection prevents tmux-in-tmux issues
+
+**Settings (Shift+F1)**
+- Theme switcher: Far Manager (Classic) and QuestDB Dark
+- QuestDB Dark: deep purple-black backgrounds with rose-pink accents
+- Theme persisted across restarts
+
 **CI Panel (F2)**
 - Tree view of CI checks with expand/collapse
 - GitHub Actions and Azure DevOps support
@@ -48,6 +76,9 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Mouse click support for selecting items in the tree
 - Failed checks sorted to top for quick access
 - PR number displayed in panel title
+- **Ctrl+E: Extract all failures** — downloads failed test logs, parses failure patterns (Rust, Java, Go, Python, Jest), writes consolidated Markdown report
+- Azure DevOps test results API (instant, no log download) with PAT auth support
+- GitHub API rate limit monitoring
 
 **Shell Panel (Ctrl+O)**
 - Spawns your default `$SHELL` at the bottom of the active panel
@@ -123,8 +154,9 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Shift+F4 opens `$EDITOR` instead
 
 **UI**
-- Far Manager classic blue color scheme
+- Multiple themes: Far Manager (Classic) and QuestDB Dark — switch with Shift+F1
 - Centralized theme system — all colors in one file (`src/theme.rs`), including syntax highlighting and git status colors
+- Thread-local cached theme access for zero-overhead rendering
 - Consistent dialog styling with shared helpers (padding, separators, buttons, checkboxes)
 - Contextual footer — shows relevant key hints for the active panel/mode
 - Panel border titles with path (shortened with `~`), git info, and CI status
@@ -147,6 +179,15 @@ git clone https://github.com/questdb/middle-manager.git
 cd middle-manager
 cargo build --release
 ./target/release/middle-manager
+```
+
+## Usage
+
+```
+middle-manager                       # Normal launch
+middle-manager --session <name>      # Launch in a persistent tmux session
+middle-manager --list-sessions       # List active middle-manager sessions
+MM_DEBUG=1 middle-manager            # Enable debug logging to ~/.config/middle-manager/debug.log
 ```
 
 ## Key Bindings
@@ -179,11 +220,15 @@ cargo build --release
 | F6 | Move (operates on selection if active) |
 | Shift+F6 | Rename |
 | F7 | Create directory |
+| Shift+F7 | Create (touch) file |
 | F8 | Delete (operates on selection if active) |
 | F9 | Cycle sort |
 | F10 | Quit (with confirmation) |
 | F11 | Open PR in browser |
+| Ctrl+T | Open Connectivity dialog (remote connections) |
+| Ctrl+Y | Open session manager (tmux sessions) |
 | F12 | Toggle Claude Code panel (maximized, opposite side) |
+| Shift+F1 | Open settings (themes) |
 | Type chars | Quick search |
 
 ### CI Panel
@@ -196,6 +241,7 @@ cargo build --release
 | Right | Expand check (load steps) |
 | Left | Collapse check / jump to parent |
 | Enter | Expand/collapse check, or download step log |
+| Ctrl+E | Extract all test failures to Markdown file |
 | o | Open check in browser |
 | Alt+Up / Alt+Down | Resize panel split |
 | Alt+Enter | Maximize / restore panel |
@@ -241,6 +287,39 @@ cargo build --release
 | Scroll / Trackpad | Scroll results |
 | Mouse click | Select result and focus panel |
 | F10 | Quit (with confirmation) |
+
+### Connectivity Dialog (Ctrl+T)
+
+| Key | Action |
+|-----|--------|
+| Alt+Left / Alt+Right | Cycle protocol (SSH/SFTP/SMB/WebDAV/S3/GCS/Azure/NFS) |
+| Tab | Cycle protocol (SSH/SFTP) or switch fields (others) |
+| Enter | Connect |
+| F2 | Save connection for quick access |
+| Del | Remove saved connection |
+| Esc | Close |
+
+### SSH / SFTP Panel
+
+| Key | Action |
+|-----|--------|
+| All keys (incl. Tab) | Forwarded to SSH session |
+| Scroll / Trackpad | Scroll through scrollback buffer |
+| Alt+Up / Alt+Down | Resize panel split |
+| Alt+Enter | Maximize / restore panel |
+| F1 | Switch focus to file panel |
+| Ctrl+T | Close SSH panel / disconnect SFTP |
+| F10 | Quit (with confirmation) |
+
+### Session Manager (Ctrl+Y)
+
+| Key | Action |
+|-----|--------|
+| Up / Down | Navigate sessions |
+| Enter | Attach to selected session |
+| n | Create new session |
+| d / Delete | Kill selected session |
+| Esc | Close |
 
 ### Dialog Inputs (all dialogs)
 
@@ -317,7 +396,19 @@ src/
   parquet_viewer.rs Parquet file viewer: metadata tree, column stats, table data decoding
   file_search.rs    File content search: ripgrep engine (ignore + grep-searcher), streaming results
   text_input.rs     Reusable text input: selection, undo/redo, cut/copy, horizontal scroll
-  ci.rs             CI panel: check/step fetching, log download, tree state
+  ci.rs             CI panel: check/step fetching, log download, failure extraction
+  remote_fs.rs      RemoteFs trait: common interface for all remote protocols
+  sftp.rs           SFTP connection (shells out to sftp CLI)
+  smb_client.rs     SMB connection (shells out to smbclient)
+  webdav.rs         WebDAV connection (shells out to curl + quick-xml)
+  s3.rs             S3 connection (shells out to aws s3api)
+  gcs.rs            GCS connection (shells out to gcloud storage)
+  azure_blob.rs     Azure Blob connection (shells out to az CLI)
+  nfs_client.rs     NFS connection (mount + local FS delegation)
+  ssh.rs            SSH host config, ~/.ssh/config parsing
+  session.rs        tmux session management
+  saved_connections.rs  Saved connection store (JSON)
+  debug_log.rs      Debug logging (MM_DEBUG=1)
   state.rs          Persistent state (JSON, ~/.config/middle-manager/)
   syntax.rs         Tree-sitter syntax highlighting with hybrid caching
   theme.rs          Centralized color scheme (panel, editor, git, syntax, dialog)

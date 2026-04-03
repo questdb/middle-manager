@@ -33,6 +33,8 @@ pub enum Action {
     EditFile,
     Archive,
 
+    CreateFile,
+
     // Sorting
     CycleSort,
 
@@ -96,10 +98,13 @@ pub enum Action {
     // GitHub / CI
     OpenPr,
     ToggleCi,
+    ExtractCiFailures,
 
-    // Terminal / Shell
+    // Terminal / Shell / SSH / Sessions
     ToggleClaude,
     ToggleShell,
+    ToggleSsh,
+    ToggleSessions,
     TerminalInput(Vec<u8>),
     TerminalOpenFile,
     BottomResizeUp,
@@ -111,6 +116,9 @@ pub enum Action {
 
     // Help
     ShowHelp,
+
+    // Settings
+    ToggleSettings,
 
     // Application
     Quit,

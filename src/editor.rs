@@ -63,6 +63,9 @@ pub struct EditorState {
     /// Undo/redo stacks.
     undo_stack: Vec<UndoEntry>,
     redo_stack: Vec<UndoEntry>,
+
+    /// If editing a remote file: (remote_path, panel_side) for upload-on-save.
+    pub remote_source: Option<(PathBuf, usize)>,
 }
 
 /// Minimal operation-based undo entry. Stores what changed, not full line copies.
@@ -141,9 +144,18 @@ impl EditorState {
             syntax,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            remote_source: None,
         };
         // Pre-scan first batch of lines for immediate display
         state.scan_to_line(10_000);
+        // Empty files need at least one editable line
+        if state.file_size == 0 {
+            state.segments = vec![Segment::Buffer {
+                lines: vec![String::new()],
+            }];
+            state.scan_complete = true;
+            state.lines_scanned = 0;
+        }
         state
     }
 
@@ -2061,11 +2073,56 @@ fn char_to_byte(s: &str, char_pos: usize) -> usize {
 }
 
 pub(crate) fn osc52_copy(text: &str) {
+    // Try native clipboard tools first (more reliable on Linux), fall back to OSC 52
+    if try_native_clipboard(text) {
+        return;
+    }
     use std::io::Write;
     let encoded = base64_encode(text.as_bytes());
     let osc = format!("\x1b]52;c;{}\x1b\\", encoded);
     let _ = std::io::stdout().write_all(osc.as_bytes());
     let _ = std::io::stdout().flush();
+}
+
+/// Try to copy using native clipboard tools. Returns true on success.
+fn try_native_clipboard(text: &str) -> bool {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    // Detect Wayland vs X11
+    let is_wayland = std::env::var("WAYLAND_DISPLAY").is_ok();
+
+    let tools: &[&[&str]] = if is_wayland {
+        &[&["wl-copy"], &["xclip", "-selection", "clipboard"]]
+    } else {
+        &[
+            &["xclip", "-selection", "clipboard"],
+            &["xsel", "--clipboard", "--input"],
+            &["wl-copy"],
+        ]
+    };
+
+    for tool_args in tools {
+        let program = tool_args[0];
+        let args = &tool_args[1..];
+        if let Ok(mut child) = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if let Ok(status) = child.wait() {
+                if status.success() {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 // Exposed for tests

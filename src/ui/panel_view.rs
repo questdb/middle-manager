@@ -343,7 +343,7 @@ fn render_fuzzy_results(frame: &mut Frame, area: Rect, state: &FuzzySearchState)
 pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool) {
     let t = theme();
 
-    let title_spans = build_panel_title(panel, t, is_active, area.width as usize);
+    let title_spans = build_panel_title(panel, &t, is_active, area.width as usize);
     let block = Block::default()
         .title(Line::from(title_spans))
         .borders(Borders::ALL)
@@ -547,16 +547,32 @@ fn build_panel_title(
     } else {
         Style::default().fg(t.path_inactive_fg).bg(t.bg)
     };
+    // SFTP prefix if this is a remote panel
+    let sftp_prefix = panel.source.label();
+    let sftp_prefix_len = sftp_prefix.as_ref().map(|s| s.len() + 2).unwrap_or(0); // " SFTP: user@host | "
+
     // Build the git suffix first to know how much space the path gets
-    let git_suffix = build_git_suffix(panel, t);
+    let git_suffix = if panel.source.is_remote() {
+        vec![] // No git info for SFTP panels
+    } else {
+        build_git_suffix(panel, t)
+    };
     let git_len: usize = git_suffix.iter().map(|s| s.width()).sum();
     // 4 = " " prefix + " " suffix + 2 border chars
-    let path_budget = panel_width.saturating_sub(git_len + 4);
+    let path_budget = panel_width.saturating_sub(git_len + sftp_prefix_len + 4);
 
     // Shorten path: replace home dir with ~, then truncate from left
     let path = shorten_path(&panel.current_dir.to_string_lossy(), path_budget);
 
     spans.push(Span::styled(" ", title_style));
+    if let Some(label) = sftp_prefix {
+        let sftp_style = Style::default()
+            .fg(t.git_branch_fg)
+            .bg(t.bg)
+            .add_modifier(Modifier::BOLD);
+        spans.push(Span::styled(label, sftp_style));
+        spans.push(Span::styled(" ", title_style));
+    }
     spans.push(Span::styled(path, title_style));
 
     spans.extend(git_suffix);

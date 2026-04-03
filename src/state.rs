@@ -12,6 +12,10 @@ fn default_split() -> u16 {
 /// Persistent application state saved to ~/.config/middle-manager/state.json
 #[derive(Debug, Serialize, Deserialize)]
 pub struct AppState {
+    /// Color theme name.
+    #[serde(default)]
+    pub theme: String,
+
     /// Last editor search parameters.
     #[serde(default)]
     pub search_query: String,
@@ -55,6 +59,14 @@ pub struct AppState {
     #[serde(default)]
     pub claude_dir_right: Option<String>,
 
+    /// SSH host names for restoration.
+    #[serde(default)]
+    pub ssh_host_left: Option<String>,
+    #[serde(default)]
+    pub ssh_host_right: Option<String>,
+    #[serde(default = "default_split")]
+    pub split_pct_ssh: u16,
+
     /// Panel sort preferences.
     #[serde(default)]
     pub left_sort_field: u8,
@@ -69,6 +81,7 @@ pub struct AppState {
 impl Default for AppState {
     fn default() -> Self {
         Self {
+            theme: String::new(),
             search_query: String::new(),
             search_direction_forward: false,
             search_case_sensitive: false,
@@ -84,6 +97,9 @@ impl Default for AppState {
             right_bottom_panels: String::new(),
             claude_dir_left: None,
             claude_dir_right: None,
+            ssh_host_left: None,
+            ssh_host_right: None,
+            split_pct_ssh: 60,
             left_sort_field: 0,
             left_sort_ascending: true,
             right_sort_field: 0,
