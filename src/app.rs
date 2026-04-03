@@ -1761,6 +1761,9 @@ impl App {
                 KeyCode::F(10) => Action::Quit,
                 // F1 switches focus away from Claude (Tab forwarded to claude)
                 KeyCode::F(1) => Action::SwitchPanel,
+                // Shift+PageUp/Down for scrollback (not used by Claude Code)
+                KeyCode::PageUp if key.modifiers.contains(KeyModifiers::SHIFT) => Action::PageUp,
+                KeyCode::PageDown if key.modifiers.contains(KeyModifiers::SHIFT) => Action::PageDown,
                 // Everything else (including Tab) is forwarded to the terminal
                 _ => Action::TerminalInput(crate::terminal::encode_key_event(key)),
             };
@@ -4867,14 +4870,16 @@ impl App {
                     self.handle_mouse_double_click(col, row);
                 }
             }
-            Action::MouseScrollUp(_, _) => {
+            Action::MouseScrollUp(_, _) | Action::PageUp => {
                 if let Some(ref mut tp) = self.claude_panels[side] {
-                    tp.scroll_up(3);
+                    let lines = if matches!(action, Action::PageUp) { 20 } else { 3 };
+                    tp.scroll_up(lines);
                 }
             }
-            Action::MouseScrollDown(_, _) => {
+            Action::MouseScrollDown(_, _) | Action::PageDown => {
                 if let Some(ref mut tp) = self.claude_panels[side] {
-                    tp.scroll_down(3);
+                    let lines = if matches!(action, Action::PageDown) { 20 } else { 3 };
+                    tp.scroll_down(lines);
                 }
             }
             _ => {}

@@ -115,7 +115,7 @@ pub fn create_session(name: &str) -> anyhow::Result<()> {
         ("xterm-keys", "on"),
         ("default-terminal", "xterm-256color"),
         ("escape-time", "0"),          // No delay after Esc (faster key handling)
-        ("mouse", "on"),               // Pass mouse events through
+        ("mouse", "on"),               // Enable mouse passthrough
     ];
     for (key, val) in opts {
         let _ = Command::new("tmux")
@@ -125,6 +125,24 @@ pub fn create_session(name: &str) -> anyhow::Result<()> {
     // Bind ` ` to send literal backtick
     let _ = Command::new("tmux")
         .args(["bind-key", "`", "send-prefix"])
+        .status();
+
+    // Prevent tmux from entering copy-mode on scroll -- pass scroll events to the app.
+    // By default, tmux intercepts WheelUp to enter copy-mode. We override that to
+    // send the actual scroll escape sequences to middle-manager.
+    let _ = Command::new("tmux")
+        .args(["unbind-key", "-T", "root", "WheelUpPane"])
+        .status();
+    let _ = Command::new("tmux")
+        .args(["unbind-key", "-T", "root", "WheelDownPane"])
+        .status();
+    let _ = Command::new("tmux")
+        .args(["bind-key", "-T", "root", "WheelUpPane",
+               "send-keys", "-M"])
+        .status();
+    let _ = Command::new("tmux")
+        .args(["bind-key", "-T", "root", "WheelDownPane",
+               "send-keys", "-M"])
         .status();
 
     Ok(())
