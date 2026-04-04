@@ -25,6 +25,7 @@ use crate::panel::git::GitCache;
 use crate::panel::sort::SortField;
 use crate::panel::Panel;
 use crate::parquet_viewer::ParquetViewerState;
+use crate::pr_diff::PrDiffPanel;
 use crate::state::AppState;
 use crate::terminal::TerminalPanel;
 use crate::text_input::TextInput;
@@ -50,6 +51,8 @@ use crate::viewer::ViewerState;
 pub struct App {
     pub panels: [Panel; 2],
     pub active_panel: usize,
+    /// Which panel currently has keyboard focus.
+    pub focus: PanelFocus,
     pub mode: AppMode,
     pub should_quit: bool,
     pub status_message: Option<String>,
@@ -79,8 +82,10 @@ pub struct App {
     dir_watcher: Option<DirWatcher>,
     /// CI panels (one per file panel side, independently togglable).
     pub ci_panels: [Option<CiPanel>; 2],
-    /// Which CI panel has focus (None = file panel has focus).
-    pub ci_focused: Option<usize>,
+    /// PR diff panels (one per file panel side, independently togglable).
+    pub diff_panels: [Option<PrDiffPanel>; 2],
+    /// Rendered areas for diff panels (for click detection).
+    pub diff_panel_areas: [Option<Rect>; 2],
     /// Go-to-path input per panel side. When Some, a path editor is shown at the top of the panel.
     pub goto_path: [Option<GotoPathState>; 2],
     /// Fuzzy file search per panel side.
@@ -91,18 +96,12 @@ pub struct App {
     pub settings_open: Option<usize>,
     /// Shell panels (one per file panel side, like CI panels).
     pub shell_panels: [Option<TerminalPanel>; 2],
-    /// Which shell panel has focus (None = not focused).
-    pub shell_focused: Option<usize>,
     /// Claude Code panels (one per file panel side, like shell panels).
     pub claude_panels: [Option<TerminalPanel>; 2],
-    /// Which Claude panel has focus.
-    pub claude_focused: Option<usize>,
     /// Rendered areas for Claude panels (for click detection and resize).
     pub claude_panel_areas: [Option<Rect>; 2],
     /// SSH panels (one per file panel side, like shell panels).
     pub ssh_panels: [Option<TerminalPanel>; 2],
-    /// Which SSH panel has focus.
-    pub ssh_focused: Option<usize>,
     /// Rendered areas for SSH panels (for click detection and resize).
     pub ssh_panel_areas: [Option<Rect>; 2],
     /// SSH host info for each side (for reconnection on disconnect).
@@ -119,8 +118,6 @@ pub struct App {
     pub file_search: Option<SearchState>,
     /// Which side the search results are displayed on.
     pub file_search_side: usize,
-    /// Whether the search results panel has focus.
-    pub file_search_focused: bool,
     /// File content search dialog.
     pub file_search_dialog: Option<FileSearchDialogState>,
     /// Wakeup sender for the event loop (given to terminal reader threads).
@@ -135,6 +132,8 @@ pub struct App {
     pub archive_progress: Option<ArchiveProgress>,
     /// Pending background remote connection (SMB or WebDAV).
     pending_remote: Option<PendingRemoteConnect>,
+    /// Stashed diff viewer context for F4 editor↔diff toggle.
+    pub stashed_diff: Option<StashedDiff>,
 }
 
 /// Result of a background remote connection attempt.
@@ -147,6 +146,13 @@ struct PendingRemoteConnect {
     rx: std::sync::mpsc::Receiver<RemoteConnectResult>,
     side: usize,
     started: std::time::Instant,
+}
+
+pub struct StashedDiff {
+    pub repo_root: PathBuf,
+    pub file_path: String,
+    pub base_branch: String,
+    pub cursor: usize,
 }
 
 pub struct GotoPathState {
@@ -349,7 +355,19 @@ pub enum AppMode {
     Viewing(Box<ViewerState>),
     HexViewing(Box<HexViewerState>),
     ParquetViewing(Box<ParquetViewerState>),
+    DiffViewing(Box<crate::diff_viewer::DiffViewerState>),
     Editing(Box<EditorState>),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PanelFocus {
+    FilePanel,
+    Ci(usize),
+    Diff(usize),
+    Shell(usize),
+    Claude(usize),
+    Ssh(usize),
+    Search,
 }
 
 // --- Simple dialog (delete, mkdir, rename) ---
@@ -1161,6 +1179,7 @@ impl App {
         Self {
             panels,
             active_panel: 0,
+            focus: PanelFocus::FilePanel,
             mode: AppMode::Normal,
             should_quit: false,
             status_message: None,
@@ -1178,7 +1197,8 @@ impl App {
             persisted,
             dir_watcher,
             ci_panels: [None, None],
-            ci_focused: None,
+            diff_panels: [None, None],
+            diff_panel_areas: [None, None],
             quit_confirm: None,
             popup: None,
             goto_path: [None, None],
@@ -1186,12 +1206,9 @@ impl App {
             help_scroll: None,
             settings_open: None,
             shell_panels: [None, None],
-            shell_focused: None,
             claude_panels: [None, None],
-            claude_focused: None,
             claude_panel_areas: [None, None],
             ssh_panels: [None, None],
-            ssh_focused: None,
             ssh_panel_areas: [None, None],
             ssh_hosts: [None, None],
             ssh_dialog: None,
@@ -1200,7 +1217,6 @@ impl App {
             bottom_maximized: [false, false],
             file_search: None,
             file_search_side: 1,
-            file_search_focused: false,
             file_search_dialog: None,
             wakeup_sender: None,
             last_cursor_pos: None,
@@ -1208,6 +1224,7 @@ impl App {
             dialog_content_area: None,
             archive_progress: None,
             pending_remote: None,
+            stashed_diff: None,
         }
     }
 
@@ -1242,6 +1259,12 @@ impl App {
                     "ci" => {
                         if let Some(ref gi) = self.panels[side].git_info {
                             self.ci_panels[side] = Some(CiPanel::for_branch(&dir, &gi.branch));
+                            self.bottom_split_pct[side] = self.persisted.split_pct_ci;
+                        }
+                    }
+                    "diff" => {
+                        if self.panels[side].git_info.is_some() {
+                            self.diff_panels[side] = Some(PrDiffPanel::for_branch(&dir));
                             self.bottom_split_pct[side] = self.persisted.split_pct_ci;
                         }
                     }
@@ -1326,6 +1349,9 @@ impl App {
                 self.persisted.split_pct_ci = pct;
                 panels.push("ci");
             }
+            if self.diff_panels[side].is_some() {
+                panels.push("diff");
+            }
             if self.shell_panels[side].is_some() {
                 self.persisted.split_pct_shell = pct;
                 panels.push("shell");
@@ -1381,8 +1407,8 @@ impl App {
                     .unwrap_or(false);
                 if !still_valid && ci.download.is_none() {
                     self.ci_panels[side] = None;
-                    if self.ci_focused == Some(side) {
-                        self.ci_focused = None;
+                    if self.focus == PanelFocus::Ci(side) {
+                        self.focus = PanelFocus::FilePanel;
                     }
                 }
             }
@@ -1501,6 +1527,18 @@ impl App {
                 else { connection.upload(local, remote) }
             }
             _ => anyhow::bail!("Not a remote panel"),
+        }
+    }
+
+    /// Which side (0 or 1) the focused bottom panel is on, or active_panel if no bottom panel focused.
+    fn focused_side(&self) -> usize {
+        match self.focus {
+            PanelFocus::Ci(s)
+            | PanelFocus::Diff(s)
+            | PanelFocus::Shell(s)
+            | PanelFocus::Claude(s)
+            | PanelFocus::Ssh(s) => s,
+            _ => self.active_panel,
         }
     }
 
@@ -1752,110 +1790,148 @@ impl App {
             };
         }
 
-        // Claude panel intercepts keys when focused
-        if self.claude_focused.is_some() {
-            return match key.code {
-                // These keys are reserved for middle-manager
-                KeyCode::F(5) => Action::TerminalOpenFile,
-                KeyCode::F(12) => Action::ToggleClaude,
-                KeyCode::F(10) => Action::Quit,
-                // F1 switches focus away from Claude (Tab forwarded to claude)
-                KeyCode::F(1) => Action::SwitchPanel,
-                // Shift+PageUp/Down for scrollback (not used by Claude Code)
-                KeyCode::PageUp if key.modifiers.contains(KeyModifiers::SHIFT) => Action::PageUp,
-                KeyCode::PageDown if key.modifiers.contains(KeyModifiers::SHIFT) => Action::PageDown,
-                // Everything else (including Tab) is forwarded to the terminal
-                _ => Action::TerminalInput(crate::terminal::encode_key_event(key)),
-            };
-        }
+        // Bottom panel focus intercepts only in normal/quick-search modes
+        // (full-screen modes like DiffViewing/Editing map their own keys via AppMode match below)
+        if matches!(self.mode, AppMode::Normal | AppMode::QuickSearch) {
+            // Claude panel intercepts keys when focused
+            if matches!(self.focus, PanelFocus::Claude(_)) {
+                return match key.code {
+                    KeyCode::F(5) => Action::TerminalOpenFile,
+                    KeyCode::F(12) => Action::ToggleClaude,
+                    KeyCode::F(10) => Action::Quit,
+                    KeyCode::F(1) => Action::SwitchPanel,
+                    _ => Action::TerminalInput(crate::terminal::encode_key_event(key)),
+                };
+            }
 
-        // File search results intercepts keys when focused
-        if self.file_search_focused && self.file_search.is_some() {
-            return match key.code {
-                KeyCode::Esc => Action::DialogCancel,
-                KeyCode::Enter => Action::DialogConfirm,
-                KeyCode::Up => Action::MoveUp,
-                KeyCode::Down => Action::MoveDown,
-                KeyCode::PageUp => Action::PageUp,
-                KeyCode::PageDown => Action::PageDown,
-                KeyCode::Home => Action::MoveToTop,
-                KeyCode::End => Action::MoveToBottom,
-                KeyCode::Right => Action::CursorRight, // expand
-                KeyCode::Left => Action::GoUp,         // collapse
-                KeyCode::Tab => Action::SwitchPanel,
-                KeyCode::BackTab => Action::SwitchPanelReverse,
-                KeyCode::F(10) => Action::Quit,
-                _ => Action::None,
-            };
-        }
+            // File search results intercepts keys when focused
+            if self.focus == PanelFocus::Search && self.file_search.is_some() {
+                return match key.code {
+                    KeyCode::Esc => Action::DialogCancel,
+                    KeyCode::Enter => Action::DialogConfirm,
+                    KeyCode::Up => Action::MoveUp,
+                    KeyCode::Down => Action::MoveDown,
+                    KeyCode::PageUp => Action::PageUp,
+                    KeyCode::PageDown => Action::PageDown,
+                    KeyCode::Home => Action::MoveToTop,
+                    KeyCode::End => Action::MoveToBottom,
+                    KeyCode::Right => Action::CursorRight,
+                    KeyCode::Left => Action::GoUp,
+                    KeyCode::Tab => Action::SwitchPanel,
+                    KeyCode::BackTab => Action::SwitchPanelReverse,
+                    KeyCode::F(10) => Action::Quit,
+                    _ => Action::None,
+                };
+            }
 
-        // Shell panel intercepts keys when focused
-        if self.shell_focused.is_some() {
-            return match key.code {
-                KeyCode::F(1) => Action::SwitchPanel,
-                KeyCode::F(10) => Action::Quit,
-                KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    Action::ToggleShell
-                }
-                // Alt+Up/Down/Enter for resize/maximize
-                KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => Action::BottomResizeUp,
-                KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
-                    Action::BottomResizeDown
-                }
-                KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
-                    Action::BottomMaximize
-                }
-                _ => Action::TerminalInput(crate::terminal::encode_key_event(key)),
-            };
-        }
+            // Shell panel intercepts keys when focused
+            if matches!(self.focus, PanelFocus::Shell(_)) {
+                return match key.code {
+                    KeyCode::F(1) => Action::SwitchPanel,
+                    KeyCode::F(10) => Action::Quit,
+                    KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Action::ToggleShell
+                    }
+                    KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                        Action::BottomResizeUp
+                    }
+                    KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                        Action::BottomResizeDown
+                    }
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                        Action::BottomMaximize
+                    }
+                    _ => Action::TerminalInput(crate::terminal::encode_key_event(key)),
+                };
+            }
 
-        // SSH panel intercepts keys when focused
-        if self.ssh_focused.is_some() {
-            return match key.code {
-                KeyCode::F(1) => Action::SwitchPanel,
-                KeyCode::F(10) => Action::Quit,
-                KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    Action::ToggleSsh
-                }
-                // Alt+Up/Down/Enter for resize/maximize
-                KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => Action::BottomResizeUp,
-                KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
-                    Action::BottomResizeDown
-                }
-                KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
-                    Action::BottomMaximize
-                }
-                _ => Action::TerminalInput(crate::terminal::encode_key_event(key)),
-            };
-        }
+            // SSH panel intercepts keys when focused
+            if matches!(self.focus, PanelFocus::Ssh(_)) {
+                return match key.code {
+                    KeyCode::F(1) => Action::SwitchPanel,
+                    KeyCode::F(10) => Action::Quit,
+                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Action::ToggleSsh
+                    }
+                    KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                        Action::BottomResizeUp
+                    }
+                    KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                        Action::BottomResizeDown
+                    }
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                        Action::BottomMaximize
+                    }
+                    _ => Action::TerminalInput(crate::terminal::encode_key_event(key)),
+                };
+            }
 
-        // CI panel intercepts keys when focused
-        if self.ci_focused.is_some() {
-            return match key.code {
-                KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => Action::BottomResizeUp,
-                KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
-                    Action::BottomResizeDown
-                }
-                KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
-                    Action::BottomMaximize
-                }
-                KeyCode::Up => Action::MoveUp,
-                KeyCode::Down => Action::MoveDown,
-                KeyCode::PageUp => Action::PageUp,
-                KeyCode::PageDown => Action::PageDown,
-                KeyCode::Home => Action::MoveToTop,
-                KeyCode::End => Action::MoveToBottom,
-                KeyCode::Enter => Action::Enter,
-                KeyCode::Right => Action::CursorRight,
-                KeyCode::Left => Action::GoUp,
-                KeyCode::Char('o') => Action::OpenPr,
-                KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::ExtractCiFailures,
-                KeyCode::Tab => Action::SwitchPanel,
-                KeyCode::BackTab => Action::SwitchPanelReverse,
-                KeyCode::F(2) => Action::ToggleCi,
-                KeyCode::F(10) => Action::Quit,
-                _ => Action::None,
-            };
+            // CI panel intercepts keys when focused
+            if matches!(self.focus, PanelFocus::Ci(_)) {
+                return match key.code {
+                    KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                        Action::BottomResizeUp
+                    }
+                    KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                        Action::BottomResizeDown
+                    }
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                        Action::BottomMaximize
+                    }
+                    KeyCode::Up => Action::MoveUp,
+                    KeyCode::Down => Action::MoveDown,
+                    KeyCode::PageUp => Action::PageUp,
+                    KeyCode::PageDown => Action::PageDown,
+                    KeyCode::Home => Action::MoveToTop,
+                    KeyCode::End => Action::MoveToBottom,
+                    KeyCode::Enter => Action::Enter,
+                    KeyCode::Right => Action::CursorRight,
+                    KeyCode::Left => Action::GoUp,
+                    KeyCode::Char('o') => Action::OpenPr,
+                    KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::ExtractCiFailures,
+                    KeyCode::Tab => Action::SwitchPanel,
+                    KeyCode::BackTab => Action::SwitchPanelReverse,
+                    KeyCode::F(2) => Action::ToggleCi,
+                    KeyCode::F(10) => Action::Quit,
+                    _ => Action::None,
+                };
+            }
+
+            // Diff panel intercepts keys when focused
+            if matches!(self.focus, PanelFocus::Diff(_)) {
+                return match key.code {
+                    KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                        Action::BottomResizeUp
+                    }
+                    KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                        Action::BottomResizeDown
+                    }
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                        Action::BottomMaximize
+                    }
+                    KeyCode::Up => Action::MoveUp,
+                    KeyCode::Down => Action::MoveDown,
+                    KeyCode::PageUp => Action::PageUp,
+                    KeyCode::PageDown => Action::PageDown,
+                    KeyCode::Home => Action::MoveToTop,
+                    KeyCode::End => Action::MoveToBottom,
+                    KeyCode::Enter => Action::Enter,
+                    KeyCode::F(4) => Action::EditBuiltin,
+                    KeyCode::Right => Action::CursorRight,
+                    KeyCode::Left => Action::GoUp,
+                    KeyCode::Tab => Action::SwitchPanel,
+                    KeyCode::BackTab => Action::SwitchPanelReverse,
+                    KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Action::ToggleDiff
+                    }
+                    KeyCode::Esc => Action::QuickSearchClear,
+                    KeyCode::F(10) => Action::Quit,
+                    KeyCode::Char(c) if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' => {
+                        Action::QuickSearch(c)
+                    }
+                    _ => Action::None,
+                };
+            }
         }
 
         // Settings dialog intercepts keys when open
@@ -1946,6 +2022,18 @@ impl App {
             AppMode::ArchiveDialog(state) => Self::map_archive_dialog_key(key, state.focused),
             AppMode::Viewing(_) | AppMode::HexViewing(_) => self.map_viewer_key(key),
             AppMode::ParquetViewing(_) => self.map_parquet_key(key),
+            AppMode::DiffViewing(ref d) => {
+                if d.search_input.is_some() {
+                    return match key.code {
+                        KeyCode::Esc => Action::DialogCancel,
+                        KeyCode::Enter => Action::DialogConfirm,
+                        KeyCode::Backspace => Action::DialogBackspace,
+                        KeyCode::Char(c) => Action::DialogInput(c),
+                        _ => Action::None,
+                    };
+                }
+                Self::map_diff_viewer_key(key)
+            }
             AppMode::Editing(_) => Self::map_editor_key(key),
         }
     }
@@ -2027,6 +2115,9 @@ impl App {
             }
             KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::ToggleSessions
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::ToggleDiff
             }
             KeyCode::Char(c) if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' => {
                 Action::QuickSearch(c)
@@ -2451,6 +2542,44 @@ impl App {
         }
     }
 
+    fn map_diff_viewer_key(key: KeyEvent) -> Action {
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if ctrl {
+            return match key.code {
+                KeyCode::Char('c') => Action::CopySelection,
+                KeyCode::Char('a') => Action::SelectAll,
+                KeyCode::Char('f') => Action::SearchPrompt,
+                _ => Action::None,
+            };
+        }
+        match key.code {
+            // Alt/Opt+Up/Down: prev/next diff hunk
+            KeyCode::Up if alt => Action::WordLeft, // prev hunk
+            KeyCode::Down if alt => Action::FindNext, // next hunk
+            KeyCode::Up if shift => Action::SelectUp,
+            KeyCode::Down if shift => Action::SelectDown,
+            KeyCode::Left if shift => Action::SelectLeft,
+            KeyCode::Right if shift => Action::SelectRight,
+            KeyCode::Up => Action::MoveUp,
+            KeyCode::Down => Action::MoveDown,
+            KeyCode::Left => Action::CursorLeft,
+            KeyCode::Right => Action::CursorRight,
+            KeyCode::Home => Action::CursorLineStart,
+            KeyCode::End => Action::CursorLineEnd,
+            KeyCode::PageUp => Action::PageUp,
+            KeyCode::PageDown => Action::PageDown,
+            KeyCode::Char('n') => Action::FindNext,
+            KeyCode::Char('N') => Action::WordLeft,
+            KeyCode::Char('g') => Action::GotoLinePrompt,
+            KeyCode::Tab => Action::SwitchPanel,
+            KeyCode::F(4) => Action::EditBuiltin,
+            KeyCode::Char('q') | KeyCode::Esc => Action::DialogCancel,
+            _ => Action::None,
+        }
+    }
+
     fn map_parquet_key(&self, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Up => Action::MoveUp,
@@ -2548,6 +2677,7 @@ impl App {
 
         // Mark dirty if any async data sources are active
         let has_active_async = self.ci_panels.iter().any(|c| c.is_some())
+            || self.diff_panels.iter().any(|d| d.is_some())
             || self
                 .file_search
                 .as_ref()
@@ -2571,7 +2701,9 @@ impl App {
             if let Some(result) = ci.poll_download() {
                 match result {
                     Ok(path) => {
-                        self.ci_focused = None;
+                        if matches!(self.focus, PanelFocus::Ci(_)) {
+                            self.focus = PanelFocus::FilePanel;
+                        }
                         self.mode =
                             AppMode::Editing(Box::new(crate::editor::EditorState::open(path)));
                         return;
@@ -2600,7 +2732,7 @@ impl App {
                                         failures.len(),
                                         output_path.display()
                                     ));
-                                    self.ci_focused = None;
+                                    self.focus = PanelFocus::FilePanel;
                                     self.mode = AppMode::Editing(Box::new(
                                         crate::editor::EditorState::open(output_path),
                                     ));
@@ -2621,14 +2753,18 @@ impl App {
                 }
             }
         }
+        // Poll diff panels
+        for diff in self.diff_panels.iter_mut().flatten() {
+            diff.poll();
+        }
         // Poll Claude panels
         for side in 0..2 {
             if let Some(ref mut tp) = self.claude_panels[side] {
                 tp.poll();
                 if tp.exited {
                     self.claude_panels[side] = None;
-                    if self.claude_focused == Some(side) {
-                        self.claude_focused = None;
+                    if self.focus == PanelFocus::Claude(side) {
+                        self.focus = PanelFocus::FilePanel;
                     }
                 }
             }
@@ -2639,8 +2775,8 @@ impl App {
                 sp.poll();
                 if sp.exited {
                     self.shell_panels[side] = None;
-                    if self.shell_focused == Some(side) {
-                        self.shell_focused = None;
+                    if self.focus == PanelFocus::Shell(side) {
+                        self.focus = PanelFocus::FilePanel;
                     }
                 }
             }
@@ -2892,14 +3028,12 @@ impl App {
                                 }
                             }
                             self.unsaved_dialog = None;
-                            self.mode = AppMode::Normal;
-                            self.needs_clear = true;
+                            self.restore_or_close_editor();
                             self.reload_panels();
                         }
                         UnsavedDialogField::Discard => {
                             self.unsaved_dialog = None;
-                            self.mode = AppMode::Normal;
-                            self.needs_clear = true;
+                            self.restore_or_close_editor();
                         }
                         UnsavedDialogField::Cancel => {
                             self.unsaved_dialog = None;
@@ -2931,26 +3065,36 @@ impl App {
             return;
         }
 
-        // CI panel intercepts when focused
-        if self.ci_focused.is_some() {
-            self.handle_ci_action(action);
-            return;
-        }
+        // Bottom panel focus intercepts only apply in normal/quick-search modes
+        // (full-screen modes like DiffViewing/Editing handle their own keys)
+        if matches!(self.mode, AppMode::Normal | AppMode::QuickSearch) {
+            // CI panel intercepts when focused
+            if matches!(self.focus, PanelFocus::Ci(_)) {
+                self.handle_ci_action(action);
+                return;
+            }
 
-        // Claude panel intercepts when focused
-        if self.claude_focused.is_some() {
-            self.handle_claude_action(action);
-            return;
-        }
+            // Diff panel intercepts when focused
+            if matches!(self.focus, PanelFocus::Diff(_)) {
+                self.handle_diff_action(action);
+                return;
+            }
 
-        // Shell panel intercepts when focused
-        if self.shell_focused.is_some() {
-            self.handle_shell_action(action);
-            return;
+            // Claude panel intercepts when focused
+            if matches!(self.focus, PanelFocus::Claude(_)) {
+                self.handle_claude_action(action);
+                return;
+            }
+
+            // Shell panel intercepts when focused
+            if matches!(self.focus, PanelFocus::Shell(_)) {
+                self.handle_shell_action(action);
+                return;
+            }
         }
 
         // SSH panel intercepts when focused
-        if self.ssh_focused.is_some() {
+        if matches!(self.focus, PanelFocus::Ssh(_)) {
             self.handle_ssh_action(action);
             return;
         }
@@ -2996,7 +3140,7 @@ impl App {
         }
 
         // File search results intercepts when focused
-        if self.file_search_focused && self.file_search.is_some() {
+        if self.focus == PanelFocus::Search && self.file_search.is_some() {
             self.handle_file_search_results(action);
             return;
         }
@@ -3005,6 +3149,207 @@ impl App {
         if self.fuzzy_search[self.active_panel].is_some() {
             self.handle_fuzzy_search_action(action);
             return;
+        }
+
+        // Diff viewer: intercept cursor movement, selection, search, next/prev change, edit-switch
+        if matches!(self.mode, AppMode::DiffViewing(_)) {
+            // Handle search input mode first
+            if let AppMode::DiffViewing(ref mut d) = self.mode {
+                if d.search_input.is_some() {
+                    match action {
+                        Action::DialogCancel => {
+                            d.search_input = None;
+                        }
+                        Action::DialogConfirm | Action::EditorNewline | Action::Enter => {
+                            if let Some(query) = d.search_input.take() {
+                                if query.is_empty() {
+                                    d.clear_search();
+                                } else {
+                                    d.search(&query);
+                                    d.search_next();
+                                }
+                            }
+                        }
+                        Action::DialogInput(c) => {
+                            if let Some(ref mut input) = d.search_input {
+                                input.push(c);
+                            }
+                        }
+                        Action::DialogBackspace => {
+                            if let Some(ref mut input) = d.search_input {
+                                input.pop();
+                            }
+                        }
+                        _ => {}
+                    }
+                    return;
+                }
+            }
+
+            match action {
+                Action::CursorLeft => {
+                    if let AppMode::DiffViewing(ref mut d) = self.mode {
+                        d.clear_selection();
+                        d.move_cursor_left();
+                    }
+                    return;
+                }
+                Action::CursorRight => {
+                    if let AppMode::DiffViewing(ref mut d) = self.mode {
+                        d.clear_selection();
+                        d.move_cursor_right();
+                    }
+                    return;
+                }
+                Action::CursorLineStart => {
+                    if let AppMode::DiffViewing(ref mut d) = self.mode {
+                        d.clear_selection();
+                        d.cursor_home();
+                    }
+                    return;
+                }
+                Action::CursorLineEnd => {
+                    if let AppMode::DiffViewing(ref mut d) = self.mode {
+                        d.clear_selection();
+                        d.cursor_end();
+                    }
+                    return;
+                }
+                Action::SelectUp => {
+                    if let AppMode::DiffViewing(ref mut d) = self.mode {
+                        d.select_up();
+                    }
+                    return;
+                }
+                Action::SelectDown => {
+                    if let AppMode::DiffViewing(ref mut d) = self.mode {
+                        d.select_down();
+                    }
+                    return;
+                }
+                Action::SelectLeft => {
+                    if let AppMode::DiffViewing(ref mut d) = self.mode {
+                        d.select_left();
+                    }
+                    return;
+                }
+                Action::SelectRight => {
+                    if let AppMode::DiffViewing(ref mut d) = self.mode {
+                        d.select_right();
+                    }
+                    return;
+                }
+                Action::SelectAll => {
+                    if let AppMode::DiffViewing(ref mut d) = self.mode {
+                        d.select_all();
+                    }
+                    return;
+                }
+                Action::CopySelection => {
+                    if let AppMode::DiffViewing(ref d) = self.mode {
+                        d.copy_to_clipboard();
+                    }
+                    return;
+                }
+                Action::SwitchPanel => {
+                    if let AppMode::DiffViewing(ref mut d) = self.mode {
+                        d.clear_selection();
+                        d.switch_side();
+                    }
+                    return;
+                }
+                Action::FindNext => {
+                    // n: search next if search active, otherwise next change
+                    if let AppMode::DiffViewing(ref mut d) = self.mode {
+                        d.clear_selection();
+                        if d.search_query.is_some() {
+                            d.search_next();
+                        } else {
+                            d.next_change();
+                        }
+                    }
+                    return;
+                }
+                Action::WordLeft => {
+                    // N: search prev if search active, otherwise prev change
+                    if let AppMode::DiffViewing(ref mut d) = self.mode {
+                        d.clear_selection();
+                        if d.search_query.is_some() {
+                            d.search_prev();
+                        } else {
+                            d.prev_change();
+                        }
+                    }
+                    return;
+                }
+                Action::SearchPrompt => {
+                    // Ctrl+F: open search input
+                    if let AppMode::DiffViewing(ref mut d) = self.mode {
+                        d.search_input = Some(d.search_query.clone().unwrap_or_default());
+                    }
+                    return;
+                }
+                Action::GotoLinePrompt => {
+                    if matches!(self.mode, AppMode::DiffViewing(_)) {
+                        self.goto_line_input = Some(String::new());
+                    }
+                    return;
+                }
+                Action::EditBuiltin => {
+                    // Switch from diff viewer to editor at current line
+                    if let AppMode::DiffViewing(ref d) = self.mode {
+                        let line = d.current_line();
+                        let cursor_offset = d.cursor.saturating_sub(d.scroll);
+                        let cursor = d.cursor;
+                        let file_path = d.path.clone();
+                        let (repo_root, base_branch) = if let PanelFocus::Diff(side) = self.focus {
+                            self.diff_panels[side]
+                                .as_ref()
+                                .map(|dp| (dp.repo_root.clone(), dp.base_branch.clone()))
+                        } else {
+                            None
+                        }
+                        .unwrap_or_else(|| {
+                            (
+                                self.panels[self.active_panel].current_dir.clone(),
+                                String::new(),
+                            )
+                        });
+                        let full_path = repo_root.join(&file_path);
+                        self.stashed_diff = Some(StashedDiff {
+                            repo_root,
+                            file_path,
+                            base_branch,
+                            cursor,
+                        });
+                        let mut editor = EditorState::open(full_path);
+                        let target = line.saturating_sub(1);
+                        if !editor.scan_complete {
+                            editor.scan_to_line(target + 100);
+                        }
+                        let total = editor.total_virtual_lines();
+                        editor.cursor_line = target.min(total.saturating_sub(1));
+                        // Maintain viewport offset: cursor stays at same visual row
+                        editor.scroll_y = editor.cursor_line.saturating_sub(cursor_offset);
+                        self.needs_clear = true;
+                        self.mode = AppMode::Editing(Box::new(editor));
+                    }
+                    return;
+                }
+                // Clear selection on non-selection movement
+                Action::MoveUp
+                | Action::MoveDown
+                | Action::PageUp
+                | Action::PageDown
+                | Action::MoveToTop
+                | Action::MoveToBottom => {
+                    if let AppMode::DiffViewing(ref mut d) = self.mode {
+                        d.clear_selection();
+                    }
+                    // fall through to normal dispatch
+                }
+                _ => {} // fall through to normal dispatch
+            }
         }
 
         match action {
@@ -3176,14 +3521,30 @@ impl App {
                             Some("Download in progress — wait for it to complete".to_string());
                     } else {
                         self.ci_panels[side] = None;
-                        if self.ci_focused == Some(side) {
-                            self.ci_focused = None;
+                        if self.focus == PanelFocus::Ci(side) {
+                            self.focus = PanelFocus::FilePanel;
                         }
                     }
                 } else if let Some(ref gi) = self.active_panel().git_info {
                     let dir = self.active_panel().current_dir.clone();
                     self.ci_panels[side] = Some(CiPanel::for_branch(&dir, &gi.branch));
-                    self.ci_focused = Some(side);
+                    self.focus = PanelFocus::Ci(side);
+                    self.bottom_split_pct[side] = self.persisted.split_pct_ci;
+                } else {
+                    self.status_message = Some("Not in a git repository".to_string());
+                }
+            }
+            Action::ToggleDiff => {
+                let side = self.active_panel;
+                if self.diff_panels[side].is_some() {
+                    self.diff_panels[side] = None;
+                    if self.focus == PanelFocus::Diff(side) {
+                        self.focus = PanelFocus::FilePanel;
+                    }
+                } else if self.active_panel().git_info.is_some() {
+                    let dir = self.active_panel().current_dir.clone();
+                    self.diff_panels[side] = Some(PrDiffPanel::for_branch(&dir));
+                    self.focus = PanelFocus::Diff(side);
                     self.bottom_split_pct[side] = self.persisted.split_pct_ci;
                 } else {
                     self.status_message = Some("Not in a git repository".to_string());
@@ -3205,8 +3566,8 @@ impl App {
                 if self.claude_panels[side].is_some() {
                     self.claude_panels[side] = None;
                     self.bottom_maximized[side] = false;
-                    if self.claude_focused == Some(side) {
-                        self.claude_focused = None;
+                    if self.focus == PanelFocus::Claude(side) {
+                        self.focus = PanelFocus::FilePanel;
                     }
                 } else if let Some(ref wakeup) = self.wakeup_sender {
                     let dir = self.panels[self.active_panel].current_dir.clone();
@@ -3216,9 +3577,7 @@ impl App {
                     match TerminalPanel::spawn_claude(&dir, cols, rows, wakeup.clone()) {
                         Ok(tp) => {
                             self.claude_panels[side] = Some(tp);
-                            self.claude_focused = Some(side);
-                            self.ci_focused = None;
-                            self.shell_focused = None;
+                            self.focus = PanelFocus::Claude(side);
                             self.bottom_maximized[side] = true;
                         }
                         Err(e) => {
@@ -3247,30 +3606,18 @@ impl App {
 
             // Bottom panel resize/maximize
             Action::BottomResizeUp => {
-                let side = self
-                    .claude_focused
-                    .or(self.shell_focused)
-                    .or(self.ci_focused)
-                    .unwrap_or(self.active_panel);
+                let side = self.focused_side();
                 self.bottom_split_pct[side] = self.bottom_split_pct[side]
                     .saturating_sub(SPLIT_RESIZE_STEP)
                     .max(SPLIT_MIN_PCT);
             }
             Action::BottomResizeDown => {
-                let side = self
-                    .claude_focused
-                    .or(self.shell_focused)
-                    .or(self.ci_focused)
-                    .unwrap_or(self.active_panel);
+                let side = self.focused_side();
                 self.bottom_split_pct[side] =
                     (self.bottom_split_pct[side] + SPLIT_RESIZE_STEP).min(SPLIT_MAX_PCT);
             }
             Action::BottomMaximize => {
-                let side = self
-                    .claude_focused
-                    .or(self.shell_focused)
-                    .or(self.ci_focused)
-                    .unwrap_or(self.active_panel);
+                let side = self.focused_side();
                 self.bottom_maximized[side] = !self.bottom_maximized[side];
             }
 
@@ -3299,6 +3646,7 @@ impl App {
             AppMode::Viewing(v) => v.scroll_up(1),
             AppMode::HexViewing(h) => h.scroll_up(1),
             AppMode::ParquetViewing(p) => p.move_up(1),
+            AppMode::DiffViewing(d) => d.scroll_up(1),
             _ => self.active_panel_mut().move_selection(-1),
         }
     }
@@ -3308,6 +3656,7 @@ impl App {
             AppMode::Viewing(v) => v.scroll_down(1),
             AppMode::HexViewing(h) => h.scroll_down(1),
             AppMode::ParquetViewing(p) => p.move_down(1),
+            AppMode::DiffViewing(d) => d.scroll_down(1),
             _ => self.active_panel_mut().move_selection(1),
         }
     }
@@ -3317,6 +3666,7 @@ impl App {
             AppMode::Viewing(v) => v.scroll_to_top(),
             AppMode::HexViewing(h) => h.scroll_to_top(),
             AppMode::ParquetViewing(p) => p.move_to_top(),
+            AppMode::DiffViewing(d) => d.scroll_to_top(),
             _ => self.active_panel_mut().move_to_top(),
         }
     }
@@ -3326,6 +3676,7 @@ impl App {
             AppMode::Viewing(v) => v.scroll_to_bottom(),
             AppMode::HexViewing(h) => h.scroll_to_bottom(),
             AppMode::ParquetViewing(p) => p.move_to_bottom(),
+            AppMode::DiffViewing(d) => d.scroll_to_bottom(),
             _ => self.active_panel_mut().move_to_bottom(),
         }
     }
@@ -3341,6 +3692,7 @@ impl App {
                 h.scroll_up(page);
             }
             AppMode::ParquetViewing(p) => p.page_up(),
+            AppMode::DiffViewing(d) => d.page_up(),
             _ => self.active_panel_mut().move_selection(-20),
         }
     }
@@ -3356,6 +3708,7 @@ impl App {
                 h.scroll_down(page);
             }
             AppMode::ParquetViewing(p) => p.page_down(),
+            AppMode::DiffViewing(d) => d.page_down(),
             _ => self.active_panel_mut().move_selection(20),
         }
     }
@@ -3406,6 +3759,7 @@ impl App {
         enum Target {
             Panel(usize),
             Ci(usize),
+            Diff(usize),
             Shell(usize),
             Claude(usize),
             Ssh(usize),
@@ -3421,6 +3775,9 @@ impl App {
         }
         if self.ci_panels[0].is_some() {
             order.push(Target::Ci(0));
+        }
+        if self.diff_panels[0].is_some() {
+            order.push(Target::Diff(0));
         }
         if self.shell_panels[0].is_some() {
             order.push(Target::Shell(0));
@@ -3441,6 +3798,9 @@ impl App {
         }
         if self.ci_panels[1].is_some() {
             order.push(Target::Ci(1));
+        }
+        if self.diff_panels[1].is_some() {
+            order.push(Target::Diff(1));
         }
         if self.shell_panels[1].is_some() {
             order.push(Target::Shell(1));
@@ -3464,30 +3824,22 @@ impl App {
             && matches!(order[1], Target::Panel(_))
         {
             self.active_panel = 1 - self.active_panel;
-            self.ci_focused = None;
-            self.shell_focused = None;
-            self.claude_focused = None;
-            self.ssh_focused = None;
-            self.file_search_focused = false;
+            self.focus = PanelFocus::FilePanel;
             return;
         }
 
-        let current = if self.file_search_focused {
-            order
+        let current = match self.focus {
+            PanelFocus::Search => order
                 .iter()
-                .position(|t| *t == Target::Search(self.file_search_side))
-        } else if let Some(side) = self.ssh_focused {
-            order.iter().position(|t| *t == Target::Ssh(side))
-        } else if let Some(side) = self.claude_focused {
-            order.iter().position(|t| *t == Target::Claude(side))
-        } else if let Some(side) = self.shell_focused {
-            order.iter().position(|t| *t == Target::Shell(side))
-        } else if let Some(side) = self.ci_focused {
-            order.iter().position(|t| *t == Target::Ci(side))
-        } else {
-            order
+                .position(|t| *t == Target::Search(self.file_search_side)),
+            PanelFocus::Ssh(side) => order.iter().position(|t| *t == Target::Ssh(side)),
+            PanelFocus::Claude(side) => order.iter().position(|t| *t == Target::Claude(side)),
+            PanelFocus::Shell(side) => order.iter().position(|t| *t == Target::Shell(side)),
+            PanelFocus::Diff(side) => order.iter().position(|t| *t == Target::Diff(side)),
+            PanelFocus::Ci(side) => order.iter().position(|t| *t == Target::Ci(side)),
+            PanelFocus::FilePanel => order
                 .iter()
-                .position(|t| *t == Target::Panel(self.active_panel))
+                .position(|t| *t == Target::Panel(self.active_panel)),
         };
 
         let len = order.len();
@@ -3505,32 +3857,32 @@ impl App {
         match &order[next] {
             Target::Panel(side) => {
                 self.active_panel = *side;
+                self.focus = PanelFocus::FilePanel;
             }
             Target::Ci(side) => {
-                self.ci_focused = Some(*side);
+                self.focus = PanelFocus::Ci(*side);
+            }
+            Target::Diff(side) => {
+                self.focus = PanelFocus::Diff(*side);
             }
             Target::Shell(side) => {
-                self.shell_focused = Some(*side);
+                self.focus = PanelFocus::Shell(*side);
             }
             Target::Claude(side) => {
-                self.claude_focused = Some(*side);
+                self.focus = PanelFocus::Claude(*side);
             }
             Target::Ssh(side) => {
-                self.ssh_focused = Some(*side);
+                self.focus = PanelFocus::Ssh(*side);
             }
             Target::Search(_) => {
-                self.file_search_focused = true;
+                self.focus = PanelFocus::Search;
             }
         }
     }
 
     /// Clear all bottom-panel focus flags.
     fn unfocus_all(&mut self) {
-        self.ci_focused = None;
-        self.shell_focused = None;
-        self.claude_focused = None;
-        self.ssh_focused = None;
-        self.file_search_focused = false;
+        self.focus = PanelFocus::FilePanel;
     }
 
     fn handle_goto_line_action(&mut self, action: Action) {
@@ -3839,10 +4191,7 @@ impl App {
                         search.poll(); // get initial results
                         self.file_search = Some(search);
                         self.file_search_side = search_side;
-                        self.file_search_focused = true;
-                        self.ci_focused = None;
-                        self.shell_focused = None;
-                        self.claude_focused = None;
+                        self.focus = PanelFocus::Search;
                     }
                 }
             }
@@ -3899,7 +4248,7 @@ impl App {
         match action {
             Action::DialogCancel => {
                 self.file_search = None;
-                self.file_search_focused = false;
+                self.focus = PanelFocus::FilePanel;
             }
             Action::DialogConfirm => {
                 // Open selected match in editor and highlight search term
@@ -3926,7 +4275,7 @@ impl App {
                         // Restore scroll position (find may have changed it)
                         editor.scroll_y = target_line;
                         editor.last_search = Some(params);
-                        self.file_search_focused = false;
+                        self.focus = PanelFocus::FilePanel;
                         self.mode = AppMode::Editing(Box::new(editor));
                     }
                 }
@@ -4020,7 +4369,7 @@ impl App {
                     }
                 } else {
                     // Click outside — unfocus search, pass to normal handler
-                    self.file_search_focused = false;
+                    self.focus = PanelFocus::FilePanel;
                     self.handle_mouse_click(col, row);
                 }
             }
@@ -4075,6 +4424,12 @@ impl App {
                 e.desired_col = col;
                 e.clamp_cursor_col();
                 e.scroll_to_cursor();
+            }
+            AppMode::DiffViewing(d) => {
+                let target = line.min(d.lines.len().saturating_sub(1));
+                d.cursor = target;
+                d.cursor_col = col;
+                d.scroll_down(0); // clamps and ensures visibility
             }
             _ => {}
         }
@@ -4170,8 +4525,7 @@ impl App {
                 if modified {
                     self.unsaved_dialog = Some(UnsavedDialogField::Save);
                 } else {
-                    self.mode = AppMode::Normal;
-                    self.needs_clear = true;
+                    self.restore_or_close_editor();
                 }
             }
 
@@ -4722,9 +5076,9 @@ impl App {
     // --- CI panel handler ---
 
     fn handle_ci_action(&mut self, action: Action) {
-        let side = match self.ci_focused {
-            Some(s) => s,
-            None => return,
+        let side = match self.focus {
+            PanelFocus::Ci(s) => s,
+            _ => return,
         };
 
         match action {
@@ -4794,7 +5148,7 @@ impl App {
                         Some("Download in progress — wait for it to complete".to_string());
                 } else {
                     self.ci_panels[side] = None;
-                    self.ci_focused = None;
+                    self.focus = PanelFocus::FilePanel;
                 }
             }
             Action::OpenPr => {
@@ -4828,10 +5182,166 @@ impl App {
         }
     }
 
+    fn handle_diff_action(&mut self, action: Action) {
+        let side = match self.focus {
+            PanelFocus::Diff(s) => s,
+            _ => return,
+        };
+
+        // Check if quick search is active (before clearing)
+        let has_search = self.diff_panels[side]
+            .as_ref()
+            .is_some_and(|d| d.quick_search.is_some());
+
+        // Clear quick search on navigation (but not on Up/Down which cycle matches)
+        if !matches!(
+            action,
+            Action::None
+                | Action::Tick
+                | Action::Resize(_, _)
+                | Action::QuickSearch(_)
+                | Action::QuickSearchClear
+                | Action::MoveUp
+                | Action::MoveDown
+        ) {
+            if let Some(ref mut diff) = self.diff_panels[side] {
+                diff.quick_search = None;
+            }
+        }
+
+        match action {
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
+            Action::MoveUp => {
+                if let Some(ref mut diff) = self.diff_panels[side] {
+                    if has_search {
+                        diff.jump_to_prev_match();
+                    } else {
+                        diff.move_up();
+                    }
+                }
+            }
+            Action::MoveDown => {
+                if let Some(ref mut diff) = self.diff_panels[side] {
+                    if has_search {
+                        diff.jump_to_next_match();
+                    } else {
+                        diff.move_down();
+                    }
+                }
+            }
+            Action::PageUp => {
+                if let Some(ref mut diff) = self.diff_panels[side] {
+                    diff.page_up();
+                }
+            }
+            Action::PageDown => {
+                if let Some(ref mut diff) = self.diff_panels[side] {
+                    diff.page_down();
+                }
+            }
+            Action::MoveToTop => {
+                if let Some(ref mut diff) = self.diff_panels[side] {
+                    diff.move_to_top();
+                }
+            }
+            Action::MoveToBottom => {
+                if let Some(ref mut diff) = self.diff_panels[side] {
+                    diff.move_to_bottom();
+                }
+            }
+            Action::Enter => {
+                // Enter on file: open diff viewer; on dir: expand/collapse
+                // Check if selected item is a file (need immutable borrow first)
+                let file_info = self.diff_panels[side].as_ref().and_then(|diff| {
+                    if let crate::pr_diff::DiffView::Tree {
+                        items, selected, ..
+                    } = &diff.view
+                    {
+                        if let Some(crate::pr_diff::DiffTreeItem::File { path, .. }) =
+                            items.get(*selected)
+                        {
+                            return Some((
+                                diff.repo_root.clone(),
+                                path.clone(),
+                                diff.base_branch.clone(),
+                            ));
+                        }
+                    }
+                    None
+                });
+                if let Some((repo_root, path, base_branch)) = file_info {
+                    let dv =
+                        crate::diff_viewer::DiffViewerState::open(&repo_root, &path, &base_branch);
+                    self.mode = AppMode::DiffViewing(Box::new(dv));
+                } else if let Some(ref mut diff) = self.diff_panels[side] {
+                    diff.enter();
+                }
+            }
+            Action::EditBuiltin => {
+                // F4: open file in editor
+                let file_path = self.diff_panels[side].as_mut().and_then(|d| d.enter());
+                if let Some(path) = file_path {
+                    self.mode = AppMode::Editing(Box::new(crate::editor::EditorState::open(path)));
+                }
+            }
+            Action::CursorRight => {
+                // Right: expand only (like Enter on dirs, no-op on files)
+                if let Some(ref mut diff) = self.diff_panels[side] {
+                    diff.enter();
+                }
+            }
+            Action::GoUp => {
+                if let Some(ref mut diff) = self.diff_panels[side] {
+                    diff.collapse_or_parent();
+                }
+            }
+            Action::SwitchPanel => {
+                self.handle_switch_panel();
+            }
+            Action::SwitchPanelReverse => {
+                self.handle_switch_panel_reverse();
+            }
+            Action::QuickSearch(c) => {
+                if let Some(ref mut diff) = self.diff_panels[side] {
+                    let query = diff.quick_search.get_or_insert_with(String::new);
+                    query.push(c);
+                    let q = query.clone();
+                    diff.jump_to_match(&q);
+                }
+            }
+            Action::QuickSearchClear => {
+                if let Some(ref mut diff) = self.diff_panels[side] {
+                    diff.quick_search = None;
+                }
+            }
+            Action::ToggleDiff => {
+                self.diff_panels[side] = None;
+                self.focus = PanelFocus::FilePanel;
+            }
+            Action::BottomResizeUp => {
+                self.bottom_split_pct[side] = self.bottom_split_pct[side]
+                    .saturating_sub(SPLIT_RESIZE_STEP)
+                    .max(SPLIT_MIN_PCT);
+            }
+            Action::BottomResizeDown => {
+                self.bottom_split_pct[side] =
+                    (self.bottom_split_pct[side] + SPLIT_RESIZE_STEP).min(SPLIT_MAX_PCT);
+            }
+            Action::BottomMaximize => {
+                self.bottom_maximized[side] = !self.bottom_maximized[side];
+            }
+            Action::MouseClick(col, row) => self.handle_mouse_click(col, row),
+            Action::MouseDoubleClick(col, row) => self.handle_mouse_double_click(col, row),
+            Action::MouseScrollUp(col, row) => self.handle_mouse_scroll(col, row, -3),
+            Action::MouseScrollDown(col, row) => self.handle_mouse_scroll(col, row, 3),
+            _ => {}
+        }
+    }
+
     fn handle_claude_action(&mut self, action: Action) {
-        let side = match self.claude_focused {
-            Some(s) => s,
-            None => return,
+        let side = match self.focus {
+            PanelFocus::Claude(s) => s,
+            _ => return,
         };
 
         match action {
@@ -4847,7 +5357,7 @@ impl App {
             Action::SwitchPanelReverse => self.handle_switch_panel_reverse(),
             Action::ToggleClaude => {
                 self.claude_panels[side] = None;
-                self.claude_focused = None;
+                self.focus = PanelFocus::FilePanel;
                 self.bottom_maximized[side] = false;
             }
             Action::TerminalOpenFile => self.handle_terminal_open_file(),
@@ -4858,7 +5368,7 @@ impl App {
                 if self.click_in_claude(col, row) {
                     // Click inside Claude panel — stay focused
                 } else {
-                    self.claude_focused = None;
+                    self.focus = PanelFocus::FilePanel;
                     self.handle_mouse_click(col, row);
                 }
             }
@@ -4866,7 +5376,7 @@ impl App {
                 if self.click_in_claude(col, row) {
                     // Double-click inside Claude panel — absorb
                 } else {
-                    self.claude_focused = None;
+                    self.focus = PanelFocus::FilePanel;
                     self.handle_mouse_double_click(col, row);
                 }
             }
@@ -4902,9 +5412,9 @@ impl App {
     }
 
     fn handle_terminal_open_file(&mut self) {
-        let side = match self.claude_focused {
-            Some(s) => s,
-            None => return,
+        let side = match self.focus {
+            PanelFocus::Claude(s) => s,
+            _ => return,
         };
         let (path, line, col) = match self.claude_panels[side] {
             Some(ref tp) => match tp.find_file_reference() {
@@ -4955,8 +5465,8 @@ impl App {
         let side = self.active_panel;
         if self.shell_panels[side].is_some() {
             self.shell_panels[side] = None;
-            if self.shell_focused == Some(side) {
-                self.shell_focused = None;
+            if self.focus == PanelFocus::Shell(side) {
+                self.focus = PanelFocus::FilePanel;
             }
         } else if let Some(ref wakeup) = self.wakeup_sender {
             let dir = self.panels[side].current_dir.clone();
@@ -4967,9 +5477,7 @@ impl App {
             match TerminalPanel::spawn_shell(&dir, cols, rows, wakeup.clone()) {
                 Ok(tp) => {
                     self.shell_panels[side] = Some(tp);
-                    self.shell_focused = Some(side);
-                    self.ci_focused = None;
-                    self.claude_focused = None;
+                    self.focus = PanelFocus::Shell(side);
                     self.bottom_split_pct[side] = self.persisted.split_pct_shell;
                 }
                 Err(e) => {
@@ -4980,9 +5488,9 @@ impl App {
     }
 
     fn handle_shell_action(&mut self, action: Action) {
-        let side = match self.shell_focused {
-            Some(s) => s,
-            None => return,
+        let side = match self.focus {
+            PanelFocus::Shell(s) => s,
+            _ => return,
         };
 
         match action {
@@ -5067,8 +5575,8 @@ impl App {
             // Close SSH panel
             self.ssh_panels[side] = None;
             self.ssh_hosts[side] = None;
-            if self.ssh_focused == Some(side) {
-                self.ssh_focused = None;
+            if self.focus == PanelFocus::Ssh(side) {
+                self.focus = PanelFocus::FilePanel;
             }
         } else {
             // Open SSH dialog to pick a host
@@ -5077,9 +5585,9 @@ impl App {
     }
 
     fn handle_ssh_action(&mut self, action: Action) {
-        let side = match self.ssh_focused {
-            Some(s) => s,
-            None => return,
+        let side = match self.focus {
+            PanelFocus::Ssh(s) => s,
+            _ => return,
         };
 
         match action {
@@ -5109,7 +5617,7 @@ impl App {
             Action::ToggleSsh => {
                 self.ssh_panels[side] = None;
                 self.ssh_hosts[side] = None;
-                self.ssh_focused = None;
+                self.focus = PanelFocus::FilePanel;
             }
             Action::Quit => {
                 self.quit_confirm = Some(true);
@@ -5130,7 +5638,7 @@ impl App {
                 if self.click_in_ssh(col, row) {
                     // Click inside SSH panel — stay focused
                 } else {
-                    self.ssh_focused = None;
+                    self.focus = PanelFocus::FilePanel;
                     self.handle_mouse_click(col, row);
                 }
             }
@@ -5138,7 +5646,7 @@ impl App {
                 if self.click_in_ssh(col, row) {
                     // absorb
                 } else {
-                    self.ssh_focused = None;
+                    self.focus = PanelFocus::FilePanel;
                     self.handle_mouse_double_click(col, row);
                 }
             }
@@ -5451,10 +5959,7 @@ impl App {
                 Ok(tp) => {
                     self.ssh_panels[side] = Some(tp);
                     self.ssh_hosts[side] = Some(host);
-                    self.ssh_focused = Some(side);
-                    self.ci_focused = None;
-                    self.shell_focused = None;
-                    self.claude_focused = None;
+                    self.focus = PanelFocus::Ssh(side);
                     self.bottom_split_pct[side] = self.persisted.split_pct_ssh;
                 }
                 Err(e) => {
@@ -5860,10 +6365,7 @@ impl App {
             {
                 Ok(tp) => {
                     self.shell_panels[side] = Some(tp);
-                    self.shell_focused = Some(side);
-                    self.ci_focused = None;
-                    self.claude_focused = None;
-                    self.ssh_focused = None;
+                    self.focus = PanelFocus::Shell(side);
                     self.bottom_split_pct[side] = self.persisted.split_pct_shell;
                 }
                 Err(e) => {
@@ -6551,6 +7053,45 @@ impl App {
         ) {
             return;
         }
+        // Diff viewer: click positions cursor on left or right side
+        if let AppMode::DiffViewing(ref mut d) = self.mode {
+            // Use terminal size to approximate layout (border=1 on each side)
+            let (term_w, _) = crossterm::terminal::size().unwrap_or((80, 24));
+            let inner_x: u16 = 1; // left border
+            let inner_width = term_w.saturating_sub(2);
+            let total_width = inner_width as usize;
+            let half_width = total_width.saturating_sub(1) / 2;
+            let num_width = crate::ui::diff_viewer_view::digit_count(d.max_line_num).max(3);
+            let inner_y: u16 = 1; // top border
+
+            let right_panel_x = inner_x as usize + half_width + 1;
+            let click_row = row as usize;
+            let click_col = col as usize;
+
+            if click_row >= inner_y as usize {
+                let line_idx = d.scroll + (click_row - inner_y as usize);
+                if line_idx < d.lines.len() {
+                    d.cursor = line_idx;
+                    d.ensure_cursor_visible();
+                    d.clear_selection();
+
+                    // Determine which side was clicked
+                    if click_col >= right_panel_x {
+                        d.cursor_side = crate::diff_viewer::DiffSide::Right;
+                        d.cursor_col = click_col.saturating_sub(right_panel_x + num_width + 1);
+                    } else {
+                        d.cursor_side = crate::diff_viewer::DiffSide::Left;
+                        d.cursor_col = click_col.saturating_sub(inner_x as usize + num_width + 1);
+                    }
+                    // Clamp col
+                    let len = d.current_side_line_len();
+                    if d.cursor_col > len {
+                        d.cursor_col = len;
+                    }
+                }
+            }
+            return;
+        }
         // Click inside dialogs: focus the clicked input field
         if self.dialog_content_area.is_some() {
             self.handle_dialog_click_at(col, row);
@@ -6565,7 +7106,7 @@ impl App {
                     && row >= ci_area.y
                     && row < ci_area.y + ci_area.height
                 {
-                    self.ci_focused = Some(side);
+                    self.focus = PanelFocus::Ci(side);
                     // Compute which item was clicked
                     if let Some(ref mut ci) = self.ci_panels[side] {
                         // Account for border (1 row for top border)
@@ -6593,6 +7134,40 @@ impl App {
             }
         }
 
+        // Check if click is in a diff panel
+        for side in 0..2 {
+            if let Some(diff_area) = self.diff_panel_areas[side] {
+                if self.diff_panels[side].is_some()
+                    && col >= diff_area.x
+                    && col < diff_area.x + diff_area.width
+                    && row >= diff_area.y
+                    && row < diff_area.y + diff_area.height
+                {
+                    self.focus = PanelFocus::Diff(side);
+                    // Select the clicked row
+                    if let Some(ref mut diff) = self.diff_panels[side] {
+                        let inner_y = diff_area.y + 1;
+                        if row >= inner_y {
+                            let click_offset = (row - inner_y) as usize;
+                            if let crate::pr_diff::DiffView::Tree {
+                                items,
+                                selected,
+                                scroll,
+                                ..
+                            } = &mut diff.view
+                            {
+                                let target = *scroll + click_offset;
+                                if target < items.len() {
+                                    *selected = target;
+                                }
+                            }
+                        }
+                    }
+                    return;
+                }
+            }
+        }
+
         // Check if click is in a Claude panel
         for side in 0..2 {
             if let Some(claude_area) = self.claude_panel_areas[side] {
@@ -6602,9 +7177,7 @@ impl App {
                     && row >= claude_area.y
                     && row < claude_area.y + claude_area.height
                 {
-                    self.claude_focused = Some(side);
-                    self.ci_focused = None;
-                    self.shell_focused = None;
+                    self.focus = PanelFocus::Claude(side);
                     return;
                 }
             }
@@ -6619,9 +7192,7 @@ impl App {
                     && row >= shell_area.y
                     && row < shell_area.y + shell_area.height
                 {
-                    self.shell_focused = Some(side);
-                    self.ci_focused = None;
-                    self.claude_focused = None;
+                    self.focus = PanelFocus::Shell(side);
                     return;
                 }
             }
@@ -6636,10 +7207,7 @@ impl App {
                     && row >= ssh_area.y
                     && row < ssh_area.y + ssh_area.height
                 {
-                    self.ssh_focused = Some(side);
-                    self.ci_focused = None;
-                    self.claude_focused = None;
-                    self.shell_focused = None;
+                    self.focus = PanelFocus::Ssh(side);
                     return;
                 }
             }
@@ -6653,11 +7221,7 @@ impl App {
                 && row >= search_area.y
                 && row < search_area.y + search_area.height
             {
-                self.file_search_focused = true;
-                self.ci_focused = None;
-                self.claude_focused = None;
-                self.shell_focused = None;
-                self.ssh_focused = None;
+                self.focus = PanelFocus::Search;
                 // Select the clicked row
                 if let Some(ref mut state) = self.file_search {
                     let inner_y = search_area.y + 1;
@@ -6674,10 +7238,7 @@ impl App {
 
         // Click on a file panel — unfocus everything
         if let Some(panel_idx) = self.panel_at(col, row) {
-            self.ci_focused = None;
-            self.claude_focused = None;
-            self.shell_focused = None;
-            self.file_search_focused = false;
+            self.focus = PanelFocus::FilePanel;
             self.active_panel = panel_idx;
             if let Some(entry_idx) = self.row_to_entry_index(panel_idx, row) {
                 self.panels[panel_idx].table_state.select(Some(entry_idx));
@@ -6713,6 +7274,14 @@ impl App {
                     p.move_up((-delta) as usize);
                 } else {
                     p.move_down(delta as usize);
+                }
+                return;
+            }
+            AppMode::DiffViewing(d) => {
+                if delta < 0 {
+                    d.scroll_up((-delta) as usize);
+                } else {
+                    d.scroll_down(delta as usize);
                 }
                 return;
             }
@@ -6866,9 +7435,37 @@ impl App {
         self.reload_panels();
     }
 
+    /// Close editor: if we came from a diff viewer, re-open it; otherwise go to Normal.
+    fn restore_or_close_editor(&mut self) {
+        if let Some(stash) = self.stashed_diff.take() {
+            // Capture editor viewport offset before replacing mode
+            let cursor_offset = if let AppMode::Editing(ref e) = self.mode {
+                e.cursor_line.saturating_sub(e.scroll_y)
+            } else {
+                5 // fallback: show some context above
+            };
+
+            let mut dv = crate::diff_viewer::DiffViewerState::open(
+                &stash.repo_root,
+                &stash.file_path,
+                &stash.base_branch,
+            );
+            dv.cursor = stash.cursor.min(dv.lines.len().saturating_sub(1));
+            dv.scroll = dv.cursor.saturating_sub(cursor_offset);
+            self.mode = AppMode::DiffViewing(Box::new(dv));
+        } else {
+            self.mode = AppMode::Normal;
+            self.focus = PanelFocus::FilePanel;
+        }
+        self.needs_clear = true;
+    }
+
     fn handle_dialog_cancel(&mut self) {
         match &self.mode {
-            AppMode::Viewing(_) | AppMode::HexViewing(_) | AppMode::ParquetViewing(_) => {
+            AppMode::Viewing(_)
+            | AppMode::HexViewing(_)
+            | AppMode::ParquetViewing(_)
+            | AppMode::DiffViewing(_) => {
                 self.mode = AppMode::Normal;
                 self.needs_clear = true;
             }

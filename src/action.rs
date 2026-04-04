@@ -99,6 +99,7 @@ pub enum Action {
     OpenPr,
     ToggleCi,
     ExtractCiFailures,
+    ToggleDiff,
 
     // Terminal / Shell / SSH / Sessions
     ToggleClaude,

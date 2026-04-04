@@ -104,6 +104,11 @@ pub struct Theme {
     // Editor / dialog cursor
     pub editor_text_fg: Color,
     pub editor_cursor: SetCursorStyle,
+    // Diff viewer backgrounds
+    pub diff_added_bg: Color,
+    pub diff_deleted_bg: Color,
+    pub diff_changed_old_bg: Color,
+    pub diff_changed_new_bg: Color,
     // Git
     pub git_modified_fg: Color,
     pub git_added_fg: Color,
@@ -180,6 +185,10 @@ impl Theme {
             syn_property: Color::LightCyan,
             syn_escape: Color::LightRed,
             syn_constructor: Color::Yellow,
+            diff_added_bg: Color::Rgb(0, 50, 0),
+            diff_deleted_bg: Color::Rgb(80, 0, 0),
+            diff_changed_old_bg: Color::Rgb(80, 40, 0),
+            diff_changed_new_bg: Color::Rgb(0, 50, 30),
             editor_text_fg: Color::White,
             editor_cursor: SetCursorStyle::BlinkingBar,
             git_modified_fg: Color::Yellow,
@@ -265,6 +274,10 @@ impl Theme {
             syn_constructor: pink_light,
             editor_text_fg: text,
             editor_cursor: SetCursorStyle::BlinkingBar,
+            diff_added_bg: Color::Rgb(0, 50, 0),
+            diff_deleted_bg: Color::Rgb(50, 0, 0),
+            diff_changed_old_bg: Color::Rgb(80, 40, 0),
+            diff_changed_new_bg: Color::Rgb(0, 50, 30),
             git_modified_fg: pink_light,
             git_added_fg: green,
             git_deleted_fg: red,
