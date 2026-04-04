@@ -205,9 +205,12 @@ impl crate::remote_fs::RemoteFs for SmbConnection {
 /// Convert a PathBuf (forward slashes) to SMB path (backslashes), escaped for smbclient commands.
 fn to_smb_path(path: &Path) -> String {
     let s = path.to_string_lossy();
-    // Escape backslashes and double quotes to prevent command injection
-    s.replace('/', "\\")
+    // Escape backslashes, double quotes, and semicolons to prevent command injection.
+    // Backslashes must be escaped first, before '/' is converted to '\'.
+    s.replace('\\', "\\\\")
+        .replace('/', "\\")
         .replace('"', "\\\"")
+        .replace(';', "\\;")
 }
 
 /// Wrap a path in quotes for smbclient commands.

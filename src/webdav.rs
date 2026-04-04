@@ -1,5 +1,6 @@
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
@@ -12,6 +13,9 @@ pub struct WebDavConnection {
     pub base_url: String,
     pub username: String,
     password: String,
+    /// When true, pass `-k` to curl to allow self-signed certificates.
+    /// Default is false (TLS verification enabled).
+    pub insecure: bool,
 }
 
 impl WebDavConnection {
@@ -22,6 +26,7 @@ impl WebDavConnection {
             base_url,
             username: username.to_string(),
             password: password.to_string(),
+            insecure: false,
         };
         // Validate connection
         conn.propfind("/", 0)?;
@@ -62,18 +67,37 @@ impl WebDavConnection {
             .arg("-X").arg(method)
             .arg("--connect-timeout").arg("15")
             .arg("--max-time").arg("300") // 5 min max for large transfers
-            .arg("-k") // allow self-signed certs (common for self-hosted)
-            // Use .netrc-style auth via stdin to avoid password in process listing
-            .arg("-u").arg(format!("{}:{}", self.username, self.password));
+            // Read credentials from stdin config to avoid leaking in process table
+            .arg("-K").arg("-");
+
+        if self.insecure {
+            cmd.arg("-k"); // only disable TLS verification when explicitly opted-in
+        }
 
         for arg in extra_args {
             cmd.arg(arg);
         }
         cmd.arg(url);
 
-        let output = cmd
-            .output()
+        // Pass credentials via stdin using curl's config format so they
+        // never appear in the process argument list visible via `ps`.
+        let config = format!("user = \"{}:{}\"", self.username, self.password);
+        cmd.stdin(Stdio::piped());
+
+        let mut child = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
             .context("Failed to run curl. Is it installed?")?;
+
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(config.as_bytes());
+            // stdin is dropped here, closing the pipe so curl proceeds
+        }
+
+        let output = child
+            .wait_with_output()
+            .context("Failed to read curl output")?;
 
         let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
 
@@ -652,6 +676,7 @@ mod tests {
             base_url: "https://cloud.example.com/dav".to_string(),
             username: "user".to_string(),
             password: "pass".to_string(),
+            insecure: false,
         };
         assert_eq!(conn.display_label(), "WebDAV: cloud.example.com");
     }
@@ -662,6 +687,7 @@ mod tests {
             base_url: "http://nas.local:8080/webdav".to_string(),
             username: String::new(),
             password: String::new(),
+            insecure: false,
         };
         assert_eq!(conn.display_label(), "WebDAV: nas.local:8080");
     }

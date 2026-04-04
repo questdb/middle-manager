@@ -5,6 +5,9 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
+#[cfg(unix)]
+use std::os::unix::fs as unix_fs;
+
 pub fn copy_entry(source: &Path, dest_dir: &Path) -> Result<()> {
     let file_name = source.file_name().context("source has no file name")?;
     let dest = dest_dir.join(file_name);
@@ -26,7 +29,18 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
 
-        if src_path.is_dir() {
+        let meta = src_path
+            .symlink_metadata()
+            .with_context(|| format!("Failed to read metadata for {:?}", src_path))?;
+
+        if meta.file_type().is_symlink() {
+            // Replicate the symlink rather than following it (prevents symlink loops).
+            let target = fs::read_link(&src_path)
+                .with_context(|| format!("Failed to read symlink {:?}", src_path))?;
+            #[cfg(unix)]
+            unix_fs::symlink(&target, &dst_path)
+                .with_context(|| format!("Failed to create symlink {:?}", dst_path))?;
+        } else if meta.is_dir() {
             copy_dir_recursive(&src_path, &dst_path)?;
         } else {
             fs::copy(&src_path, &dst_path)?;
@@ -42,12 +56,14 @@ pub fn move_entry(source: &Path, dest_dir: &Path) -> Result<()> {
     // Try rename first (fast, same-filesystem move)
     match fs::rename(source, &dest) {
         Ok(()) => Ok(()),
-        Err(_) => {
-            // Fall back to copy + delete (cross-filesystem)
+        Err(err) if err.raw_os_error() == Some(18) => {
+            // EXDEV (errno 18): cross-device link — fall back to copy + delete
             copy_entry(source, dest_dir)?;
             delete_entry(source)?;
             Ok(())
         }
+        Err(err) => Err(err)
+            .with_context(|| format!("Failed to move {:?} to {:?}", source, dest))?,
     }
 }
 

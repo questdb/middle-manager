@@ -46,7 +46,7 @@ pub fn render(frame: &mut Frame, state: &SshDialogState) {
             let label = conn.display_label();
             let cw = layout.cw;
             let padded = format!("{:<width$}", label, width = cw);
-            let display = if padded.len() > cw { padded[..cw].to_string() } else { padded };
+            let display = if padded.len() > cw { super::truncate_to_width(&padded, cw).to_string() } else { padded };
             let style = if is_selected {
                 Style::default()
                     .fg(t.dialog_input_fg_focused)
@@ -257,7 +257,7 @@ fn render_ssh_sftp(
         let line_text = format!("{}{}", label, name_part);
         let padded = format!("{:<width$}", line_text, width = cw);
         let display = if padded.len() > cw {
-            padded[..cw].to_string()
+            super::truncate_to_width(&padded, cw).to_string()
         } else {
             padded
         };

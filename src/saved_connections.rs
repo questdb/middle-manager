@@ -1,5 +1,8 @@
 use std::path::{Path, PathBuf};
 
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
+
 use serde::{Deserialize, Serialize};
 
 /// A saved connection entry that can represent any protocol.
@@ -98,14 +101,24 @@ pub fn load_connections() -> Vec<SavedConnection> {
     }
 }
 
-/// Save connections to disk.
+/// Save connections to disk with restrictive file permissions (0600).
 pub fn save_connections(connections: &[SavedConnection]) {
     let path = connections_path();
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+        // Restrict directory to owner-only access
+        #[cfg(unix)]
+        {
+            let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        }
     }
     if let Ok(json) = serde_json::to_string_pretty(connections) {
-        let _ = std::fs::write(&path, json);
+        let _ = std::fs::write(&path, &json);
+        // Restrict file to owner read/write only
+        #[cfg(unix)]
+        {
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
     }
 }
 

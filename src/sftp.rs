@@ -252,7 +252,14 @@ impl crate::remote_fs::RemoteFs for SftpConnection {
 }
 
 /// Quote a string for sftp batch commands (wrap in double quotes, escape inner quotes).
+///
+/// Rejects newlines and other control characters to prevent command injection
+/// in SFTP batch mode (which processes commands line-by-line).
 fn shell_quote(s: &str) -> String {
+    // Reject control characters (including \n, \r) that could inject batch commands
+    if s.bytes().any(|b| b < 0x20 && b != b'\t') {
+        return "\"<invalid-filename>\"".to_string();
+    }
     if s.contains('"') || s.contains(' ') || s.contains('\\') {
         format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
     } else {

@@ -58,11 +58,18 @@ impl NfsConnection {
     fn local_path(&self, path: &Path) -> PathBuf {
         let relative = path.to_string_lossy();
         let clean = relative.trim_start_matches('/');
-        if clean.is_empty() {
+        let result = if clean.is_empty() {
             self.mount_point.clone()
         } else {
             self.mount_point.join(clean)
+        };
+        // Ensure the path doesn't escape the mount point via ..
+        let normalized = normalize_path(&result);
+        let mount_normalized = normalize_path(&self.mount_point);
+        if !normalized.starts_with(&mount_normalized) {
+            return self.mount_point.clone();
         }
+        result
     }
 
     pub fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> {
@@ -180,6 +187,18 @@ impl crate::remote_fs::RemoteFs for NfsConnection {
     fn upload_dir(&self, local: &Path, remote: &Path) -> Result<u64> { self.upload_dir(local, remote) }
     fn home_dir(&self) -> PathBuf { self.home_dir() }
     fn display_label(&self) -> String { self.display_label() }
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => { components.pop(); }
+            std::path::Component::CurDir => {}
+            c => components.push(c),
+        }
+    }
+    components.iter().collect()
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<u64> {

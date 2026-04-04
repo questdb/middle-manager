@@ -561,6 +561,8 @@ pub struct CopyDialogState {
     pub symlink_mode: SymlinkMode,
     pub use_filter: bool,
     pub focused: CopyDialogField,
+    /// Panel index that was active when the dialog was opened (source side).
+    pub source_panel: usize,
 }
 
 impl CopyDialogState {
@@ -569,6 +571,7 @@ impl CopyDialogState {
         source_paths: Vec<PathBuf>,
         destination: String,
         is_move: bool,
+        source_panel: usize,
     ) -> Self {
         Self {
             source_name,
@@ -585,6 +588,7 @@ impl CopyDialogState {
             symlink_mode: SymlinkMode::Smart,
             use_filter: false,
             focused: CopyDialogField::Destination,
+            source_panel,
         }
     }
 
@@ -2689,12 +2693,6 @@ impl App {
         if has_active_async {
             self.dirty = true;
         }
-        if let Some(ref w) = self.dir_watcher {
-            if w.has_changes() {
-                self.dirty = true;
-            }
-        }
-
         // Poll CI panels for async results, downloads, and failure extraction
         for ci in self.ci_panels.iter_mut().flatten() {
             ci.poll();
@@ -2947,14 +2945,14 @@ impl App {
                     }
                 }
                 Action::CursorLeft => {
-                    // Cycle backward (same as forward with 2 themes)
+                    // Cycle backward
                     if let Some(0) = self.settings_open {
-                        let next = crate::theme::current_theme_name().next();
-                        crate::theme::set_theme(next);
-                        self.persisted.theme = next.to_str().to_string();
+                        let prev = crate::theme::current_theme_name().prev();
+                        crate::theme::set_theme(prev);
+                        self.persisted.theme = prev.to_str().to_string();
                         self.persisted.save();
                         self.needs_clear = true;
-                        self.status_message = Some(format!("Theme: {}", next.label()));
+                        self.status_message = Some(format!("Theme: {}", prev.label()));
                     }
                 }
                 _ => {}
@@ -4844,7 +4842,7 @@ impl App {
         } else {
             format!("{} items", paths.len())
         };
-        let mut dlg = CopyDialogState::new(display_name, paths, dest, false);
+        let mut dlg = CopyDialogState::new(display_name, paths, dest, false, self.active_panel);
         dlg.destination.select_all();
         self.mode = AppMode::CopyDialog(dlg);
     }
@@ -4870,7 +4868,7 @@ impl App {
         } else {
             format!("{} items", paths.len())
         };
-        let mut dlg = CopyDialogState::new(display_name, paths, dest, true);
+        let mut dlg = CopyDialogState::new(display_name, paths, dest, true, self.active_panel);
         dlg.destination.select_all();
         self.mode = AppMode::CopyDialog(dlg);
     }
@@ -6653,7 +6651,7 @@ impl App {
     }
 
     fn confirm_copy_dialog(&mut self) {
-        let (source_paths, dest, is_move) = {
+        let (source_paths, dest, is_move, source_panel) = {
             let state = match &self.mode {
                 AppMode::CopyDialog(s) => s,
                 _ => return,
@@ -6666,14 +6664,16 @@ impl App {
                 state.source_paths.clone(),
                 PathBuf::from(&state.destination.text),
                 state.is_move,
+                state.source_panel,
             )
         };
 
-        // Determine source and dest filesystem types
-        let src_remote = self.panels[self.active_panel].source.is_remote();
-        let dst_remote = self.panels[1 - self.active_panel].source.is_remote();
-        let src_side = self.active_panel;
-        let dst_side = 1 - self.active_panel;
+        // Determine source and dest filesystem types using the panel that was
+        // active when the dialog was opened, not the currently active panel.
+        let src_remote = self.panels[source_panel].source.is_remote();
+        let dst_remote = self.panels[1 - source_panel].source.is_remote();
+        let src_side = source_panel;
+        let dst_side = 1 - source_panel;
 
         let mut first_err: Option<anyhow::Error> = None;
         let total_files = source_paths.len();
@@ -6732,10 +6732,18 @@ impl App {
             }
         }
 
-        // For move operations from remote, delete source after copy
+        // For move operations from remote, delete source after copy.
+        // Use src_side (snapshotted at dialog-open time) instead of
+        // self.active_panel, which may have changed while the dialog was open.
         if is_move && first_err.is_none() && src_remote {
             for source_path in &source_paths {
-                if let Err(e) = self.remote_delete(source_path) {
+                let del_result = match &self.panels[src_side].source {
+                    crate::panel::PanelSource::Local => fs_ops::delete_entry(source_path),
+                    crate::panel::PanelSource::Remote { connection } => {
+                        connection.remove_recursive(source_path)
+                    }
+                };
+                if let Err(e) = del_result {
                     first_err = Some(e);
                     break;
                 }

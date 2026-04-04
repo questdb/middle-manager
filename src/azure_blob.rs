@@ -39,12 +39,12 @@ impl AzureBlobConnection {
         Ok(conn)
     }
 
-    /// Auth-only args (no container).
+    /// Auth-only CLI args (no container). Sensitive values (connection string,
+    /// SAS token) are passed via environment variables — see `set_auth_env`.
     fn auth_args(&self) -> Vec<String> {
         let mut args = Vec::new();
         if let Some(ref cs) = self.connection_string {
-            args.push("--connection-string".into());
-            args.push(cs.clone());
+            // Connection string is passed via AZURE_STORAGE_CONNECTION_STRING env var
             if let Some(endpoint) = extract_connection_string_field(cs, "BlobEndpoint") {
                 args.push("--blob-endpoint".into());
                 args.push(endpoint);
@@ -52,12 +52,19 @@ impl AzureBlobConnection {
         } else {
             args.push("--account-name".into());
             args.push(self.account.clone());
-            if let Some(ref sas) = self.sas_token {
-                args.push("--sas-token".into());
-                args.push(sas.clone());
-            }
+            // SAS token is passed via AZURE_STORAGE_SAS_TOKEN env var
         }
         args
+    }
+
+    /// Set authentication environment variables on a Command so that secrets
+    /// are not visible in the process table.
+    fn set_auth_env(&self, cmd: &mut Command) {
+        if let Some(ref cs) = self.connection_string {
+            cmd.env("AZURE_STORAGE_CONNECTION_STRING", cs);
+        } else if let Some(ref sas) = self.sas_token {
+            cmd.env("AZURE_STORAGE_SAS_TOKEN", sas);
+        }
     }
 
     /// Auth args + container name.
@@ -72,6 +79,7 @@ impl AzureBlobConnection {
     fn list_containers(&self) -> Result<serde_json::Value> {
         let mut cmd = Command::new("az");
         cmd.arg("storage").arg("container").arg("list");
+        self.set_auth_env(&mut cmd);
         for arg in self.auth_args() {
             cmd.arg(arg);
         }
@@ -104,6 +112,7 @@ impl AzureBlobConnection {
         let mut cmd = Command::new("az");
         cmd.arg("storage").arg("container").arg("create")
             .arg("--name").arg(name);
+        self.set_auth_env(&mut cmd);
         for arg in self.auth_args() {
             cmd.arg(arg);
         }
@@ -131,6 +140,7 @@ impl AzureBlobConnection {
         for arg in subcmd {
             cmd.arg(arg);
         }
+        self.set_auth_env(&mut cmd);
         for arg in self.args_for_container(container) {
             cmd.arg(arg);
         }
@@ -164,6 +174,7 @@ impl AzureBlobConnection {
         for arg in subcmd {
             cmd.arg(arg);
         }
+        self.set_auth_env(&mut cmd);
         for arg in self.common_args() {
             cmd.arg(arg);
         }
@@ -393,6 +404,7 @@ impl AzureBlobConnection {
             let mut cmd = Command::new("az");
             cmd.arg("storage").arg("container").arg("delete")
                 .arg("--name").arg(&container);
+            self.set_auth_env(&mut cmd);
             for arg in self.auth_args() {
                 cmd.arg(arg);
             }
@@ -414,7 +426,7 @@ impl AzureBlobConnection {
 
     pub fn rename(&self, src: &Path, dst: &Path) -> Result<()> {
         let (src_container, src_prefix) = self.resolve_path(src);
-        let (_dst_container, dst_prefix) = self.resolve_path(dst);
+        let (dst_container, dst_prefix) = self.resolve_path(dst);
         let src_blob = src_prefix.trim_end_matches('/');
         let dst_blob = dst_prefix.trim_end_matches('/');
 
@@ -430,15 +442,16 @@ impl AzureBlobConnection {
         self.run_az_with_container(
             &["copy", "start"],
             &["--source-uri", &source_uri, "--destination-blob", dst_blob],
-            &src_container,
+            &dst_container,
         )?;
 
         // Poll until copy completes
+        let mut copy_succeeded = false;
         for _ in 0..60 {
             let output = self.run_az_with_container(
                 &["show"],
                 &["--name", dst_blob, "--output", "json"],
-                &src_container,
+                &dst_container,
             )?;
             if let Ok(json) = serde_json::from_str::<serde_json::Value>(&output) {
                 let status = json
@@ -448,7 +461,10 @@ impl AzureBlobConnection {
                     .and_then(|s| s.as_str())
                     .unwrap_or("pending");
                 match status {
-                    "success" => break,
+                    "success" => {
+                        copy_succeeded = true;
+                        break;
+                    }
                     "failed" | "aborted" => {
                         anyhow::bail!("Azure blob copy failed with status: {}", status);
                     }
@@ -457,8 +473,12 @@ impl AzureBlobConnection {
                     }
                 }
             } else {
-                break; // Can't parse, assume done
+                anyhow::bail!("Azure blob copy: unable to parse status response");
             }
+        }
+
+        if !copy_succeeded {
+            anyhow::bail!("Azure blob copy timed out after 30s without completing");
         }
 
         self.run_az_with_container(&["delete"], &["--name", src_blob], &src_container)?;

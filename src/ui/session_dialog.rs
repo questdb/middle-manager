@@ -104,7 +104,7 @@ pub fn render(frame: &mut Frame, state: &SessionDialogState) {
         let cw = layout.cw;
         let padded = format!("{:<width$}", line_text, width = cw);
         let display = if padded.len() > cw {
-            padded[..cw].to_string()
+            super::truncate_to_width(&padded, cw).to_string()
         } else {
             padded
         };

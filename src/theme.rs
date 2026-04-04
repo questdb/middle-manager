@@ -40,6 +40,13 @@ impl ThemeName {
             Self::QuestdbDark => Self::FarManager,
         }
     }
+
+    pub fn prev(&self) -> Self {
+        match self {
+            Self::FarManager => Self::QuestdbDark,
+            Self::QuestdbDark => Self::FarManager,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -416,12 +423,15 @@ pub fn theme() -> Theme {
     }
 
     // Cache miss -- read from RwLock
-    let t = if let Some(ref t) = *THEME.read().unwrap() {
-        t.clone()
-    } else {
-        drop(THEME.read());
-        set_theme(ThemeName::FarManager);
-        THEME.read().unwrap().as_ref().unwrap().clone()
+    let t = {
+        let guard = THEME.read().unwrap();
+        if let Some(ref t) = *guard {
+            t.clone()
+        } else {
+            drop(guard); // drop read lock before set_theme acquires write lock
+            set_theme(ThemeName::FarManager);
+            THEME.read().unwrap().as_ref().unwrap().clone()
+        }
     };
 
     // Re-read generation (set_theme may have incremented it)

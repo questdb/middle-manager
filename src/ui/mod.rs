@@ -28,6 +28,37 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
+
+/// Truncate a string so its display width (measured in terminal columns) does
+/// not exceed `max_width`.  This is char-boundary safe and accounts for
+/// double-width (CJK) characters.
+pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> &str {
+    let mut end = 0;
+    let mut width = 0;
+    for (i, c) in s.char_indices() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if width + cw > max_width {
+            break;
+        }
+        width += cw;
+        end = i + c.len_utf8();
+    }
+    &s[..end]
+}
+
+/// Find the nearest valid char boundary at or after `byte_pos` in `s`.
+/// Returns `s.len()` if no valid boundary exists before the end.
+pub(crate) fn ceil_char_boundary(s: &str, byte_pos: usize) -> usize {
+    if byte_pos >= s.len() {
+        return s.len();
+    }
+    let mut pos = byte_pos;
+    while pos < s.len() && !s.is_char_boundary(pos) {
+        pos += 1;
+    }
+    pos
+}
 
 use std::cell::Cell;
 
@@ -371,7 +402,7 @@ fn render_status_message(frame: &mut Frame, area: Rect, msg: &str) {
     let padded = format!(" {} ", msg);
     let cw = area.width as usize;
     let display = if padded.len() > cw {
-        format!("{}", &padded[..cw])
+        truncate_to_width(&padded, cw).to_string()
     } else {
         format!("{:<width$}", padded, width = cw)
     };

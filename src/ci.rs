@@ -775,8 +775,8 @@ fn extract_all_failures(
         if let Ok(content) = std::fs::read_to_string(&tmp_path) {
             let tail_size = 512 * 1024; // 512KB
             let content = if content.len() > tail_size {
-                // Take from the last tail_size bytes, but start at a line boundary
-                let start = content.len() - tail_size;
+                // Take from the last tail_size bytes, but start at a valid char + line boundary
+                let start = crate::ui::ceil_char_boundary(&content, content.len() - tail_size);
                 match content[start..].find('\n') {
                     Some(pos) => &content[start + pos + 1..],
                     None => &content[start..],
@@ -895,7 +895,10 @@ fn query_azure_test_results(azure: &AzureInfo, check_name: &str) -> Option<Vec<T
     let mut seen = std::collections::HashSet::new();
 
     for run in runs {
-        let run_id = run.get("id")?.as_u64()?;
+        let run_id = match run.get("id").and_then(|v| v.as_u64()) {
+            Some(id) => id,
+            None => continue,
+        };
         let results_url = format!(
             "https://dev.azure.com/{}/{}/_apis/test/runs/{}/results?outcomes=Failed&$top=500&api-version=7.1",
             azure.org, azure.project, run_id
