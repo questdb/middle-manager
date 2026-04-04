@@ -1630,3 +1630,270 @@ fn query_azure_steps(azure: &AzureInfo) -> Result<Vec<CiStep>, String> {
     steps.sort_by_key(|s| s.number);
     Ok(steps)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------------------------------------------------------------
+    // parse_failures: Rust test output
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_failures_rust_test_output() {
+        let log = "\
+running 4 tests
+test utils::tests::test_ok ... ok
+test utils::tests::test_add ... FAILED
+test utils::tests::test_sub ... FAILED
+test utils::tests::test_mul ... ok
+
+failures:
+
+failures:
+    utils::tests::test_add
+    utils::tests::test_sub
+
+test result: FAILED. 2 passed; 2 failed; 0 ignored
+";
+        let failures = parse_failures(log, "build");
+        let names: Vec<&str> = failures.iter().map(|f| f.test_name.as_str()).collect();
+        assert!(names.contains(&"utils::tests::test_add"));
+        assert!(names.contains(&"utils::tests::test_sub"));
+        assert_eq!(failures.len(), 2);
+        // All failures should have the check_name set
+        assert!(failures.iter().all(|f| f.check_name == "build"));
+    }
+
+    #[test]
+    fn parse_failures_no_failures() {
+        let log = "\
+running 3 tests
+test a ... ok
+test b ... ok
+test c ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored
+";
+        let failures = parse_failures(log, "ci");
+        assert!(failures.is_empty());
+    }
+
+    #[test]
+    fn parse_failures_empty_content() {
+        let failures = parse_failures("", "ci");
+        assert!(failures.is_empty());
+    }
+
+    // ---------------------------------------------------------------
+    // parse_failures: Go test output
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_failures_go_test_output() {
+        let log = "\
+--- FAIL: TestSomething (0.01s)
+    expected 1, got 2
+--- FAIL: TestOther (0.03s)
+    expected true, got false
+FAIL
+";
+        let failures = parse_failures(log, "go-tests");
+        let names: Vec<&str> = failures.iter().map(|f| f.test_name.as_str()).collect();
+        assert!(names.contains(&"TestSomething"));
+        assert!(names.contains(&"TestOther"));
+        assert_eq!(failures.len(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // parse_failures: Python/pytest output
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_failures_pytest_output() {
+        let log = "\
+FAILED tests/test_math.py::TestCalc::test_divide - ZeroDivisionError
+FAILED tests/test_math.py::TestCalc::test_neg - AssertionError
+";
+        let failures = parse_failures(log, "pytest");
+        let names: Vec<&str> = failures.iter().map(|f| f.test_name.as_str()).collect();
+        assert!(names.contains(&"tests/test_math.py::TestCalc::test_divide"));
+        assert!(names.contains(&"tests/test_math.py::TestCalc::test_neg"));
+        assert_eq!(failures.len(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // parse_failures: Jest/vitest output
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_failures_jest_output() {
+        let log = "\
+FAIL src/utils/math.test.ts
+FAIL src/components/Button.test.tsx
+";
+        let failures = parse_failures(log, "jest");
+        let names: Vec<&str> = failures.iter().map(|f| f.test_name.as_str()).collect();
+        assert!(names.contains(&"src/utils/math.test.ts"));
+        assert!(names.contains(&"src/components/Button.test.tsx"));
+        assert_eq!(failures.len(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // parse_failures: Java/Maven Surefire output
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_failures_java_surefire_output() {
+        let log = "\
+  testAdd(com.example.MathTest)  Time elapsed: 0.01 s  <<< FAILURE!
+  testDiv(com.example.MathTest)  Time elapsed: 0.02 s  <<< ERROR!
+";
+        let failures = parse_failures(log, "maven");
+        assert_eq!(failures.len(), 2);
+        assert!(failures.iter().any(|f| f.test_name.contains("testAdd")));
+        assert!(failures.iter().any(|f| f.test_name.contains("testDiv")));
+    }
+
+    // ---------------------------------------------------------------
+    // parse_failures: GitHub Actions error annotation
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_failures_github_error_annotation() {
+        let log = "\
+##[error]src/lib.rs:42: assertion failed
+##[error]tests/integration.rs:100: expected 5, got 3
+";
+        let failures = parse_failures(log, "actions");
+        // Both lines contain '/' or '.' so they should be captured
+        assert_eq!(failures.len(), 2);
+    }
+
+    // ---------------------------------------------------------------
+    // parse_failures: deduplication
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_failures_deduplicates() {
+        let log = "\
+test my::test ... FAILED
+test my::test ... FAILED
+test my::test ... FAILED
+";
+        let failures = parse_failures(log, "dup");
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].test_name, "my::test");
+    }
+
+    // ---------------------------------------------------------------
+    // parse_failures: mixed output from multiple frameworks
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_failures_mixed_frameworks() {
+        let log = "\
+test rust::path::test_one ... FAILED
+--- FAIL: GoTest (0.01s)
+FAILED tests/test_py.py::test_x - AssertionError
+FAIL src/a.test.ts
+";
+        let failures = parse_failures(log, "mixed");
+        assert_eq!(failures.len(), 4);
+    }
+
+    // ---------------------------------------------------------------
+    // parse_details_url: GitHub Actions
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_details_url_github() {
+        let url = "https://github.com/owner/repo/actions/runs/12345/job/67890";
+        let (run_id, job_id, azure) = parse_details_url(url);
+        assert_eq!(run_id, 12345);
+        assert_eq!(job_id, 67890);
+        assert!(azure.is_none());
+    }
+
+    #[test]
+    fn parse_details_url_github_no_job() {
+        let url = "https://github.com/owner/repo/actions/runs/12345/";
+        let (run_id, job_id, azure) = parse_details_url(url);
+        assert_eq!(run_id, 12345);
+        assert_eq!(job_id, 0); // no /job/ segment
+        assert!(azure.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // parse_details_url / parse_azure_url: Azure DevOps
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_details_url_azure() {
+        let url = "https://dev.azure.com/myorg/myproject/_build/results?buildId=999&view=logs&jobId=abc-123";
+        let (run_id, job_id, azure) = parse_details_url(url);
+        assert_eq!(run_id, 0);
+        assert_eq!(job_id, 0);
+        let azure = azure.unwrap();
+        assert_eq!(azure.org, "myorg");
+        assert_eq!(azure.project, "myproject");
+        assert_eq!(azure.build_id, "999");
+        assert_eq!(azure.job_id, "abc-123");
+    }
+
+    #[test]
+    fn parse_azure_url_no_build_id() {
+        let url = "https://dev.azure.com/org/proj/_build/results?view=logs";
+        let azure = parse_azure_url(url);
+        assert!(azure.is_none()); // buildId is required
+    }
+
+    // ---------------------------------------------------------------
+    // parse_details_url: unknown URL
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_details_url_unknown() {
+        let (run_id, job_id, azure) = parse_details_url("https://example.com/status/123");
+        assert_eq!(run_id, 0);
+        assert_eq!(job_id, 0);
+        assert!(azure.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // CiStatus helpers
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn ci_status_sort_priority_ordering() {
+        // Failures should sort first (lowest priority number)
+        assert!(CiStatus::Failure.sort_priority() < CiStatus::Pending.sort_priority());
+        assert!(CiStatus::Pending.sort_priority() < CiStatus::Success.sort_priority());
+        assert!(CiStatus::Success.sort_priority() < CiStatus::Skipped.sort_priority());
+    }
+
+    #[test]
+    fn ci_check_display_name() {
+        let check = CiCheck {
+            workflow_name: "CI".to_string(),
+            job_name: "build".to_string(),
+            status: CiStatus::Success,
+            details_url: String::new(),
+            run_id: 0,
+            job_id: 0,
+            azure_info: None,
+        };
+        assert_eq!(check.display_name(), "CI / build");
+
+        let check_no_workflow = CiCheck {
+            workflow_name: String::new(),
+            job_name: "lint".to_string(),
+            status: CiStatus::Success,
+            details_url: String::new(),
+            run_id: 0,
+            job_id: 0,
+            azure_info: None,
+        };
+        assert_eq!(check_no_workflow.display_name(), "lint");
+    }
+}

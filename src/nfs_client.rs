@@ -193,12 +193,104 @@ fn normalize_path(path: &Path) -> PathBuf {
     let mut components = Vec::new();
     for component in path.components() {
         match component {
-            std::path::Component::ParentDir => { components.pop(); }
+            std::path::Component::ParentDir => {
+                // Never pop past the root component so absolute paths stay absolute.
+                if let Some(last) = components.last() {
+                    if !matches!(last, std::path::Component::RootDir | std::path::Component::Prefix(_)) {
+                        components.pop();
+                    }
+                }
+            }
             std::path::Component::CurDir => {}
             c => components.push(c),
         }
     }
     components.iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    /// Helper to build an NfsConnection without actually mounting anything.
+    fn test_nfs(mount_point: &str) -> NfsConnection {
+        NfsConnection {
+            host: "testhost".to_string(),
+            export: "/export".to_string(),
+            mount_point: PathBuf::from(mount_point),
+        }
+    }
+
+    // ── normalize_path tests ────────────────────────────────────────
+
+    #[test]
+    fn normalize_no_change() {
+        assert_eq!(normalize_path(Path::new("/a/b/c")), PathBuf::from("/a/b/c"));
+    }
+
+    #[test]
+    fn normalize_parent_dir() {
+        assert_eq!(normalize_path(Path::new("/a/b/../c")), PathBuf::from("/a/c"));
+    }
+
+    #[test]
+    fn normalize_cur_dir() {
+        assert_eq!(normalize_path(Path::new("/a/b/./c")), PathBuf::from("/a/b/c"));
+    }
+
+    #[test]
+    fn normalize_above_root() {
+        // Going above root should collapse to just /etc
+        assert_eq!(normalize_path(Path::new("/a/../../etc")), PathBuf::from("/etc"));
+    }
+
+    #[test]
+    fn normalize_multiple_parent() {
+        assert_eq!(
+            normalize_path(Path::new("/a/b/c/../../d")),
+            PathBuf::from("/a/d")
+        );
+    }
+
+    // ── local_path tests ────────────────────────────────────────────
+
+    #[test]
+    fn local_path_normal() {
+        let nfs = test_nfs("/mnt/nfs");
+        let result = nfs.local_path(Path::new("/foo"));
+        assert_eq!(result, PathBuf::from("/mnt/nfs/foo"));
+    }
+
+    #[test]
+    fn local_path_traversal_falls_back_to_mount_point() {
+        let nfs = test_nfs("/mnt/nfs");
+        let result = nfs.local_path(Path::new("/../../../etc/shadow"));
+        // The traversal escapes the mount point, so it must fall back.
+        assert_eq!(result, PathBuf::from("/mnt/nfs"));
+    }
+
+    #[test]
+    fn local_path_dotdot_within_mount() {
+        let nfs = test_nfs("/mnt/nfs");
+        // /a/../b stays inside /mnt/nfs  →  /mnt/nfs/b  (allowed)
+        let result = nfs.local_path(Path::new("/a/../b"));
+        assert_eq!(result, PathBuf::from("/mnt/nfs/a/../b"));
+    }
+
+    #[test]
+    fn local_path_root() {
+        let nfs = test_nfs("/mnt/nfs");
+        let result = nfs.local_path(Path::new("/"));
+        assert_eq!(result, PathBuf::from("/mnt/nfs"));
+    }
+
+    #[test]
+    fn local_path_empty() {
+        let nfs = test_nfs("/mnt/nfs");
+        let result = nfs.local_path(Path::new(""));
+        assert_eq!(result, PathBuf::from("/mnt/nfs"));
+    }
 }
 
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<u64> {

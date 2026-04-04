@@ -230,7 +230,7 @@ fn smb_quote(path: &str) -> String {
 ///
 ///                 12345678 blocks of size 1024. 9876543 blocks available
 /// ```
-fn parse_smbclient_ls(output: &str, parent: &Path) -> Result<Vec<FileEntry>> {
+pub fn parse_smbclient_ls(output: &str, parent: &Path) -> Result<Vec<FileEntry>> {
     let mut entries = Vec::new();
 
     for line in output.lines() {
@@ -424,6 +424,48 @@ mod tests {
     #[test]
     fn to_smb_path_conversion() {
         assert_eq!(to_smb_path(Path::new("/docs/file.txt")), "\\docs\\file.txt");
+        assert_eq!(to_smb_path(Path::new("/")), "\\");
+    }
+
+    #[test]
+    fn to_smb_path_simple() {
+        assert_eq!(to_smb_path(Path::new("/foo/bar")), "\\foo\\bar");
+    }
+
+    #[test]
+    fn to_smb_path_double_quotes_escaped() {
+        // Quotes must be escaped to prevent breaking out of quoted arguments
+        assert_eq!(to_smb_path(Path::new("/say\"hello")), "\\say\\\"hello");
+    }
+
+    #[test]
+    fn to_smb_path_semicolons_escaped() {
+        // Semicolons separate smbclient commands; must be escaped
+        assert_eq!(to_smb_path(Path::new("/a;rm -rf")), "\\a\\;rm -rf");
+    }
+
+    #[test]
+    fn to_smb_path_backslashes_escaped() {
+        // Existing backslashes in the input must be doubled before '/' -> '\' conversion
+        assert_eq!(to_smb_path(Path::new("/a\\b")), "\\a\\\\b");
+    }
+
+    #[test]
+    fn to_smb_path_all_special_chars() {
+        // Combine backslash, quote, and semicolon
+        assert_eq!(
+            to_smb_path(Path::new("/x\\y\"z;w")),
+            "\\x\\\\y\\\"z\\;w"
+        );
+    }
+
+    #[test]
+    fn to_smb_path_empty() {
+        assert_eq!(to_smb_path(Path::new("")), "");
+    }
+
+    #[test]
+    fn to_smb_path_root() {
         assert_eq!(to_smb_path(Path::new("/")), "\\");
     }
 

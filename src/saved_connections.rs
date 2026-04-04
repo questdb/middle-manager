@@ -188,4 +188,313 @@ mod tests {
             identity_file: None, jump_host: None,
         }
     }
+
+    /// Serialize and deserialize a SavedConnection round-trip via serde_json.
+    #[test]
+    fn serde_round_trip() {
+        let conn = SavedConnection {
+            name: "dev-box".to_string(),
+            protocol: "ssh".to_string(),
+            host: Some("10.0.0.1".to_string()),
+            port: Some(2222),
+            user: Some("deploy".to_string()),
+            password: Some("s3cret".to_string()),
+            identity_file: Some("/home/deploy/.ssh/id_ed25519".to_string()),
+            ..default_connection()
+        };
+        let json = serde_json::to_string_pretty(&vec![conn.clone()]).unwrap();
+        let loaded: Vec<SavedConnection> = serde_json::from_str(&json).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "dev-box");
+        assert_eq!(loaded[0].protocol, "ssh");
+        assert_eq!(loaded[0].host.as_deref(), Some("10.0.0.1"));
+        assert_eq!(loaded[0].port, Some(2222));
+        assert_eq!(loaded[0].user.as_deref(), Some("deploy"));
+        assert_eq!(loaded[0].password.as_deref(), Some("s3cret"));
+        assert_eq!(
+            loaded[0].identity_file.as_deref(),
+            Some("/home/deploy/.ssh/id_ed25519")
+        );
+    }
+
+    /// Optional fields that are None should not appear in serialized JSON.
+    #[test]
+    fn serde_skips_none_fields() {
+        let conn = SavedConnection {
+            name: "minimal".to_string(),
+            protocol: "s3".to_string(),
+            bucket: Some("data".to_string()),
+            ..default_connection()
+        };
+        let json = serde_json::to_string(&vec![conn]).unwrap();
+        // These None fields should be absent from the JSON
+        assert!(!json.contains("\"host\""));
+        assert!(!json.contains("\"port\""));
+        assert!(!json.contains("\"password\""));
+        assert!(!json.contains("\"export\""));
+        // These should be present
+        assert!(json.contains("\"bucket\""));
+        assert!(json.contains("\"name\""));
+    }
+
+    /// Deserializing JSON with missing optional fields should default to None.
+    #[test]
+    fn serde_missing_fields_default_to_none() {
+        let json = r#"[{"name":"test","protocol":"sftp"}]"#;
+        let loaded: Vec<SavedConnection> = serde_json::from_str(json).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].name, "test");
+        assert!(loaded[0].host.is_none());
+        assert!(loaded[0].port.is_none());
+        assert!(loaded[0].password.is_none());
+    }
+
+    #[test]
+    fn display_label_webdav() {
+        let c = SavedConnection {
+            name: "nextcloud".to_string(),
+            protocol: "webdav".to_string(),
+            url: Some("https://cloud.example.com/dav".to_string()),
+            ..default_connection()
+        };
+        assert_eq!(c.display_label(), "WebDAV: https://cloud.example.com/dav");
+    }
+
+    #[test]
+    fn display_label_smb() {
+        let c = SavedConnection {
+            name: "nas".to_string(),
+            protocol: "smb".to_string(),
+            host: Some("nas.local".to_string()),
+            share: Some("public".to_string()),
+            ..default_connection()
+        };
+        assert_eq!(c.display_label(), "SMB: nas.local\\public");
+    }
+
+    #[test]
+    fn display_label_nfs() {
+        let c = SavedConnection {
+            name: "nfs-share".to_string(),
+            protocol: "nfs".to_string(),
+            host: Some("storage.lan".to_string()),
+            export: Some("/exports/data".to_string()),
+            ..default_connection()
+        };
+        assert_eq!(c.display_label(), "NFS: storage.lan:/exports/data");
+    }
+
+    #[test]
+    fn display_label_azure() {
+        let c = SavedConnection {
+            name: "az".to_string(),
+            protocol: "azure".to_string(),
+            account: Some("myaccount".to_string()),
+            container: Some("mycontainer".to_string()),
+            ..default_connection()
+        };
+        assert_eq!(c.display_label(), "Azure: myaccount/mycontainer");
+    }
+
+    #[test]
+    fn display_label_gcs() {
+        let c = SavedConnection {
+            name: "gcloud".to_string(),
+            protocol: "gcs".to_string(),
+            bucket: Some("my-gcs-bucket".to_string()),
+            ..default_connection()
+        };
+        assert_eq!(c.display_label(), "GCS: my-gcs-bucket");
+    }
+
+    #[test]
+    fn display_label_unknown_protocol() {
+        let c = SavedConnection {
+            name: "custom".to_string(),
+            protocol: "ftp".to_string(),
+            ..default_connection()
+        };
+        assert_eq!(c.display_label(), "FTP: custom");
+    }
+
+    // ---------------------------------------------------------------
+    // File-system integration tests — use XDG_CONFIG_HOME override
+    // to redirect save/load to a temp directory.
+    // These must run serially since they mutate a process-global env var.
+    // ---------------------------------------------------------------
+
+    use std::sync::Mutex;
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Helper: run a closure with XDG_CONFIG_HOME pointing at `dir`.
+    fn with_temp_config<F: FnOnce()>(dir: &Path, f: F) {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("XDG_CONFIG_HOME");
+        std::env::set_var("XDG_CONFIG_HOME", dir);
+        f();
+        // Restore
+        match prev {
+            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+            None => std::env::remove_var("XDG_CONFIG_HOME"),
+        }
+    }
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conns = vec![
+            SavedConnection {
+                name: "alpha".to_string(),
+                protocol: "ssh".to_string(),
+                host: Some("host-a.example.com".to_string()),
+                user: Some("root".to_string()),
+                ..default_connection()
+            },
+            SavedConnection {
+                name: "beta".to_string(),
+                protocol: "s3".to_string(),
+                bucket: Some("archive".to_string()),
+                region: Some("us-east-1".to_string()),
+                ..default_connection()
+            },
+        ];
+
+        with_temp_config(tmp.path(), || {
+            save_connections(&conns);
+            let loaded = load_connections();
+            assert_eq!(loaded.len(), 2);
+            assert_eq!(loaded[0].name, "alpha");
+            assert_eq!(loaded[0].protocol, "ssh");
+            assert_eq!(loaded[0].host.as_deref(), Some("host-a.example.com"));
+            assert_eq!(loaded[1].name, "beta");
+            assert_eq!(loaded[1].bucket.as_deref(), Some("archive"));
+            assert_eq!(loaded[1].region.as_deref(), Some("us-east-1"));
+        });
+    }
+
+    #[test]
+    fn save_creates_file_with_valid_json() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conns = vec![SavedConnection {
+            name: "test".to_string(),
+            protocol: "sftp".to_string(),
+            host: Some("sftp.example.com".to_string()),
+            ..default_connection()
+        }];
+
+        with_temp_config(tmp.path(), || {
+            save_connections(&conns);
+            let path = connections_path();
+            assert!(path.exists(), "connections file should exist after save");
+
+            let raw = std::fs::read_to_string(&path).unwrap();
+            let parsed: Vec<SavedConnection> = serde_json::from_str(&raw).unwrap();
+            assert_eq!(parsed.len(), 1);
+            assert_eq!(parsed[0].name, "test");
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_sets_file_permissions_0600() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conns = vec![SavedConnection {
+            name: "secure".to_string(),
+            protocol: "ssh".to_string(),
+            password: Some("topsecret".to_string()),
+            ..default_connection()
+        }];
+
+        with_temp_config(tmp.path(), || {
+            save_connections(&conns);
+            let path = connections_path();
+            let meta = std::fs::metadata(&path).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "file permissions should be 0600, got {:o}",
+                mode
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_sets_directory_permissions_0700() {
+        let tmp = tempfile::tempdir().unwrap();
+        let conns = vec![SavedConnection {
+            name: "x".to_string(),
+            protocol: "ssh".to_string(),
+            ..default_connection()
+        }];
+
+        with_temp_config(tmp.path(), || {
+            save_connections(&conns);
+            let path = connections_path();
+            let parent = path.parent().unwrap();
+            let meta = std::fs::metadata(parent).unwrap();
+            let mode = meta.permissions().mode() & 0o777;
+            assert_eq!(
+                mode, 0o700,
+                "directory permissions should be 0700, got {:o}",
+                mode
+            );
+        });
+    }
+
+    #[test]
+    fn load_nonexistent_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_temp_config(tmp.path(), || {
+            // No file saved — load should return an empty vec
+            let loaded = load_connections();
+            assert!(loaded.is_empty());
+        });
+    }
+
+    #[test]
+    fn load_invalid_json_returns_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_temp_config(tmp.path(), || {
+            let path = connections_path();
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "not valid json {{{{").unwrap();
+            let loaded = load_connections();
+            assert!(loaded.is_empty(), "invalid JSON should produce empty vec");
+        });
+    }
+
+    #[test]
+    fn save_empty_list() {
+        let tmp = tempfile::tempdir().unwrap();
+        with_temp_config(tmp.path(), || {
+            save_connections(&[]);
+            let loaded = load_connections();
+            assert!(loaded.is_empty());
+        });
+    }
+
+    #[test]
+    fn save_overwrites_previous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let first = vec![SavedConnection {
+            name: "first".to_string(),
+            protocol: "ssh".to_string(),
+            ..default_connection()
+        }];
+        let second = vec![SavedConnection {
+            name: "second".to_string(),
+            protocol: "s3".to_string(),
+            bucket: Some("b".to_string()),
+            ..default_connection()
+        }];
+
+        with_temp_config(tmp.path(), || {
+            save_connections(&first);
+            save_connections(&second);
+            let loaded = load_connections();
+            assert_eq!(loaded.len(), 1);
+            assert_eq!(loaded[0].name, "second");
+        });
+    }
 }

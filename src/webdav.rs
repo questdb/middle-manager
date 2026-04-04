@@ -300,7 +300,7 @@ fn url_encode_path(path: &str) -> String {
 }
 
 /// Parse a WebDAV PROPFIND 207 Multi-Status XML response into FileEntry items.
-fn parse_propfind_response(
+pub fn parse_propfind_response(
     xml: &str,
     parent: &Path,
     base_url: &str,
@@ -690,5 +690,106 @@ mod tests {
             insecure: false,
         };
         assert_eq!(conn.display_label(), "WebDAV: nas.local:8080");
+    }
+
+    #[test]
+    fn webdav_display_label_no_scheme() {
+        let conn = WebDavConnection {
+            base_url: "myserver.local".to_string(),
+            username: String::new(),
+            password: String::new(),
+            insecure: false,
+        };
+        // Falls through to the else branch — shows the raw base_url
+        assert_eq!(conn.display_label(), "WebDAV: myserver.local");
+    }
+
+    #[test]
+    fn webdav_insecure_defaults_false() {
+        // Construct the same way `connect()` does, but skip the network call
+        let conn = WebDavConnection {
+            base_url: "https://cloud.example.com/dav".to_string(),
+            username: "user".to_string(),
+            password: "secret".to_string(),
+            insecure: false,
+        };
+        assert!(!conn.insecure, "insecure should default to false");
+    }
+
+    #[test]
+    fn webdav_insecure_true() {
+        let conn = WebDavConnection {
+            base_url: "https://self-signed.local/dav".to_string(),
+            username: "admin".to_string(),
+            password: "pw".to_string(),
+            insecure: true,
+        };
+        assert!(conn.insecure);
+        assert_eq!(conn.display_label(), "WebDAV: self-signed.local");
+    }
+
+    #[test]
+    fn webdav_url_for_root() {
+        let conn = WebDavConnection {
+            base_url: "https://host/dav".to_string(),
+            username: String::new(),
+            password: String::new(),
+            insecure: false,
+        };
+        assert_eq!(conn.url_for(Path::new("/")), "https://host/dav/");
+        assert_eq!(conn.url_for(Path::new("")), "https://host/dav/");
+    }
+
+    #[test]
+    fn webdav_url_for_subpath() {
+        let conn = WebDavConnection {
+            base_url: "https://host/dav".to_string(),
+            username: String::new(),
+            password: String::new(),
+            insecure: false,
+        };
+        assert_eq!(
+            conn.url_for(Path::new("/docs/notes.txt")),
+            "https://host/dav/docs/notes.txt"
+        );
+    }
+
+    #[test]
+    fn webdav_url_for_spaces_encoded() {
+        let conn = WebDavConnection {
+            base_url: "https://host/dav".to_string(),
+            username: String::new(),
+            password: String::new(),
+            insecure: false,
+        };
+        assert_eq!(
+            conn.url_for(Path::new("/my docs/file name.txt")),
+            "https://host/dav/my%20docs/file%20name.txt"
+        );
+    }
+
+    #[test]
+    fn webdav_base_url_trailing_slash_stripped() {
+        // connect() trims trailing slashes — verify via direct construction
+        let url = "https://host/dav/";
+        let base_url = url.trim_end_matches('/').to_string();
+        let conn = WebDavConnection {
+            base_url,
+            username: String::new(),
+            password: String::new(),
+            insecure: false,
+        };
+        assert_eq!(conn.base_url, "https://host/dav");
+    }
+
+    #[test]
+    fn webdav_home_dir_is_root() {
+        let conn = WebDavConnection {
+            base_url: "https://host/dav".to_string(),
+            username: String::new(),
+            password: String::new(),
+            insecure: false,
+        };
+        assert_eq!(conn.home_dir(), PathBuf::from("/"));
     }
 }

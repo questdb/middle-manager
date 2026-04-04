@@ -8,7 +8,7 @@
 //! Tests are skipped automatically if the service is not available.
 //! Run with: `cargo test --test integration_remote -- --nocapture`
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 
 /// Check if a TCP port is open on localhost.
@@ -115,7 +115,7 @@ mod s3mock {
                 assert!(entries.is_empty(), "Expected empty, got {:?}", entries.iter().map(|e| &e.name).collect::<Vec<_>>());
             }
             Err(e) => {
-                eprintln!("S3 connect failed (may need AWS_ACCESS_KEY_ID=dummy): {}", e);
+                panic!("S3 connect failed (skip guard confirmed service is up): {}", e);
             }
         }
 
@@ -264,7 +264,7 @@ mod azurite {
                 assert!(names.contains(&"mm-test-list"), "Missing container in {:?}", names);
             }
             Err(e) => {
-                eprintln!("Azure connect failed: {}", e);
+                panic!("Azure connect failed (skip guard confirmed service is up): {}", e);
             }
         }
 
@@ -431,10 +431,25 @@ mod webdav {
   </d:response>
 </d:multistatus>"#;
 
-        // This calls the parser directly without a live server
-        // The parse function is internal, so we test via the unit tests in webdav.rs
-        // This test just validates the test infrastructure works
-        assert!(xml.contains("multistatus"));
+        let entries = middle_manager::webdav::parse_propfind_response(
+            xml,
+            Path::new("/"),
+            "https://example.com/webdav",
+        )
+        .expect("parse_propfind_response should succeed");
+
+        // The first <d:response> is the directory itself (/webdav/) and should be skipped.
+        // We expect 2 entries: "documents" (dir) and "readme.txt" (file).
+        assert_eq!(entries.len(), 2, "Expected 2 entries, got {:?}", entries.iter().map(|e| &e.name).collect::<Vec<_>>());
+
+        // Verify the directory entry
+        assert_eq!(entries[0].name, "documents");
+        assert!(entries[0].is_dir, "documents should be a directory");
+
+        // Verify the file entry
+        assert_eq!(entries[1].name, "readme.txt");
+        assert!(!entries[1].is_dir, "readme.txt should not be a directory");
+        assert_eq!(entries[1].size, 42);
     }
 }
 
@@ -457,9 +472,28 @@ mod smb {
 
                 12345678 blocks of size 1024. 9876543 blocks available
 ";
-        // Parser is tested in unit tests in smb_client.rs
-        // This integration test validates test infrastructure
-        assert!(output.contains("Documents"));
-        assert!(output.contains("photo.jpg"));
+        let entries = middle_manager::smb_client::parse_smbclient_ls(output, Path::new("/"))
+            .expect("parse_smbclient_ls should succeed");
+
+        // "." is skipped by the parser, so we expect 4 entries: "..", "Documents", "photo.jpg", "readme.txt"
+        assert_eq!(entries.len(), 4, "Expected 4 entries, got {:?}", entries.iter().map(|e| &e.name).collect::<Vec<_>>());
+
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&".."), "Missing '..' in {:?}", names);
+        assert!(names.contains(&"Documents"), "Missing 'Documents' in {:?}", names);
+        assert!(names.contains(&"photo.jpg"), "Missing 'photo.jpg' in {:?}", names);
+        assert!(names.contains(&"readme.txt"), "Missing 'readme.txt' in {:?}", names);
+
+        // Verify directory flag
+        let docs = entries.iter().find(|e| e.name == "Documents").unwrap();
+        assert!(docs.is_dir, "Documents should be a directory");
+
+        // Verify file size
+        let photo = entries.iter().find(|e| e.name == "photo.jpg").unwrap();
+        assert!(!photo.is_dir, "photo.jpg should not be a directory");
+        assert_eq!(photo.size, 1234567);
+
+        let readme = entries.iter().find(|e| e.name == "readme.txt").unwrap();
+        assert_eq!(readme.size, 4096);
     }
 }

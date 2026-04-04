@@ -441,3 +441,35 @@ pub fn theme() -> Theme {
     });
     t
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn far_manager_next_is_questdb_dark() {
+        assert_eq!(ThemeName::FarManager.next(), ThemeName::QuestdbDark);
+    }
+
+    #[test]
+    fn questdb_dark_next_is_far_manager() {
+        assert_eq!(ThemeName::QuestdbDark.next(), ThemeName::FarManager);
+    }
+
+    #[test]
+    fn far_manager_prev_is_questdb_dark() {
+        assert_eq!(ThemeName::FarManager.prev(), ThemeName::QuestdbDark);
+    }
+
+    #[test]
+    fn questdb_dark_prev_is_far_manager() {
+        assert_eq!(ThemeName::QuestdbDark.prev(), ThemeName::FarManager);
+    }
+
+    #[test]
+    fn round_trip_next_prev() {
+        for &name in ThemeName::all() {
+            assert_eq!(name.next().prev(), name, "round-trip failed for {:?}", name);
+        }
+    }
+}

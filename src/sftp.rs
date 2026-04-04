@@ -487,6 +487,59 @@ drwxr-xr-x    2 nick     staff          64 Feb  5 09:30 Documents
     }
 
     #[test]
+    fn shell_quote_normal_filename() {
+        // No special characters — just wrapped in double quotes
+        assert_eq!(shell_quote("readme.txt"), "\"readme.txt\"");
+    }
+
+    #[test]
+    fn shell_quote_spaces() {
+        assert_eq!(shell_quote("my file.txt"), "\"my file.txt\"");
+    }
+
+    #[test]
+    fn shell_quote_double_quotes() {
+        assert_eq!(shell_quote("say\"hello"), "\"say\\\"hello\"");
+    }
+
+    #[test]
+    fn shell_quote_backslashes() {
+        assert_eq!(shell_quote("back\\slash"), "\"back\\\\slash\"");
+    }
+
+    #[test]
+    fn shell_quote_newline_returns_sentinel() {
+        assert_eq!(shell_quote("bad\nname"), "\"<invalid-filename>\"");
+    }
+
+    #[test]
+    fn shell_quote_carriage_return_returns_sentinel() {
+        assert_eq!(shell_quote("bad\rname"), "\"<invalid-filename>\"");
+    }
+
+    #[test]
+    fn shell_quote_null_byte_returns_sentinel() {
+        assert_eq!(shell_quote("bad\0name"), "\"<invalid-filename>\"");
+    }
+
+    #[test]
+    fn shell_quote_tab_allowed() {
+        // Tab (0x09) is the only control char below 0x20 that is NOT rejected
+        assert_eq!(shell_quote("col1\tcol2"), "\"col1\tcol2\"");
+    }
+
+    #[test]
+    fn shell_quote_backtick() {
+        // Backtick is not a control char and needs no special escaping in sftp batch mode
+        assert_eq!(shell_quote("file`name"), "\"file`name\"");
+    }
+
+    #[test]
+    fn shell_quote_empty_string() {
+        assert_eq!(shell_quote(""), "\"\"");
+    }
+
+    #[test]
     fn parse_ls_filename_with_spaces() {
         let line = "-rw-r--r--    1 nick     staff       100 Jan  1 00:00 my file name.txt";
         let entry = parse_ls_line(line, Path::new("/")).unwrap();

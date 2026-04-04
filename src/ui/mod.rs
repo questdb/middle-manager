@@ -616,3 +616,104 @@ fn render_goto_prompt(frame: &mut Frame, input: &str) {
 
     shadow::render_shadow(frame, rect);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── truncate_to_width ──
+
+    #[test]
+    fn truncate_ascii_shorter_than_max() {
+        assert_eq!(truncate_to_width("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_ascii_exact_max() {
+        assert_eq!(truncate_to_width("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_ascii_longer_than_max() {
+        assert_eq!(truncate_to_width("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate_to_width("", 5), "");
+    }
+
+    #[test]
+    fn truncate_cjk_characters() {
+        // Each CJK char is width 2. "日本語abc" = widths [2,2,2,1,1,1] = total 9.
+        // At max_width 5: "日本" fits (width 4), "語" would be 6 — doesn't fit.
+        assert_eq!(truncate_to_width("日本語abc", 5), "日本");
+    }
+
+    #[test]
+    fn truncate_mixed_ascii_multibyte() {
+        // "café": c(1) a(1) f(1) é(1) — all width 1.
+        assert_eq!(truncate_to_width("café", 3), "caf");
+        assert_eq!(truncate_to_width("café", 4), "café");
+    }
+
+    #[test]
+    fn truncate_max_width_zero() {
+        assert_eq!(truncate_to_width("hello", 0), "");
+    }
+
+    #[test]
+    fn truncate_emoji() {
+        // "a🎉b": a(1) 🎉(2) b(1).
+        // max_width 1 → "a"
+        assert_eq!(truncate_to_width("a🎉b", 1), "a");
+        // max_width 2 → "a" (🎉 needs 2 more, total would be 3)
+        assert_eq!(truncate_to_width("a🎉b", 2), "a");
+        // max_width 3 → "a🎉"
+        assert_eq!(truncate_to_width("a🎉b", 3), "a🎉");
+        // max_width 4 → "a🎉b"
+        assert_eq!(truncate_to_width("a🎉b", 4), "a🎉b");
+    }
+
+    // ── ceil_char_boundary ──
+
+    #[test]
+    fn ceil_boundary_at_valid_boundary() {
+        let s = "hello";
+        // Every position in an ASCII string is a valid boundary.
+        assert_eq!(ceil_char_boundary(s, 3), 3);
+    }
+
+    #[test]
+    fn ceil_boundary_mid_multibyte() {
+        // 'é' in UTF-8 is 2 bytes (0xC3 0xA9). In "café", 'é' starts at byte 3.
+        let s = "café";
+        // Byte 4 is in the middle of 'é' — should round up to 5 (end of é).
+        assert_eq!(ceil_char_boundary(s, 4), 5);
+    }
+
+    #[test]
+    fn ceil_boundary_at_zero() {
+        assert_eq!(ceil_char_boundary("hello", 0), 0);
+    }
+
+    #[test]
+    fn ceil_boundary_past_end() {
+        let s = "hi";
+        assert_eq!(ceil_char_boundary(s, 100), s.len());
+    }
+
+    #[test]
+    fn ceil_boundary_at_end() {
+        let s = "hi";
+        assert_eq!(ceil_char_boundary(s, s.len()), s.len());
+    }
+
+    #[test]
+    fn ceil_boundary_ascii_every_position() {
+        let s = "abcde";
+        for i in 0..=s.len() {
+            assert_eq!(ceil_char_boundary(s, i), i, "position {i}");
+        }
+    }
+}

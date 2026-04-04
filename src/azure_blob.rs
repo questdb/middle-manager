@@ -650,4 +650,141 @@ mod tests {
         let items = json.as_array().unwrap();
         assert!(items.is_empty());
     }
+
+    /// Helper to build a connection with an empty default container (account-level browsing).
+    fn account_level_conn() -> AzureBlobConnection {
+        AzureBlobConnection {
+            account: "acc".to_string(),
+            container: String::new(),
+            sas_token: None,
+            connection_string: None,
+        }
+    }
+
+    /// Helper to build a connection with a fixed default container.
+    fn container_level_conn() -> AzureBlobConnection {
+        AzureBlobConnection {
+            account: "acc".to_string(),
+            container: "fixedcontainer".to_string(),
+            sas_token: None,
+            connection_string: None,
+        }
+    }
+
+    // --- resolve_path tests (account-level: first segment = container) ---
+
+    #[test]
+    fn resolve_path_container_and_blob() {
+        let conn = account_level_conn();
+        let (container, prefix) = conn.resolve_path(Path::new("/container/path/to/blob"));
+        assert_eq!(container, "container");
+        assert_eq!(prefix, "path/to/blob/");
+    }
+
+    #[test]
+    fn resolve_path_container_trailing_slash() {
+        let conn = account_level_conn();
+        let (container, prefix) = conn.resolve_path(Path::new("/container/"));
+        assert_eq!(container, "container");
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn resolve_path_container_no_trailing_slash() {
+        let conn = account_level_conn();
+        let (container, prefix) = conn.resolve_path(Path::new("/container"));
+        assert_eq!(container, "container");
+        assert_eq!(prefix, "");
+    }
+
+    #[test]
+    fn resolve_path_nested_dirs() {
+        let conn = account_level_conn();
+        let (container, prefix) =
+            conn.resolve_path(Path::new("/mycontainer/dir1/dir2/file.txt"));
+        assert_eq!(container, "mycontainer");
+        assert_eq!(prefix, "dir1/dir2/file.txt/");
+    }
+
+    #[test]
+    fn resolve_path_account_root() {
+        let conn = account_level_conn();
+        let (container, prefix) = conn.resolve_path(Path::new("/"));
+        assert_eq!(container, "");
+        assert_eq!(prefix, "");
+    }
+
+    // --- resolve_path tests (container-level: self.container is set) ---
+
+    #[test]
+    fn resolve_path_fixed_container_subpath() {
+        let conn = container_level_conn();
+        let (container, prefix) = conn.resolve_path(Path::new("/logs/data"));
+        assert_eq!(container, "fixedcontainer");
+        assert_eq!(prefix, "logs/data/");
+    }
+
+    #[test]
+    fn resolve_path_fixed_container_root() {
+        let conn = container_level_conn();
+        let (container, prefix) = conn.resolve_path(Path::new("/"));
+        assert_eq!(container, "fixedcontainer");
+        assert_eq!(prefix, "");
+    }
+
+    // --- to_prefix tests (verifying the behaviour shared with S3/GCS) ---
+
+    #[test]
+    fn to_prefix_root() {
+        let conn = container_level_conn();
+        assert_eq!(conn.to_prefix(Path::new("/")), "");
+    }
+
+    #[test]
+    fn to_prefix_single_segment() {
+        let conn = container_level_conn();
+        assert_eq!(conn.to_prefix(Path::new("/logs")), "logs/");
+    }
+
+    #[test]
+    fn to_prefix_trailing_slash() {
+        let conn = container_level_conn();
+        assert_eq!(conn.to_prefix(Path::new("/logs/")), "logs/");
+    }
+
+    #[test]
+    fn to_prefix_nested() {
+        let conn = container_level_conn();
+        assert_eq!(conn.to_prefix(Path::new("/a/b/c")), "a/b/c/");
+    }
+
+    #[test]
+    fn to_prefix_empty_path() {
+        let conn = container_level_conn();
+        assert_eq!(conn.to_prefix(Path::new("")), "");
+    }
+
+    // --- extract_connection_string_field tests ---
+
+    #[test]
+    fn extract_field_blob_endpoint() {
+        let cs = "DefaultEndpointsProtocol=https;AccountName=acc;BlobEndpoint=http://127.0.0.1:10000/acc;AccountKey=abc";
+        let ep = extract_connection_string_field(cs, "BlobEndpoint");
+        assert_eq!(ep, Some("http://127.0.0.1:10000/acc".to_string()));
+    }
+
+    #[test]
+    fn extract_field_missing() {
+        let cs = "AccountName=acc;AccountKey=abc";
+        assert_eq!(extract_connection_string_field(cs, "BlobEndpoint"), None);
+    }
+
+    #[test]
+    fn extract_field_account_name() {
+        let cs = "DefaultEndpointsProtocol=https;AccountName=myaccount;AccountKey=abc";
+        assert_eq!(
+            extract_connection_string_field(cs, "AccountName"),
+            Some("myaccount".to_string())
+        );
+    }
 }
