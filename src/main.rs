@@ -1,6 +1,7 @@
 mod action;
 mod app;
 mod ci;
+mod diff_viewer;
 mod editor;
 mod event;
 mod file_search;
@@ -8,6 +9,7 @@ mod fs_ops;
 mod hex_viewer;
 mod panel;
 mod parquet_viewer;
+mod pr_diff;
 mod state;
 mod syntax;
 mod terminal;

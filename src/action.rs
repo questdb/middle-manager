@@ -96,6 +96,7 @@ pub enum Action {
     // GitHub / CI
     OpenPr,
     ToggleCi,
+    ToggleDiff,
 
     // Terminal / Shell
     ToggleClaude,

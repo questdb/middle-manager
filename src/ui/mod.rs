@@ -3,6 +3,8 @@ pub mod ci_view;
 pub mod copy_dialog;
 pub mod dialog;
 pub mod dialog_helpers;
+pub mod diff_view;
+pub mod diff_viewer_view;
 pub mod editor_view;
 pub mod file_search_dialog;
 pub mod footer;
@@ -26,7 +28,7 @@ use ratatui::Frame;
 
 use std::cell::Cell;
 
-use crate::app::{App, AppMode};
+use crate::app::{App, AppMode, PanelFocus};
 use crate::theme::theme;
 
 thread_local! {
@@ -56,27 +58,30 @@ pub fn take_dialog_content() -> Option<Rect> {
     DIALOG_CONTENT.replace(None)
 }
 
-/// Split a panel column into file area + optional CI area + optional shell area + optional Claude area.
+/// Split a panel column into file area + optional bottom panels (CI, diff, shell, Claude).
 ///
 /// When `maximized` is true, the file panel gets 0 height and the bottom panels fill the column.
 /// `split_pct` controls the top/bottom ratio (percentage for the file panel).
+#[allow(clippy::too_many_arguments)]
 fn split_panel_column(
     col: Rect,
     has_ci: bool,
+    has_diff: bool,
     has_shell: bool,
     has_claude: bool,
     split_pct: u16,
     maximized: bool,
-) -> (Rect, Option<Rect>, Option<Rect>, Option<Rect>) {
+) -> (Rect, Option<Rect>, Option<Rect>, Option<Rect>, Option<Rect>) {
     // When Claude is maximized, it takes the entire column
     if maximized && has_claude {
         let zero = Rect::new(col.x, col.y, col.width, 0);
-        return (zero, None, None, Some(col));
+        return (zero, None, None, None, Some(col));
     }
 
-    let bottom_count = has_ci as usize + has_shell as usize + has_claude as usize;
+    let bottom_count =
+        has_ci as usize + has_diff as usize + has_shell as usize + has_claude as usize;
     if bottom_count == 0 {
-        return (col, None, None, None);
+        return (col, None, None, None, None);
     }
 
     // Split top (file panel) vs bottom (all sub-panels share equally)
@@ -104,6 +109,13 @@ fn split_panel_column(
     } else {
         None
     };
+    let diff_area = if has_diff {
+        let a = areas[idx];
+        idx += 1;
+        Some(a)
+    } else {
+        None
+    };
     let shell_area = if has_shell {
         let a = areas[idx];
         idx += 1;
@@ -119,7 +131,7 @@ fn split_panel_column(
         None
     };
 
-    (file_area, ci_area, shell_area, claude_area)
+    (file_area, ci_area, diff_area, shell_area, claude_area)
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -127,6 +139,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         AppMode::Viewing(_) => render_viewer(frame, app),
         AppMode::HexViewing(_) => render_hex_viewer(frame, app),
         AppMode::ParquetViewing(_) => render_parquet_viewer(frame, app),
+        AppMode::DiffViewing(_) => render_diff_viewer(frame, app),
         AppMode::Editing(_) => render_editor(frame, app),
         _ => render_normal(frame, app),
     }
@@ -161,39 +174,40 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
         Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(panels_area);
 
     // Split each column: file panel on top, bottom panels below
-    let (left_area, left_ci_area, left_shell_area, left_claude_area) = split_panel_column(
-        left_col,
-        app.ci_panels[0].is_some(),
-        app.shell_panels[0].is_some(),
-        app.claude_panels[0].is_some(),
-        app.bottom_split_pct[0],
-        app.bottom_maximized[0],
-    );
-    let (right_area, right_ci_area, right_shell_area, right_claude_area) = split_panel_column(
-        right_col,
-        app.ci_panels[1].is_some(),
-        app.shell_panels[1].is_some(),
-        app.claude_panels[1].is_some(),
-        app.bottom_split_pct[1],
-        app.bottom_maximized[1],
-    );
+    let (left_area, left_ci_area, left_diff_area, left_shell_area, left_claude_area) =
+        split_panel_column(
+            left_col,
+            app.ci_panels[0].is_some(),
+            app.diff_panels[0].is_some(),
+            app.shell_panels[0].is_some(),
+            app.claude_panels[0].is_some(),
+            app.bottom_split_pct[0],
+            app.bottom_maximized[0],
+        );
+    let (right_area, right_ci_area, right_diff_area, right_shell_area, right_claude_area) =
+        split_panel_column(
+            right_col,
+            app.ci_panels[1].is_some(),
+            app.diff_panels[1].is_some(),
+            app.shell_panels[1].is_some(),
+            app.claude_panels[1].is_some(),
+            app.bottom_split_pct[1],
+            app.bottom_maximized[1],
+        );
 
     app.panel_areas = [left_area, right_area];
     app.ci_panel_areas = [left_ci_area, right_ci_area];
+    app.diff_panel_areas = [left_diff_area, right_diff_area];
     app.shell_panel_areas = [left_shell_area, right_shell_area];
     app.claude_panel_areas = [left_claude_area, right_claude_area];
 
     header::render(frame, header_area, app);
 
     // File panels are active only when nothing else is focused
-    let (left_active, right_active) = if app.ci_focused.is_some()
-        || app.claude_focused.is_some()
-        || app.shell_focused.is_some()
-        || app.file_search_focused
-    {
-        (false, false)
-    } else {
+    let (left_active, right_active) = if app.focus == PanelFocus::FilePanel {
         (app.active_panel == 0, app.active_panel == 1)
+    } else {
+        (false, false)
     };
 
     let has_search = app.file_search.is_some();
@@ -205,7 +219,7 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
     // Left side
     if has_search && search_side == 0 {
         if let Some(ref mut state) = app.file_search {
-            search_results_view::render(frame, left_area, state, app.file_search_focused);
+            search_results_view::render(frame, left_area, state, app.focus == PanelFocus::Search);
         }
     } else if left_area.height > 0 {
         panel_view::render_with_overlays(
@@ -221,7 +235,7 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
     // Right side
     if has_search && search_side == 1 {
         if let Some(ref mut state) = app.file_search {
-            search_results_view::render(frame, right_area, state, app.file_search_focused);
+            search_results_view::render(frame, right_area, state, app.focus == PanelFocus::Search);
         }
     } else if right_area.height > 0 {
         panel_view::render_with_overlays(
@@ -242,43 +256,50 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
 
     // Render CI panels
     if let (Some(ci_area), Some(ref mut ci)) = (left_ci_area, &mut app.ci_panels[0]) {
-        ci_view::render(frame, ci_area, ci, app.ci_focused == Some(0));
+        ci_view::render(frame, ci_area, ci, app.focus == PanelFocus::Ci(0));
     }
     if let (Some(ci_area), Some(ref mut ci)) = (right_ci_area, &mut app.ci_panels[1]) {
-        ci_view::render(frame, ci_area, ci, app.ci_focused == Some(1));
+        ci_view::render(frame, ci_area, ci, app.focus == PanelFocus::Ci(1));
+    }
+
+    // Render diff panels
+    if let (Some(diff_area), Some(ref mut diff)) = (left_diff_area, &mut app.diff_panels[0]) {
+        diff_view::render(frame, diff_area, diff, app.focus == PanelFocus::Diff(0));
+    }
+    if let (Some(diff_area), Some(ref mut diff)) = (right_diff_area, &mut app.diff_panels[1]) {
+        diff_view::render(frame, diff_area, diff, app.focus == PanelFocus::Diff(1));
     }
 
     // Render shell panels
     if let (Some(shell_area), Some(ref sp)) = (left_shell_area, &app.shell_panels[0]) {
-        terminal_view::render(frame, shell_area, sp, app.shell_focused == Some(0));
+        terminal_view::render(frame, shell_area, sp, app.focus == PanelFocus::Shell(0));
     }
     if let (Some(shell_area), Some(ref sp)) = (right_shell_area, &app.shell_panels[1]) {
-        terminal_view::render(frame, shell_area, sp, app.shell_focused == Some(1));
+        terminal_view::render(frame, shell_area, sp, app.focus == PanelFocus::Shell(1));
     }
 
     // Render Claude panels
     if let (Some(claude_area), Some(ref cp)) = (left_claude_area, &app.claude_panels[0]) {
-        terminal_view::render(frame, claude_area, cp, app.claude_focused == Some(0));
+        terminal_view::render(frame, claude_area, cp, app.focus == PanelFocus::Claude(0));
     }
     if let (Some(claude_area), Some(ref cp)) = (right_claude_area, &app.claude_panels[1]) {
-        terminal_view::render(frame, claude_area, cp, app.claude_focused == Some(1));
+        terminal_view::render(frame, claude_area, cp, app.focus == PanelFocus::Claude(1));
     }
 
     // Show appropriate footer
-    if app.file_search_focused {
-        footer::render_search(frame, footer_area);
-    } else if app.shell_focused.is_some() {
-        footer::render_shell(frame, footer_area);
-    } else if app.claude_focused.is_some() {
-        footer::render_terminal(frame, footer_area);
-    } else if let Some(side) = app.ci_focused {
-        if let Some(ref ci) = app.ci_panels[side] {
-            footer::render_ci(frame, footer_area, &ci.view);
-        } else {
-            footer::render(frame, footer_area);
+    match app.focus {
+        PanelFocus::Search => footer::render_search(frame, footer_area),
+        PanelFocus::Shell(_) => footer::render_shell(frame, footer_area),
+        PanelFocus::Claude(_) => footer::render_terminal(frame, footer_area),
+        PanelFocus::Ci(side) => {
+            if let Some(ref ci) = app.ci_panels[side] {
+                footer::render_ci(frame, footer_area, &ci.view);
+            } else {
+                footer::render(frame, footer_area);
+            }
         }
-    } else {
-        footer::render(frame, footer_area);
+        PanelFocus::Diff(_) => footer::render_diff(frame, footer_area),
+        PanelFocus::FilePanel => footer::render(frame, footer_area),
     }
 
     let dialog_area = match &app.mode {
@@ -308,6 +329,12 @@ fn render_hex_viewer(frame: &mut Frame, app: &mut App) {
 fn render_parquet_viewer(frame: &mut Frame, app: &mut App) {
     if let AppMode::ParquetViewing(ref mut pq) = app.mode {
         parquet_view::render(frame, frame.area(), pq);
+    }
+}
+
+fn render_diff_viewer(frame: &mut Frame, app: &mut App) {
+    if let AppMode::DiffViewing(ref mut dv) = app.mode {
+        diff_viewer_view::render(frame, frame.area(), dv);
     }
 }
 
