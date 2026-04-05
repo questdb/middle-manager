@@ -1,4 +1,4 @@
-class MiddleManager < Formula
+class Mm < Formula
   desc "Dual-panel file manager TUI inspired by Far Manager, built in Rust"
   homepage "https://github.com/questdb/middle-manager"
   version "{{VERSION}}"
@@ -16,10 +16,10 @@ class MiddleManager < Formula
   end
 
   def install
-    bin.install "middle-manager"
+    bin.install "middle-manager" => "mm"
   end
 
   test do
-    assert_match version.to_s, shell_output("#{bin}/middle-manager --version 2>&1", 1)
+    assert_match version.to_s, shell_output("#{bin}/mm --version 2>&1", 1)
   end
 end

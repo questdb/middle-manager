@@ -2,9 +2,10 @@ name: Release
 
 # SETUP REQUIRED (one-time, manual):
 # 1. Create repo: https://github.com/organizations/questdb/repositories/new
-#    Name: homebrew-tap   Visibility: Public
-# 2. Create directory Formula/ with a placeholder middle-manager.rb
+#    Name: homebrew-middle-manager   Visibility: Public
+# 2. Create directory Formula/ with a placeholder mm.rb
 # 3. Create a GitHub PAT (classic) with 'repo' scope on that repo
+#    Users install with: brew install questdb/middle-manager/mm
 # 4. Add it as a secret named HOMEBREW_TAP_TOKEN in questdb/middle-manager settings:
 #    https://github.com/questdb/middle-manager/settings/secrets/actions
 
@@ -195,7 +196,7 @@ jobs:
       - name: Checkout homebrew-tap
         uses: actions/checkout@v4
         with:
-          repository: questdb/homebrew-tap
+          repository: questdb/homebrew-middle-manager
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
           path: homebrew-tap
 
@@ -207,7 +208,7 @@ jobs:
             -e "s/{{SHA256_ARM64_MAC}}/${{ needs.release.outputs.sha256_arm64 }}/g" \
             -e "s/{{SHA256_X86_MAC}}/${{ needs.release.outputs.sha256_x86 }}/g" \
             source/dist/homebrew/middle-manager.rb.template \
-            > homebrew-tap/Formula/middle-manager.rb
+            > homebrew-tap/Formula/mm.rb
 
       - name: Create PR against homebrew-tap
         env:
@@ -218,7 +219,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git checkout -b "$BRANCH"
-          git add Formula/middle-manager.rb
+          git add Formula/mm.rb
           git commit -m "Update middle-manager to ${RELEASE_TAG}"
           git push origin "$BRANCH"
           gh pr create \
