@@ -1,0 +1,228 @@
+name: Release
+
+# SETUP REQUIRED (one-time, manual):
+# 1. Create repo: https://github.com/organizations/questdb/repositories/new
+#    Name: homebrew-tap   Visibility: Public
+# 2. Create directory Formula/ with a placeholder middle-manager.rb
+# 3. Create a GitHub PAT (classic) with 'repo' scope on that repo
+# 4. Add it as a secret named HOMEBREW_TAP_TOKEN in questdb/middle-manager settings:
+#    https://github.com/questdb/middle-manager/settings/secrets/actions
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1.0)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            use_cross: false
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            use_cross: false
+          - target: x86_64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+          - target: aarch64-unknown-linux-musl
+            os: ubuntu-latest
+            use_cross: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use_cross
+        run: cargo install cross --locked
+
+      - name: Build (cross)
+        if: matrix.use_cross
+        run: cross build --release --target ${{ matrix.target }}
+
+      - name: Build (cargo)
+        if: "!matrix.use_cross"
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Strip binary (macOS)
+        if: runner.os == 'macOS'
+        run: strip -x target/${{ matrix.target }}/release/middle-manager
+
+      - name: Package tarball
+        run: |
+          BINARY=target/${{ matrix.target }}/release/middle-manager
+          ARCHIVE=middle-manager-${{ matrix.target }}.tar.gz
+          tar -czf "$ARCHIVE" -C "$(dirname $BINARY)" middle-manager
+          echo "ARCHIVE=$ARCHIVE" >> $GITHUB_ENV
+
+      - name: Compute checksum (macOS)
+        if: runner.os == 'macOS'
+        run: shasum -a 256 "$ARCHIVE" > "$ARCHIVE.sha256"
+
+      - name: Compute checksum (Linux)
+        if: runner.os == 'Linux'
+        run: sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-${{ matrix.target }}
+          path: |
+            ${{ env.ARCHIVE }}
+            ${{ env.ARCHIVE }}.sha256
+
+  linux-packages:
+    name: Linux Packages
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Download x86_64 musl artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: artifacts-x86_64-unknown-linux-musl
+          path: artifacts/
+
+      - name: Install packaging tools
+        run: |
+          cargo install cargo-deb --locked
+          cargo install cargo-generate-rpm --locked
+          cargo install cross --locked
+
+      - name: Build x86_64 musl binary
+        run: cross build --release --target x86_64-unknown-linux-musl
+
+      - name: Build .deb package
+        run: cargo deb --no-build --target x86_64-unknown-linux-musl
+
+      - name: Build .rpm package
+        run: cargo generate-rpm --target x86_64-unknown-linux-musl
+
+      - name: Upload .deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-deb
+          path: target/debian/*.deb
+
+      - name: Upload .rpm
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-rpm
+          path: target/generate-rpm/*.rpm
+
+  release:
+    name: GitHub Release
+    runs-on: ubuntu-latest
+    needs: [build, linux-packages]
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          pattern: artifacts-*
+          merge-multiple: true
+
+      - name: Collect release assets
+        run: |
+          mkdir -p release-assets
+          find artifacts/ -type f \( -name "*.tar.gz" -o -name "*.deb" -o -name "*.rpm" \) \
+            -exec cp {} release-assets/ \;
+          cd release-assets && sha256sum * > SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          name: middle-manager ${{ env.RELEASE_TAG }}
+          draft: false
+          generate_release_notes: true
+          files: release-assets/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract checksums for Homebrew
+        id: checksums
+        run: |
+          cd release-assets
+          SHA_ARM64=$(grep 'middle-manager-aarch64-apple-darwin.tar.gz' SHA256SUMS | awk '{print $1}')
+          SHA_X86=$(grep 'middle-manager-x86_64-apple-darwin.tar.gz' SHA256SUMS | awk '{print $1}')
+          echo "sha256_arm64=$SHA_ARM64" >> $GITHUB_OUTPUT
+          echo "sha256_x86=$SHA_X86" >> $GITHUB_OUTPUT
+
+    outputs:
+      sha256_arm64: ${{ steps.checksums.outputs.sha256_arm64 }}
+      sha256_x86: ${{ steps.checksums.outputs.sha256_x86 }}
+
+  update-homebrew-tap:
+    name: Update Homebrew Tap
+    runs-on: ubuntu-latest
+    needs: release
+    steps:
+      - name: Checkout middle-manager (for template)
+        uses: actions/checkout@v4
+        with:
+          path: source
+
+      - name: Checkout homebrew-tap
+        uses: actions/checkout@v4
+        with:
+          repository: questdb/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: homebrew-tap
+
+      - name: Render formula from template
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          sed \
+            -e "s/{{VERSION}}/$VERSION/g" \
+            -e "s/{{SHA256_ARM64_MAC}}/${{ needs.release.outputs.sha256_arm64 }}/g" \
+            -e "s/{{SHA256_X86_MAC}}/${{ needs.release.outputs.sha256_x86 }}/g" \
+            source/dist/homebrew/middle-manager.rb.template \
+            > homebrew-tap/Formula/middle-manager.rb
+
+      - name: Create PR against homebrew-tap
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          cd homebrew-tap
+          BRANCH="release-${RELEASE_TAG}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add Formula/middle-manager.rb
+          git commit -m "Update middle-manager to ${RELEASE_TAG}"
+          git push origin "$BRANCH"
+          gh pr create \
+            --title "Update middle-manager to ${RELEASE_TAG}" \
+            --body "Automated PR from [middle-manager release ${RELEASE_TAG}](https://github.com/questdb/middle-manager/releases/tag/${RELEASE_TAG})." \
+            --base main \
+            --head "$BRANCH"
