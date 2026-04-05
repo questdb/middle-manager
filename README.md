@@ -142,6 +142,12 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 brew install questdb/middle-manager/mm
 ```
 
+### Linux (quick install)
+
+```
+curl -fsSL https://raw.githubusercontent.com/questdb/middle-manager/master/install.sh | sh
+```
+
 ### Download binary
 
 Grab a prebuilt binary from the [latest release](https://github.com/questdb/middle-manager/releases/latest). Available for macOS (ARM, Intel) and Linux (x86_64, aarch64).
