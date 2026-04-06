@@ -74,6 +74,8 @@ pub struct App {
     pub quit_confirm: Option<bool>,
     /// Popup overlay: shown centered, dismissed with any key. (title, message)
     pub popup: Option<(String, String)>,
+    /// Deferred action to execute after the popup is dismissed (e.g. open editor).
+    popup_after: Option<PathBuf>,
     /// Shared git status cache across panels.
     git_cache: GitCache,
     /// Persistent state (search, paths, sort, etc.)
@@ -1205,6 +1207,7 @@ impl App {
             diff_panel_areas: [None, None],
             quit_confirm: None,
             popup: None,
+            popup_after: None,
             goto_path: [None, None],
             fuzzy_search: [None, None],
             help_scroll: None,
@@ -1857,6 +1860,9 @@ impl App {
                     KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         Action::ToggleSsh
                     }
+                    KeyCode::F(2) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        Action::ToggleSsh
+                    }
                     KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
                         Action::BottomResizeUp
                     }
@@ -1895,7 +1901,13 @@ impl App {
                     KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::ExtractCiFailures,
                     KeyCode::Tab => Action::SwitchPanel,
                     KeyCode::BackTab => Action::SwitchPanelReverse,
-                    KeyCode::F(2) => Action::ToggleCi,
+                    KeyCode::F(2) => {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            Action::ToggleSsh
+                        } else {
+                            Action::ToggleCi
+                        }
+                    }
                     KeyCode::F(10) => Action::Quit,
                     _ => Action::None,
                 };
@@ -1946,6 +1958,7 @@ impl App {
                 KeyCode::Down => Action::MoveDown,
                 KeyCode::Left => Action::CursorLeft,
                 KeyCode::Right => Action::CursorRight,
+                KeyCode::Char(' ') => Action::Toggle,
                 KeyCode::Enter => Action::Enter,
                 _ => Action::None,
             };
@@ -1989,22 +2002,17 @@ impl App {
                 };
             }
 
-            let is_ssh_sftp = matches!(
-                dialog.protocol,
-                RemoteProtocol::Ssh | RemoteProtocol::Sftp
-            );
             return match key.code {
                 KeyCode::Esc => Action::DialogCancel,
                 KeyCode::Enter => Action::DialogConfirm,
-                // Left/Right cycle protocol
+                // Alt+Left/Right cycle protocol
                 KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => Action::SwitchPanelReverse,
                 KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => Action::SwitchPanel,
-                // Tab cycles fields in SMB/WebDAV; cycles protocol in SSH/SFTP
-                KeyCode::Tab if is_ssh_sftp => Action::Toggle,
+                // Tab/BackTab cycle fields (host list for SSH/SFTP, form fields for others)
                 KeyCode::Tab => Action::MoveDown,
                 KeyCode::BackTab => Action::MoveUp,
-                KeyCode::Up if is_ssh_sftp => Action::MoveUp,
-                KeyCode::Down if is_ssh_sftp => Action::MoveDown,
+                KeyCode::Up => Action::MoveUp,
+                KeyCode::Down => Action::MoveDown,
                 KeyCode::Backspace => Action::DialogBackspace,
                 KeyCode::F(2) => Action::EditorSave, // Save current fields
                 KeyCode::Char(c) => Action::DialogInput(c),
@@ -2096,7 +2104,13 @@ impl App {
             KeyCode::F(8) => Action::Delete,
             KeyCode::F(9) => Action::CycleSort,
             KeyCode::F(10) => Action::Quit,
-            KeyCode::F(2) => Action::ToggleCi,
+            KeyCode::F(2) => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    Action::ToggleSsh
+                } else {
+                    Action::ToggleCi
+                }
+            }
             KeyCode::F(11) => Action::OpenPr,
             KeyCode::F(12) => Action::ToggleClaude,
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
@@ -2725,15 +2739,24 @@ impl App {
                             ));
                             match crate::ci::write_failures_file(&output_path, &failures, &repo, pr_number) {
                                 Ok(()) => {
-                                    self.status_message = Some(format!(
-                                        "Extracted {} failure(s) → {}",
-                                        failures.len(),
-                                        output_path.display()
-                                    ));
-                                    self.focus = PanelFocus::FilePanel;
-                                    self.mode = AppMode::Editing(Box::new(
-                                        crate::editor::EditorState::open(output_path),
-                                    ));
+                                    // Build a summary for the popup
+                                    let unique: std::collections::HashSet<&str> = failures.iter().map(|f| f.test_name.as_str()).collect();
+                                    let mut by_check: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+                                    for f in &failures {
+                                        *by_check.entry(&f.check_name).or_default() += 1;
+                                    }
+                                    let mut summary = String::new();
+                                    if failures.is_empty() {
+                                        summary.push_str("No test failures found in the logs.\n\nThe failed checks may not contain\nrecognizable test output.");
+                                    } else {
+                                        summary.push_str(&format!("{} unique failure(s) across {} check(s):\n", unique.len(), by_check.len()));
+                                        for (check, count) in &by_check {
+                                            summary.push_str(&format!("\n  {} ({} failure{})", check, count, if *count == 1 { "" } else { "s" }));
+                                        }
+                                        summary.push_str("\n\nPress any key to view full report.");
+                                    }
+                                    self.popup = Some(("CI Failure Extraction".to_string(), summary));
+                                    self.popup_after = Some(output_path);
                                     return;
                                 }
                                 Err(e) => {
@@ -2883,6 +2906,13 @@ impl App {
         // Error popup: any key dismisses it
         if self.popup.is_some() {
             self.popup = None;
+            // Execute deferred action (e.g. open editor after extraction summary)
+            if let Some(path) = self.popup_after.take() {
+                self.focus = PanelFocus::FilePanel;
+                self.mode = AppMode::Editing(Box::new(
+                    crate::editor::EditorState::open(path),
+                ));
+            }
             return;
         }
 
@@ -2932,7 +2962,7 @@ impl App {
                         *sel = (*sel + 1).min(max_setting);
                     }
                 }
-                Action::Enter | Action::DialogConfirm | Action::CursorRight => {
+                Action::Enter | Action::DialogConfirm | Action::CursorRight | Action::Toggle => {
                     // Cycle the selected setting
                     if let Some(0) = self.settings_open {
                         // Theme: cycle to next
@@ -5765,11 +5795,7 @@ impl App {
                 }
             }
             Action::Toggle => {
-                // Tab in SSH/SFTP mode: cycle protocol
-                if let Some(ref mut d) = self.ssh_dialog {
-                    d.protocol = d.protocol.next();
-                    d.field_focus = 0;
-                }
+                // Only used from saved connections mode (Tab to switch to input)
             }
             Action::DialogConfirm | Action::Enter => {
                 let protocol = self.ssh_dialog.as_ref().map(|d| d.protocol);
@@ -6395,6 +6421,26 @@ impl App {
 
         if failed_checks.is_empty() {
             self.status_message = Some("No failed checks to extract".to_string());
+            return;
+        }
+
+        // Check auth requirements before starting
+        let has_github = failed_checks.iter().any(|c| c.details_url.contains("github.com"));
+        let has_azure = failed_checks.iter().any(|c| c.azure_info.is_some());
+        let mut warnings = Vec::new();
+
+        if has_github && !crate::ci::check_gh_auth() {
+            warnings.push("GitHub: `gh auth login` required for log access.");
+        }
+        if has_azure && !crate::ci::has_azure_pat() {
+            warnings.push("Azure DevOps: PAT required. Set AZURE_DEVOPS_PAT\nor store via: secret-tool store --label 'mm azure'\n  service middle-manager account azure-pat");
+        }
+
+        if !warnings.is_empty() {
+            self.popup = Some((
+                "Authentication Required".to_string(),
+                warnings.join("\n\n"),
+            ));
             return;
         }
 

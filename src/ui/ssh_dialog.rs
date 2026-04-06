@@ -172,7 +172,7 @@ fn render_protocol_tabs(
     frame.render_widget(Paragraph::new(Line::from(spans)), rect);
 
     // Hint line
-    let hint = "Alt+Left/Right: switch protocol  F2: save connection";
+    let hint = "Alt+\u{2190}/\u{2192}: protocol  Tab: next field  F2: save";
     dh::render_line(
         frame,
         content,
@@ -350,7 +350,7 @@ fn render_webdav(
 
 fn render_hint(frame: &mut Frame, layout: &dh::DialogLayout, row: u16, normal: Style) {
     let cw = layout.cw;
-    let hint = "Tab: switch field  Enter: connect  F2: save";
+    let hint = "Tab: next field  Enter: connect  F2: save";
     let dim = Style::default()
         .fg(normal.fg.unwrap_or_default())
         .add_modifier(Modifier::DIM);

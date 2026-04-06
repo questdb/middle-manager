@@ -627,6 +627,8 @@ impl CiPanel {
 pub struct TestFailure {
     pub check_name: String,
     pub test_name: String,
+    /// Error message or failure context (if available).
+    pub failure_info: Option<String>,
 }
 
 /// Batch failure extraction state.
@@ -669,6 +671,22 @@ impl FailureExtraction {
         }
         self.rx.try_recv().ok()
     }
+}
+
+/// Check if `gh` CLI is authenticated. Returns true if auth is configured.
+pub fn check_gh_auth() -> bool {
+    Command::new("gh")
+        .args(["auth", "status"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Check if Azure DevOps PAT is available.
+pub fn has_azure_pat() -> bool {
+    get_azure_pat().is_some()
 }
 
 /// Check GitHub API rate limit. Returns (remaining, limit) or None if check fails.
@@ -720,14 +738,6 @@ fn extract_all_failures(
 
         current += 1;
         let check_name = check.display_name();
-        let _ = progress.send(format!("Downloading {}/{}: {}", current, total, check_name));
-
-        // Download the job log
-        let tmp_path = std::env::temp_dir().join(format!(
-            "mm-ci-log-{}-{}.txt",
-            check.job_id,
-            std::process::id()
-        ));
 
         crate::debug_log::log(&format!(
             "Extracting: {} (job_id={}, run_id={}, is_gh={}, has_azure={})",
@@ -736,65 +746,25 @@ fn extract_all_failures(
             check.azure_info.is_some(),
         ));
 
-        // Try Azure test results API first (fast path -- no log download needed)
+        // Azure DevOps: use test results API (structured test names + error messages)
         if let Some(ref azure) = check.azure_info {
             let _ = progress.send(format!("Check {}/{}: {} (querying test results)", current, total, check_name));
             if let Some(failures) = query_azure_test_results(azure, &check_name) {
-                if !failures.is_empty() {
-                    crate::debug_log::log(&format!("Got {} failures from test results API for {}", failures.len(), check_name));
-                    all_failures.extend(failures);
-                    let _ = std::fs::remove_file(&tmp_path);
-                    continue;
-                }
+                crate::debug_log::log(&format!("Got {} failures from Azure test results API for {}", failures.len(), check_name));
+                all_failures.extend(failures);
+            } else {
+                crate::debug_log::log(&format!("Azure test results API returned no results for {}", check_name));
             }
         }
-
-        let download_ok = if check.is_github_actions() {
-            let _ = progress.send(format!("Check {}/{}: {} (GitHub job log)", current, total, check_name));
-            download_github_log(repo, check.job_id, &tmp_path)
-        } else if check.details_url.contains("github.com") && check.run_id > 0 {
-            let _ = progress.send(format!("Check {}/{}: {} (GitHub run logs)", current, total, check_name));
-            download_github_run_logs(repo, check.run_id, &tmp_path)
-        } else if let Some(ref azure) = check.azure_info {
-            let _ = progress.send(format!("Check {}/{}: {} (Azure logs fallback)", current, total, check_name));
-            download_azure_log(azure, &tmp_path, progress, current, total, &check_name)
-        } else {
-            crate::debug_log::log(&format!("Skipping {}: no download method available", check_name));
-            false
-        };
-
-        if !download_ok {
-            crate::debug_log::log(&format!("Download failed for {}", check_name));
-            continue;
-        }
-
-        crate::debug_log::log(&format!("Downloaded log for {}, parsing...", check_name));
-        let _ = progress.send(format!("Parsing {}/{}: {}", current, total, check_name));
-
-        // Parse only the tail of the log (failure summaries are at the end)
-        if let Ok(content) = std::fs::read_to_string(&tmp_path) {
-            let tail_size = 512 * 1024; // 512KB
-            let content = if content.len() > tail_size {
-                // Take from the last tail_size bytes, but start at a valid char + line boundary
-                let start = crate::ui::ceil_char_boundary(&content, content.len() - tail_size);
-                match content[start..].find('\n') {
-                    Some(pos) => &content[start + pos + 1..],
-                    None => &content[start..],
-                }
-            } else {
-                &content
-            };
-            crate::debug_log::log(&format!(
-                "Log: {} bytes (parsing tail), first 200 chars: {:?}",
-                content.len(),
-                &content[..content.len().min(200)]
-            ));
-            let failures = parse_failures(content, &check_name);
-            crate::debug_log::log(&format!("Found {} failures in {}", failures.len(), check_name));
+        // GitHub: use check run annotations API (structured error annotations)
+        else if check.details_url.contains("github.com") && check.job_id > 0 {
+            let _ = progress.send(format!("Check {}/{}: {} (querying annotations)", current, total, check_name));
+            let failures = query_github_annotations(repo, check.job_id, &check_name);
+            crate::debug_log::log(&format!("Got {} failures from GitHub annotations for {}", failures.len(), check_name));
             all_failures.extend(failures);
+        } else {
+            crate::debug_log::log(&format!("Skipping {}: no API method available", check_name));
         }
-
-        let _ = std::fs::remove_file(&tmp_path);
     }
 
     // Report final rate limit status
@@ -809,6 +779,76 @@ fn extract_all_failures(
     }
 
     Ok(all_failures)
+}
+
+/// Query GitHub check run annotations for failure info.
+/// Uses `gh api` to fetch annotations which contain test failure details.
+fn query_github_annotations(repo: &str, job_id: u64, check_name: &str) -> Vec<TestFailure> {
+    let url = format!("repos/{}/check-runs/{}/annotations", repo, job_id);
+    let output = Command::new("gh")
+        .args(["api", &url, "--paginate"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let annotations = match json.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+
+    let mut failures = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for ann in annotations {
+        let level = ann.get("annotation_level").and_then(|v| v.as_str()).unwrap_or("");
+        if level != "failure" && level != "error" {
+            continue;
+        }
+
+        let title = ann.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let message = ann.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let path = ann.get("path").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Build test name from title or path
+        let test_name = if !title.is_empty() {
+            title.to_string()
+        } else if !path.is_empty() {
+            path.to_string()
+        } else {
+            continue;
+        };
+
+        if seen.insert(test_name.clone()) {
+            let failure_info = if !message.is_empty() {
+                // Truncate very long messages
+                let msg = if message.len() > 500 {
+                    format!("{}...", &message[..500])
+                } else {
+                    message.to_string()
+                };
+                Some(msg)
+            } else {
+                None
+            };
+            failures.push(TestFailure {
+                check_name: check_name.to_string(),
+                test_name,
+                failure_info,
+            });
+        }
+    }
+
+    failures
 }
 
 /// Get Azure DevOps PAT from environment or system keyring.
@@ -937,9 +977,13 @@ fn query_azure_test_results(azure: &AzureInfo, check_name: &str) -> Option<Vec<T
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if !test_name.is_empty() && seen.insert(test_name.to_string()) {
+                    let error_msg = result.get("errorMessage")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
                     failures.push(TestFailure {
                         check_name: check_name.to_string(),
                         test_name: test_name.to_string(),
+                        failure_info: error_msg,
                     });
                 }
             }
@@ -947,324 +991,6 @@ fn query_azure_test_results(azure: &AzureInfo, check_name: &str) -> Option<Vec<T
     }
 
     Some(failures)
-}
-
-fn download_github_log(repo: &str, job_id: u64, output_path: &Path) -> bool {
-    let url = format!("repos/{}/actions/jobs/{}/logs", repo, job_id);
-    let out_file = match std::fs::File::create(output_path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    Command::new("gh")
-        .args(["api", &url, "-H", "Accept: application/vnd.github+json"])
-        .stdout(out_file)
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Fallback: download all logs for a GitHub Actions run via `gh run view --log-failed`.
-fn download_github_run_logs(repo: &str, run_id: u64, output_path: &Path) -> bool {
-    crate::debug_log::log(&format!("Fallback: gh run view --log-failed for run {}", run_id));
-    let out_file = match std::fs::File::create(output_path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    // `gh run view <run_id> --log-failed` dumps all failed job logs to stdout
-    Command::new("gh")
-        .args(["run", "view", &run_id.to_string(), "--log-failed", "-R", repo])
-        .stdout(out_file)
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-fn download_azure_log(
-    azure: &AzureInfo,
-    output_path: &Path,
-    progress: &std::sync::mpsc::Sender<String>,
-    check_num: usize,
-    check_total: usize,
-    check_name: &str,
-) -> bool {
-    // 1. Fetch timeline to find failed task log IDs
-    let timeline_url = format!(
-        "https://dev.azure.com/{}/{}/_apis/build/builds/{}/timeline?api-version=7.0",
-        azure.org, azure.project, azure.build_id
-    );
-    crate::debug_log::log(&format!("Azure timeline: {}", timeline_url));
-
-    let auth = azure_auth_args();
-    let mut cmd = Command::new("curl");
-    cmd.args(["-s", "-L", "--compressed"]);
-    for arg in &auth {
-        cmd.arg(arg);
-    }
-    cmd.arg(&timeline_url);
-    let output = cmd
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output();
-
-    let timeline_json = match output {
-        Ok(o) if o.status.success() => {
-            let s = String::from_utf8_lossy(&o.stdout).into_owned();
-            if s.is_empty() {
-                crate::debug_log::log("Azure: timeline response is empty");
-                return false;
-            }
-            s
-        }
-        Ok(o) => {
-            crate::debug_log::log(&format!("Azure: timeline curl failed with status {}", o.status));
-            return false;
-        }
-        Err(e) => {
-            crate::debug_log::log(&format!("Azure: timeline curl error: {}", e));
-            return false;
-        }
-    };
-
-    crate::debug_log::log(&format!(
-        "Azure timeline response: {} bytes, first 300: {:?}",
-        timeline_json.len(),
-        &timeline_json[..timeline_json.len().min(300)]
-    ));
-
-    // 2. Parse timeline to find failed records with log IDs
-    let timeline: serde_json::Value = match serde_json::from_str(&timeline_json) {
-        Ok(v) => v,
-        Err(e) => {
-            crate::debug_log::log(&format!("Azure timeline JSON parse error: {}", e));
-            return false;
-        }
-    };
-
-    let mut log_ids: Vec<u64> = Vec::new();
-    if let Some(records) = timeline.get("records").and_then(|r| r.as_array()) {
-        crate::debug_log::log(&format!("Azure: timeline has {} records", records.len()));
-        for record in records {
-            let name = record.get("name").and_then(|n| n.as_str()).unwrap_or("?");
-            let result = record.get("result").and_then(|r| r.as_str()).unwrap_or("");
-            let rec_type = record.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let _has_log = record.get("log").and_then(|l| l.get("id")).is_some();
-            if result == "failed" || result == "partiallySucceeded" {
-                if let Some(log_id) = record.get("log").and_then(|l| l.get("id")).and_then(|i| i.as_u64()) {
-                    // Only download Task-level logs that contain test output
-                    // Skip Phase/Stage/Job/Checkpoint records and "Upload crash logs" tasks
-                    let is_test_task = rec_type == "Task"
-                        && (name.contains("test") || name.contains("Test")
-                            || name.contains("coverage") || name.contains("Coverage"))
-                        && !name.contains("Upload");
-                    if is_test_task {
-                        crate::debug_log::log(&format!("Azure: will download '{}' log_id={}", name, log_id));
-                        log_ids.push(log_id);
-                    } else {
-                        crate::debug_log::log(&format!("Azure: skipping '{}' type={} (not a test task)", name, rec_type));
-                    }
-                } else {
-                    crate::debug_log::log(&format!("Azure: failed record '{}' type={} but no log ID", name, rec_type));
-                }
-            }
-        }
-    } else {
-        crate::debug_log::log(&format!("Azure: no 'records' key in timeline. Keys: {:?}",
-            timeline.as_object().map(|o| o.keys().collect::<Vec<_>>())));
-    }
-
-    if log_ids.is_empty() {
-        crate::debug_log::log("Azure: no failed records with log IDs found in timeline");
-        return false;
-    }
-
-    crate::debug_log::log(&format!("Azure: found {} failed step logs to download", log_ids.len()));
-
-    // 3. Download the TAIL of each failed step's log (last 512KB).
-    //    Test failure summaries are always near the end.
-    //    Uses HTTP Range header; servers that don't support it return full content.
-    let tail_bytes = 512 * 1024; // 512KB
-    let range_header = format!("Range: bytes=-{}", tail_bytes);
-    let mut combined = String::new();
-    for (i, log_id) in log_ids.iter().enumerate() {
-        let _ = progress.send(format!(
-            "Check {}/{}: {} — fetching log {}/{}",
-            check_num, check_total, check_name, i + 1, log_ids.len()
-        ));
-        crate::debug_log::log(&format!("Azure: downloading log tail {}/{} (id={})", i + 1, log_ids.len(), log_id));
-        let log_url = format!(
-            "https://dev.azure.com/{}/{}/_apis/build/builds/{}/logs/{}?api-version=7.0",
-            azure.org, azure.project, azure.build_id, log_id
-        );
-        // Use --compressed for gzip transfer, -w for stats, auth if available
-        let auth = azure_auth_args();
-        let mut cmd = Command::new("curl");
-        cmd.args(["-s", "-L", "--compressed", "-H", &range_header,
-                   "-w", "\n__CURL_STATS__ %{size_download} %{speed_download} %{time_total}"]);
-        for arg in &auth {
-            cmd.arg(arg);
-        }
-        cmd.arg(&log_url);
-        let output = cmd
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .output();
-        if let Ok(o) = output {
-            if o.status.success() {
-                let full_output = String::from_utf8_lossy(&o.stdout);
-                // Extract curl stats from the end
-                let (text, stats) = if let Some(pos) = full_output.rfind("\n__CURL_STATS__ ") {
-                    (&full_output[..pos], &full_output[pos..])
-                } else {
-                    (full_output.as_ref(), "")
-                };
-                // Parse stats for progress display
-                if !stats.is_empty() {
-                    let parts: Vec<&str> = stats.trim().strip_prefix("__CURL_STATS__ ").unwrap_or("").split_whitespace().collect();
-                    if parts.len() >= 3 {
-                        let size_bytes: f64 = parts[0].parse().unwrap_or(0.0);
-                        let speed: f64 = parts[1].parse().unwrap_or(0.0);
-                        let time: f64 = parts[2].parse().unwrap_or(0.0);
-                        let size_kb = size_bytes / 1024.0;
-                        let speed_kb = speed / 1024.0;
-                        let _ = progress.send(format!(
-                            "Check {}/{}: {} — log {}/{} ({:.0}KB in {:.1}s, {:.0}KB/s)",
-                            check_num, check_total, check_name, i + 1, log_ids.len(),
-                            size_kb, time, speed_kb
-                        ));
-                    }
-                }
-                crate::debug_log::log(&format!("Azure: log {} returned {} bytes", log_id, text.len()));
-                combined.push_str(text);
-                combined.push('\n');
-            }
-        }
-    }
-
-    if combined.is_empty() {
-        return false;
-    }
-
-    std::fs::write(output_path, &combined).is_ok()
-}
-
-/// Parse a CI log for test failure patterns.
-pub fn parse_failures(content: &str, check_name: &str) -> Vec<TestFailure> {
-    let mut failures = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        // Rust: "test path::to::test ... FAILED"
-        if trimmed.starts_with("test ") && trimmed.ends_with("FAILED") {
-            if let Some(name) = trimmed
-                .strip_prefix("test ")
-                .and_then(|rest| rest.strip_suffix(" ... FAILED"))
-            {
-                let name = name.trim();
-                if !name.is_empty() && seen.insert(name.to_string()) {
-                    failures.push(TestFailure {
-                        check_name: check_name.to_string(),
-                        test_name: name.to_string(),
-                    });
-                }
-            }
-        }
-        // Go: "--- FAIL: TestName (0.01s)"
-        else if trimmed.starts_with("--- FAIL:") {
-            let rest = trimmed.strip_prefix("--- FAIL:").unwrap().trim();
-            let name = rest.split_whitespace().next().unwrap_or(rest);
-            if !name.is_empty() && seen.insert(name.to_string()) {
-                failures.push(TestFailure {
-                    check_name: check_name.to_string(),
-                    test_name: name.to_string(),
-                });
-            }
-        }
-        // Python/pytest: "FAILED path/to/test.py::TestClass::test_method"
-        else if trimmed.starts_with("FAILED ") {
-            let name = trimmed.strip_prefix("FAILED ").unwrap().trim();
-            // Strip trailing info like " - AssertionError"
-            let name = name.split(" - ").next().unwrap_or(name).trim();
-            if !name.is_empty() && seen.insert(name.to_string()) {
-                failures.push(TestFailure {
-                    check_name: check_name.to_string(),
-                    test_name: name.to_string(),
-                });
-            }
-        }
-        // Jest/vitest: "FAIL src/path/file.test.ts"
-        else if trimmed.starts_with("FAIL ") && !trimmed.starts_with("FAILED") {
-            let name = trimmed.strip_prefix("FAIL ").unwrap().trim();
-            if !name.is_empty() && seen.insert(name.to_string()) {
-                failures.push(TestFailure {
-                    check_name: check_name.to_string(),
-                    test_name: name.to_string(),
-                });
-            }
-        }
-        // Java/Maven/Gradle: "Tests run: X, Failures: Y" or specific test names
-        // Surefire: "  testMethodName(com.example.TestClass)  Time elapsed: 0.1 s  <<< FAILURE!"
-        else if trimmed.contains("<<< FAILURE!") || trimmed.contains("<<< ERROR!") {
-            // Extract test name: "  testMethod(com.pkg.Class)"
-            let name = trimmed.split("Time elapsed").next().unwrap_or(trimmed).trim();
-            if !name.is_empty() && name.len() < 200 && seen.insert(name.to_string()) {
-                failures.push(TestFailure {
-                    check_name: check_name.to_string(),
-                    test_name: name.to_string(),
-                });
-            }
-        }
-        // Java/JUnit: "  testName  FAILED" (Gradle output)
-        else if trimmed.ends_with(" FAILED") && !trimmed.starts_with("test ") && !trimmed.contains("TASK") {
-            let name = trimmed.strip_suffix(" FAILED").unwrap_or(trimmed).trim();
-            // Looks like a test name if it starts with a letter and has no spaces (or is qualified)
-            if !name.is_empty() && !name.contains(' ') && name.len() < 200 {
-                if seen.insert(name.to_string()) {
-                    failures.push(TestFailure {
-                        check_name: check_name.to_string(),
-                        test_name: name.to_string(),
-                    });
-                }
-            }
-        }
-        // Maven Surefire summary: "Failed tests:"  followed by "  methodName(ClassName)"
-        // We catch the individual lines after "Failed tests:" header
-        else if trimmed.starts_with("Failed tests:") || trimmed.starts_with("Tests in error:") {
-            // The header line itself -- next lines are the actual test names
-            // Just skip the header, the indented lines below are caught by other patterns
-        }
-        // GitHub Actions error annotation: "##[error]..."
-        else if trimmed.starts_with("##[error]") {
-            let msg = trimmed.strip_prefix("##[error]").unwrap().trim();
-            // Only capture if it looks like a test name (contains :: or / or .)
-            if (msg.contains("::") || msg.contains('/') || msg.contains('.')) && msg.len() < 200 {
-                if seen.insert(msg.to_string()) {
-                    failures.push(TestFailure {
-                        check_name: check_name.to_string(),
-                        test_name: msg.to_string(),
-                    });
-                }
-            }
-        }
-        // Azure DevOps: "##[error]  testName(className) <<< FAILURE!"
-        // (caught by the <<< FAILURE! check above, but also match raw ##[error] lines)
-
-        // Indented test name (common in Maven/Gradle failure summaries): "  methodName(com.pkg.Class)"
-        else if trimmed.starts_with("  ") && trimmed.contains('(') && trimmed.contains(')') && trimmed.len() < 200 {
-            let name = trimmed.trim();
-            if !name.starts_with("at ") && !name.starts_with("//") && seen.insert(name.to_string()) {
-                failures.push(TestFailure {
-                    check_name: check_name.to_string(),
-                    test_name: name.to_string(),
-                });
-            }
-        }
-    }
-
-    failures
 }
 
 /// Write consolidated failures to a Markdown file.
@@ -1290,19 +1016,27 @@ pub fn write_failures_file(
         return Ok(());
     }
 
-    // Group by check name
-    let mut by_check: std::collections::BTreeMap<&str, Vec<&str>> = std::collections::BTreeMap::new();
+    // Group by check name, preserving failure info
+    let mut by_check: std::collections::BTreeMap<&str, Vec<&TestFailure>> = std::collections::BTreeMap::new();
     for fail in failures {
         by_check
             .entry(&fail.check_name)
             .or_default()
-            .push(&fail.test_name);
+            .push(fail);
     }
 
     for (check, tests) in &by_check {
         writeln!(f, "## {}", check)?;
         for test in tests {
-            writeln!(f, "- {}", test)?;
+            writeln!(f, "- **{}**", test.test_name)?;
+            if let Some(ref info) = test.failure_info {
+                // Indent failure info as a code block under the test name
+                writeln!(f, "  ```")?;
+                for info_line in info.lines().take(10) {
+                    writeln!(f, "  {}", info_line)?;
+                }
+                writeln!(f, "  ```")?;
+            }
         }
         writeln!(f)?;
     }
@@ -1634,173 +1368,6 @@ fn query_azure_steps(azure: &AzureInfo) -> Result<Vec<CiStep>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    // ---------------------------------------------------------------
-    // parse_failures: Rust test output
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn parse_failures_rust_test_output() {
-        let log = "\
-running 4 tests
-test utils::tests::test_ok ... ok
-test utils::tests::test_add ... FAILED
-test utils::tests::test_sub ... FAILED
-test utils::tests::test_mul ... ok
-
-failures:
-
-failures:
-    utils::tests::test_add
-    utils::tests::test_sub
-
-test result: FAILED. 2 passed; 2 failed; 0 ignored
-";
-        let failures = parse_failures(log, "build");
-        let names: Vec<&str> = failures.iter().map(|f| f.test_name.as_str()).collect();
-        assert!(names.contains(&"utils::tests::test_add"));
-        assert!(names.contains(&"utils::tests::test_sub"));
-        assert_eq!(failures.len(), 2);
-        // All failures should have the check_name set
-        assert!(failures.iter().all(|f| f.check_name == "build"));
-    }
-
-    #[test]
-    fn parse_failures_no_failures() {
-        let log = "\
-running 3 tests
-test a ... ok
-test b ... ok
-test c ... ok
-
-test result: ok. 3 passed; 0 failed; 0 ignored
-";
-        let failures = parse_failures(log, "ci");
-        assert!(failures.is_empty());
-    }
-
-    #[test]
-    fn parse_failures_empty_content() {
-        let failures = parse_failures("", "ci");
-        assert!(failures.is_empty());
-    }
-
-    // ---------------------------------------------------------------
-    // parse_failures: Go test output
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn parse_failures_go_test_output() {
-        let log = "\
---- FAIL: TestSomething (0.01s)
-    expected 1, got 2
---- FAIL: TestOther (0.03s)
-    expected true, got false
-FAIL
-";
-        let failures = parse_failures(log, "go-tests");
-        let names: Vec<&str> = failures.iter().map(|f| f.test_name.as_str()).collect();
-        assert!(names.contains(&"TestSomething"));
-        assert!(names.contains(&"TestOther"));
-        assert_eq!(failures.len(), 2);
-    }
-
-    // ---------------------------------------------------------------
-    // parse_failures: Python/pytest output
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn parse_failures_pytest_output() {
-        let log = "\
-FAILED tests/test_math.py::TestCalc::test_divide - ZeroDivisionError
-FAILED tests/test_math.py::TestCalc::test_neg - AssertionError
-";
-        let failures = parse_failures(log, "pytest");
-        let names: Vec<&str> = failures.iter().map(|f| f.test_name.as_str()).collect();
-        assert!(names.contains(&"tests/test_math.py::TestCalc::test_divide"));
-        assert!(names.contains(&"tests/test_math.py::TestCalc::test_neg"));
-        assert_eq!(failures.len(), 2);
-    }
-
-    // ---------------------------------------------------------------
-    // parse_failures: Jest/vitest output
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn parse_failures_jest_output() {
-        let log = "\
-FAIL src/utils/math.test.ts
-FAIL src/components/Button.test.tsx
-";
-        let failures = parse_failures(log, "jest");
-        let names: Vec<&str> = failures.iter().map(|f| f.test_name.as_str()).collect();
-        assert!(names.contains(&"src/utils/math.test.ts"));
-        assert!(names.contains(&"src/components/Button.test.tsx"));
-        assert_eq!(failures.len(), 2);
-    }
-
-    // ---------------------------------------------------------------
-    // parse_failures: Java/Maven Surefire output
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn parse_failures_java_surefire_output() {
-        let log = "\
-  testAdd(com.example.MathTest)  Time elapsed: 0.01 s  <<< FAILURE!
-  testDiv(com.example.MathTest)  Time elapsed: 0.02 s  <<< ERROR!
-";
-        let failures = parse_failures(log, "maven");
-        assert_eq!(failures.len(), 2);
-        assert!(failures.iter().any(|f| f.test_name.contains("testAdd")));
-        assert!(failures.iter().any(|f| f.test_name.contains("testDiv")));
-    }
-
-    // ---------------------------------------------------------------
-    // parse_failures: GitHub Actions error annotation
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn parse_failures_github_error_annotation() {
-        let log = "\
-##[error]src/lib.rs:42: assertion failed
-##[error]tests/integration.rs:100: expected 5, got 3
-";
-        let failures = parse_failures(log, "actions");
-        // Both lines contain '/' or '.' so they should be captured
-        assert_eq!(failures.len(), 2);
-    }
-
-    // ---------------------------------------------------------------
-    // parse_failures: deduplication
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn parse_failures_deduplicates() {
-        let log = "\
-test my::test ... FAILED
-test my::test ... FAILED
-test my::test ... FAILED
-";
-        let failures = parse_failures(log, "dup");
-        assert_eq!(failures.len(), 1);
-        assert_eq!(failures[0].test_name, "my::test");
-    }
-
-    // ---------------------------------------------------------------
-    // parse_failures: mixed output from multiple frameworks
-    // ---------------------------------------------------------------
-
-    #[test]
-    fn parse_failures_mixed_frameworks() {
-        let log = "\
-test rust::path::test_one ... FAILED
---- FAIL: GoTest (0.01s)
-FAILED tests/test_py.py::test_x - AssertionError
-FAIL src/a.test.ts
-";
-        let failures = parse_failures(log, "mixed");
-        assert_eq!(failures.len(), 4);
-    }
 
     // ---------------------------------------------------------------
     // parse_details_url: GitHub Actions

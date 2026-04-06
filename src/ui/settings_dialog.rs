@@ -47,7 +47,7 @@ pub fn render(frame: &mut Frame, selected: usize) -> Rect {
 
     let label = "  Theme: ";
     let value = theme_name.label();
-    let hint = if is_selected { "  ← → to change" } else { "" };
+    let hint = if is_selected { "  Space/← → to change" } else { "" };
 
     let line = Line::from(vec![
         Span::styled(label, style),
@@ -62,7 +62,7 @@ pub fn render(frame: &mut Frame, selected: usize) -> Rect {
     let hint_rect = Rect::new(inner.x + 1, inner.y + inner.height.saturating_sub(1), inner.width.saturating_sub(2), 1);
     let hint_style = Style::default().fg(t.dialog_text_fg).bg(t.dialog_bg).add_modifier(Modifier::DIM);
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled("Up/Down: select  Left/Right: change  Esc: close", hint_style))),
+        Paragraph::new(Line::from(Span::styled("Up/Down: select  Space/Left/Right: change  Esc: close", hint_style))),
         hint_rect,
     );
 
