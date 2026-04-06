@@ -50,13 +50,13 @@ depends = "$auto"
 section = "utils"
 priority = "optional"
 assets = [
-  ["target/release/middle-manager", "usr/bin/", "755"],
+  ["target/release/middle-manager", "usr/bin/mm", "755"],
   ["README.md", "usr/share/doc/middle-manager/README", "644"],
 ]
 
 [package.metadata.generate-rpm]
 assets = [
-  { source = "target/release/middle-manager", dest = "/usr/bin/middle-manager", mode = "755" },
+  { source = "target/release/middle-manager", dest = "/usr/bin/mm", mode = "755" },
   { source = "README.md", dest = "/usr/share/doc/middle-manager/README", mode = "644" },
   { source = "LICENSE", dest = "/usr/share/licenses/middle-manager/LICENSE", mode = "644" },
 ]

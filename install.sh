@@ -36,14 +36,14 @@ main() {
   tar -xzf "${tmpdir}/${archive}" -C "$tmpdir"
 
   if [ -w "$INSTALL_DIR" ]; then
-    mv "${tmpdir}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
+    mv "${tmpdir}/${BINARY}" "${INSTALL_DIR}/mm"
   else
     echo "Installing to ${INSTALL_DIR} (requires sudo)..."
-    sudo mv "${tmpdir}/${BINARY}" "${INSTALL_DIR}/${BINARY}"
+    sudo mv "${tmpdir}/${BINARY}" "${INSTALL_DIR}/mm"
   fi
-  chmod +x "${INSTALL_DIR}/${BINARY}"
+  chmod +x "${INSTALL_DIR}/mm"
 
-  echo "Installed ${BINARY} ${tag} to ${INSTALL_DIR}/${BINARY}"
+  echo "Installed mm ${tag} to ${INSTALL_DIR}/mm"
 }
 
 main
