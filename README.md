@@ -145,7 +145,7 @@ brew install questdb/middle-manager/mm
 ### Linux (quick install)
 
 ```
-curl -fsSL https://raw.githubusercontent.com/questdb/middle-manager/master/install.sh | sh
+curl -fsSL https://mm.questdb.io | sh
 ```
 
 ### Download binary
