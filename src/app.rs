@@ -59,7 +59,7 @@ pub struct App {
     pub panel_areas: [Rect; 2],
     pub ci_panel_areas: [Option<Rect>; 2],
     pub shell_panel_areas: [Option<Rect>; 2],
-    last_click: Option<(Instant, u16, u16)>,
+    last_click: Option<(Instant, u16, u16, u8)>,
     /// Go-to-line prompt state. When Some, an input overlay is shown.
     pub goto_line_input: Option<String>,
     /// Set to true when the UI needs a full terminal clear (e.g. leaving full-screen mode).
@@ -68,6 +68,8 @@ pub struct App {
     pub search_dialog: Option<SearchDialogState>,
     /// Unsaved changes confirmation dialog overlay.
     pub unsaved_dialog: Option<UnsavedDialogField>,
+    /// Search wrap-around confirmation dialog.
+    pub search_wrap_dialog: Option<SearchWrapDialog>,
     /// Quit confirmation dialog: true = Quit focused, false = Cancel focused.
     pub quit_confirm: Option<bool>,
     /// Shared git status cache across panels.
@@ -86,8 +88,8 @@ pub struct App {
     pub goto_path: [Option<GotoPathState>; 2],
     /// Fuzzy file search per panel side.
     pub fuzzy_search: [Option<FuzzySearchState>; 2],
-    /// Help dialog scroll offset.
-    pub help_scroll: Option<usize>,
+    /// Help dialog state (scroll + optional search filter).
+    pub help_state: Option<HelpState>,
     /// Shell panels (one per file panel side, like CI panels).
     pub shell_panels: [Option<TerminalPanel>; 2],
     /// Claude Code panels (one per file panel side, like shell panels).
@@ -104,6 +106,8 @@ pub struct App {
     pub file_search_side: usize,
     /// File content search dialog.
     pub file_search_dialog: Option<FileSearchDialogState>,
+    /// Overwrite confirmation dialog for Ask-mode copy/move.
+    pub overwrite_ask: Option<OverwriteAskState>,
     /// Wakeup sender for the event loop (given to terminal reader threads).
     wakeup_sender: Option<crate::event::WakeupSender>,
     /// Previous frame's cursor position (to detect changes and avoid blink reset).
@@ -123,6 +127,49 @@ pub struct StashedDiff {
     pub file_path: String,
     pub base_branch: String,
     pub cursor: usize,
+}
+
+pub struct HelpState {
+    pub scroll: usize,
+    pub filter: String,
+}
+
+/// Overwrite confirmation dialog shown during Ask-mode copy/move.
+pub struct OverwriteAskState {
+    pub focused: OverwriteAskChoice,
+    /// The copy item that triggered the conflict.
+    pub conflict_item: fs_ops::CopyItem,
+    /// Remaining items to process after this one.
+    pub remaining_items: Vec<fs_ops::CopyItem>,
+    pub is_move: bool,
+    pub copy_opts: fs_ops::CopyOptions,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum OverwriteAskChoice {
+    Overwrite,
+    Skip,
+    SkipAll,
+    Cancel,
+}
+
+impl OverwriteAskChoice {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Overwrite => Self::Skip,
+            Self::Skip => Self::SkipAll,
+            Self::SkipAll => Self::Cancel,
+            Self::Cancel => Self::Overwrite,
+        }
+    }
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Overwrite => Self::Cancel,
+            Self::Skip => Self::Overwrite,
+            Self::SkipAll => Self::Skip,
+            Self::Cancel => Self::SkipAll,
+        }
+    }
 }
 
 pub struct GotoPathState {
@@ -485,6 +532,16 @@ impl SearchDialogField {
     }
 }
 
+// --- Search wrap confirmation dialog ---
+
+/// Shown when search reaches end/beginning without finding a match,
+/// offering to wrap around to the other end.
+pub struct SearchWrapDialog {
+    pub params: crate::editor::SearchParams,
+    /// true = "Wrap" focused (default), false = "Stop" focused
+    pub wrap_focused: bool,
+}
+
 // --- Unsaved changes dialog ---
 
 #[derive(Clone, Copy, PartialEq)]
@@ -548,7 +605,7 @@ impl CopyDialogState {
             copy_access_mode: true,
             copy_extended_attrs: false,
             disable_write_cache: false,
-            produce_sparse: false,
+            produce_sparse: true,
             use_cow: false,
             symlink_mode: SymlinkMode::Smart,
             use_filter: false,
@@ -911,6 +968,7 @@ impl App {
             needs_clear: false,
             search_dialog: None,
             unsaved_dialog: None,
+            search_wrap_dialog: None,
             git_cache,
             persisted,
             dir_watcher,
@@ -920,7 +978,7 @@ impl App {
             quit_confirm: None,
             goto_path: [None, None],
             fuzzy_search: [None, None],
-            help_scroll: None,
+            help_state: None,
             shell_panels: [None, None],
             claude_panels: [None, None],
             claude_panel_areas: [None, None],
@@ -929,6 +987,7 @@ impl App {
             file_search: None,
             file_search_side: 1,
             file_search_dialog: None,
+            overwrite_ask: None,
             wakeup_sender: None,
             last_cursor_pos: None,
             dirty: true,
@@ -1139,18 +1198,33 @@ impl App {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let now = Instant::now();
-                if let Some((prev_time, prev_col, prev_row)) = self.last_click {
+                let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+
+                // Multi-click detection: double and triple click
+                if let Some((prev_time, prev_col, prev_row, click_count)) = self.last_click {
                     if now.duration_since(prev_time).as_millis() < DOUBLE_CLICK_MS
                         && col == prev_col
                         && row == prev_row
                     {
-                        self.last_click = None;
+                        if click_count >= 2 {
+                            // Third click → triple
+                            self.last_click = None;
+                            return Action::MouseTripleClick(col, row);
+                        }
+                        // Second click → double
+                        self.last_click = Some((now, col, row, 2));
                         return Action::MouseDoubleClick(col, row);
                     }
                 }
-                self.last_click = Some((now, col, row));
-                Action::MouseClick(col, row)
+
+                self.last_click = Some((now, col, row, 1));
+                if shift {
+                    Action::MouseShiftClick(col, row)
+                } else {
+                    Action::MouseClick(col, row)
+                }
             }
+            MouseEventKind::Drag(MouseButton::Left) => Action::MouseDrag(col, row),
             MouseEventKind::ScrollUp => Action::MouseScrollUp(col, row),
             MouseEventKind::ScrollDown => Action::MouseScrollDown(col, row),
             _ => Action::None,
@@ -1159,15 +1233,17 @@ impl App {
 
     pub fn map_key_to_action(&self, key: KeyEvent) -> Action {
         // Help dialog intercepts keys
-        if self.help_scroll.is_some() {
+        if self.help_state.is_some() {
             return match key.code {
-                KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q') => Action::DialogCancel,
+                KeyCode::Esc | KeyCode::F(1) => Action::DialogCancel,
                 KeyCode::Up => Action::MoveUp,
                 KeyCode::Down => Action::MoveDown,
                 KeyCode::PageUp => Action::PageUp,
                 KeyCode::PageDown => Action::PageDown,
                 KeyCode::Home => Action::MoveToTop,
                 KeyCode::End => Action::MoveToBottom,
+                KeyCode::Backspace => Action::DialogBackspace,
+                KeyCode::Char(c) => Action::DialogInput(c),
                 _ => Action::None,
             };
         }
@@ -1375,6 +1451,17 @@ impl App {
             };
         }
 
+        // Overwrite-ask dialog intercepts keys when active
+        if self.overwrite_ask.is_some() {
+            return match key.code {
+                KeyCode::Esc => Action::DialogCancel,
+                KeyCode::Enter => Action::DialogConfirm,
+                KeyCode::Tab | KeyCode::Right | KeyCode::Down => Action::MoveDown,
+                KeyCode::BackTab | KeyCode::Left | KeyCode::Up => Action::MoveUp,
+                _ => Action::None,
+            };
+        }
+
         // Bottom panel focus intercepts only in normal/quick-search modes
         // (full-screen modes like DiffViewing/Editing map their own keys via AppMode match below)
         if matches!(self.mode, AppMode::Normal | AppMode::QuickSearch) {
@@ -1495,6 +1582,18 @@ impl App {
                     _ => Action::None,
                 };
             }
+        }
+
+        // Search wrap dialog intercepts keys when active
+        if self.search_wrap_dialog.is_some() {
+            return match key.code {
+                KeyCode::Enter => Action::DialogConfirm,
+                KeyCode::Esc => Action::DialogCancel,
+                KeyCode::Tab | KeyCode::Left | KeyCode::Right | KeyCode::BackTab => {
+                    Action::SwitchPanel
+                }
+                _ => Action::None,
+            };
         }
 
         // Search dialog intercepts keys when active
@@ -2183,6 +2282,7 @@ impl App {
                     if self.focus == PanelFocus::Claude(side) {
                         self.focus = PanelFocus::FilePanel;
                     }
+                    self.dirty = true;
                 }
             }
         }
@@ -2195,6 +2295,7 @@ impl App {
                     if self.focus == PanelFocus::Shell(side) {
                         self.focus = PanelFocus::FilePanel;
                     }
+                    self.dirty = true;
                 }
             }
         }
@@ -2255,31 +2356,51 @@ impl App {
         }
 
         // Help dialog intercepts when active
-        if self.help_scroll.is_some() {
+        if self.help_state.is_some() {
             match action {
-                Action::DialogCancel => self.help_scroll = None,
+                Action::DialogCancel => self.help_state = None,
                 Action::MoveUp => {
-                    if let Some(ref mut s) = self.help_scroll {
-                        *s = s.saturating_sub(1);
+                    if let Some(ref mut h) = self.help_state {
+                        h.scroll = h.scroll.saturating_sub(1);
                     }
                 }
                 Action::MoveDown => {
-                    if let Some(ref mut s) = self.help_scroll {
-                        *s += 1;
+                    if let Some(ref mut h) = self.help_state {
+                        h.scroll += 1;
                     }
                 }
                 Action::PageUp => {
-                    if let Some(ref mut s) = self.help_scroll {
-                        *s = s.saturating_sub(20);
+                    if let Some(ref mut h) = self.help_state {
+                        h.scroll = h.scroll.saturating_sub(20);
                     }
                 }
                 Action::PageDown => {
-                    if let Some(ref mut s) = self.help_scroll {
-                        *s += 20;
+                    if let Some(ref mut h) = self.help_state {
+                        h.scroll += 20;
                     }
                 }
-                Action::MoveToTop => self.help_scroll = Some(0),
-                Action::MoveToBottom => self.help_scroll = Some(usize::MAX),
+                Action::MoveToTop => {
+                    if let Some(ref mut h) = self.help_state {
+                        h.scroll = 0;
+                    }
+                }
+                Action::MoveToBottom => {
+                    if let Some(ref mut h) = self.help_state {
+                        h.scroll = usize::MAX;
+                    }
+                }
+                Action::DialogInput(c) => {
+                    if let Some(ref mut h) = self.help_state {
+                        h.filter.push(c);
+                        h.scroll = 0;
+                    }
+                }
+                Action::DialogBackspace => {
+                    if let Some(ref mut h) = self.help_state {
+                        h.filter.pop();
+                        h.scroll = 0;
+                    }
+                }
                 _ => {}
             }
             return;
@@ -2379,6 +2500,76 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        // Overwrite-ask dialog intercepts when active
+        if self.overwrite_ask.is_some() {
+            match action {
+                Action::DialogConfirm => {
+                    let state = self.overwrite_ask.take().unwrap();
+                    let mut overwrite_opts = state.copy_opts.clone();
+                    overwrite_opts.conflict = fs_ops::ConflictPolicy::Overwrite;
+                    match state.focused {
+                        OverwriteAskChoice::Overwrite => {
+                            if let Err(e) =
+                                fs_ops::exec_copy_item(&state.conflict_item, &overwrite_opts)
+                            {
+                                self.status_message = Some(format!("Error: {}", e));
+                                self.reload_panels();
+                            } else {
+                                self.continue_copy_ask(
+                                    state.remaining_items,
+                                    state.is_move,
+                                    state.copy_opts,
+                                );
+                            }
+                        }
+                        OverwriteAskChoice::Skip => {
+                            self.continue_copy_ask(
+                                state.remaining_items,
+                                state.is_move,
+                                state.copy_opts,
+                            );
+                        }
+                        OverwriteAskChoice::SkipAll => {
+                            let mut skip_opts = state.copy_opts.clone();
+                            skip_opts.conflict = fs_ops::ConflictPolicy::Skip;
+                            for item in &state.remaining_items {
+                                if let Err(e) = fs_ops::exec_copy_item(item, &skip_opts) {
+                                    self.status_message = Some(format!("Error: {}", e));
+                                    break;
+                                }
+                            }
+                            self.reload_panels();
+                        }
+                        OverwriteAskChoice::Cancel => {
+                            self.reload_panels();
+                        }
+                    }
+                }
+                Action::DialogCancel => {
+                    self.overwrite_ask = None;
+                    self.reload_panels();
+                }
+                Action::MoveDown => {
+                    if let Some(ref mut s) = self.overwrite_ask {
+                        s.focused = s.focused.next();
+                    }
+                }
+                Action::MoveUp => {
+                    if let Some(ref mut s) = self.overwrite_ask {
+                        s.focused = s.focused.prev();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Search wrap confirmation dialog intercepts when active
+        if self.search_wrap_dialog.is_some() {
+            self.handle_search_wrap_dialog_action(action);
             return;
         }
 
@@ -2738,14 +2929,14 @@ impl App {
             Action::CopyName => {
                 if let Some(entry) = self.active_panel().selected_entry() {
                     let name = entry.name.clone();
-                    crate::editor::osc52_copy(&name);
+                    crate::clipboard::copy(&name);
                     self.status_message = Some(format!("Copied: {}", name));
                 }
             }
             Action::CopyPath => {
                 if let Some(entry) = self.active_panel().selected_entry() {
                     let path = entry.path.display().to_string();
-                    crate::editor::osc52_copy(&path);
+                    crate::clipboard::copy(&path);
                     self.status_message = Some(format!("Copied: {}", path));
                 }
             }
@@ -2769,7 +2960,10 @@ impl App {
 
             // Help
             Action::ShowHelp => {
-                self.help_scroll = Some(0);
+                self.help_state = Some(HelpState {
+                    scroll: 0,
+                    filter: String::new(),
+                });
             }
 
             // File content search dialog
@@ -2904,7 +3098,10 @@ impl App {
 
             // Mouse
             Action::MouseClick(col, row) => self.handle_mouse_click(col, row),
+            Action::MouseShiftClick(col, row) => self.handle_mouse_click(col, row),
             Action::MouseDoubleClick(col, row) => self.handle_mouse_double_click(col, row),
+            Action::MouseTripleClick(col, row) => self.handle_mouse_click(col, row),
+            Action::MouseDrag(_, _) => {}
             Action::MouseScrollUp(col, row) => self.handle_mouse_scroll(col, row, -3),
             Action::MouseScrollDown(col, row) => self.handle_mouse_scroll(col, row, 3),
 
@@ -3957,14 +4154,15 @@ impl App {
                 });
             }
             Action::FindNext => {
-                if let AppMode::Editing(ref mut e) = self.mode {
-                    if let Some(params) = e.last_search.clone() {
-                        if !e.find(&params) {
-                            e.status_msg = Some(format!("'{}' not found", params.query));
-                        }
-                    } else {
-                        e.status_msg = Some("No previous search".to_string());
-                    }
+                let params = if let AppMode::Editing(ref e) = self.mode {
+                    e.last_search.clone()
+                } else {
+                    None
+                };
+                if let Some(params) = params {
+                    self.do_find(params);
+                } else if let AppMode::Editing(ref mut e) = self.mode {
+                    e.status_msg = Some("No previous search".to_string());
                 }
             }
 
@@ -3972,6 +4170,26 @@ impl App {
             Action::MouseClick(col, row) => {
                 if let AppMode::Editing(ref mut e) = self.mode {
                     e.click_at(col, row);
+                }
+            }
+            Action::MouseShiftClick(col, row) => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.shift_click_at(col, row);
+                }
+            }
+            Action::MouseDoubleClick(col, row) => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.double_click_at(col, row);
+                }
+            }
+            Action::MouseTripleClick(col, row) => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.triple_click_at(col, row);
+                }
+            }
+            Action::MouseDrag(col, row) => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.drag_to(col, row);
                 }
             }
             Action::MouseScrollUp(_, _) => {
@@ -4250,11 +4468,52 @@ impl App {
             matches!(params.direction, SearchDirection::Forward);
         self.persisted.search_case_sensitive = params.case_sensitive;
 
+        self.do_find(params);
+    }
+
+    /// Run a non-wrapping search. If not found, show the wrap confirmation dialog.
+    fn do_find(&mut self, params: crate::editor::SearchParams) {
         if let AppMode::Editing(ref mut e) = self.mode {
             e.last_search = Some(params.clone());
             if !e.find(&params) {
-                e.status_msg = Some(format!("'{}' not found", params.query));
+                // Not found in current direction — offer to wrap
+                self.search_wrap_dialog = Some(SearchWrapDialog {
+                    params,
+                    wrap_focused: false,
+                });
             }
+        }
+    }
+
+    fn handle_search_wrap_dialog_action(&mut self, action: Action) {
+        match action {
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
+            Action::Quit => self.should_quit = true,
+            Action::DialogCancel | Action::QuickSearchClear => {
+                self.search_wrap_dialog = None;
+            }
+            Action::DialogConfirm => {
+                if let Some(dlg) = self.search_wrap_dialog.take() {
+                    if dlg.wrap_focused {
+                        // User chose to wrap around
+                        if let AppMode::Editing(ref mut e) = self.mode {
+                            if !e.find_wrapped(&dlg.params) {
+                                e.status_msg = Some(format!("'{}' not found", dlg.params.query));
+                            }
+                        }
+                    }
+                    // else: Stop was focused (default), just dismiss
+                }
+            }
+            Action::SwitchPanel
+            | Action::SwitchPanelReverse
+            | Action::CursorLeft
+            | Action::CursorRight => {
+                if let Some(ref mut dlg) = self.search_wrap_dialog {
+                    dlg.wrap_focused = !dlg.wrap_focused;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -4888,7 +5147,7 @@ impl App {
         };
 
         let mut first_err: Option<anyhow::Error> = None;
-        for name in names {
+        for name in &names {
             if let Err(e) = fs_ops::create_directory(&dir, name) {
                 first_err = Some(e);
                 break;
@@ -4902,6 +5161,13 @@ impl App {
 
         self.mode = AppMode::Normal;
         self.reload_panels();
+
+        // Position cursor on the first created directory
+        if let Some(name) = names.first() {
+            // For nested paths like "a/b/c", select the top-level component
+            let top = name.split('/').next().unwrap_or(name);
+            self.active_panel_mut().select_by_name(top);
+        }
     }
 
     // --- Copy dialog handler ---
@@ -4969,8 +5235,35 @@ impl App {
         }
     }
 
+    fn build_copy_options(state: &CopyDialogState) -> (fs_ops::CopyOptions, bool) {
+        let is_ask = state.overwrite_mode == OverwriteMode::Ask;
+        let conflict = match state.overwrite_mode {
+            OverwriteMode::Ask | OverwriteMode::Overwrite => fs_ops::ConflictPolicy::Overwrite,
+            OverwriteMode::Skip => fs_ops::ConflictPolicy::Skip,
+            OverwriteMode::Rename => fs_ops::ConflictPolicy::Rename,
+            OverwriteMode::Append => fs_ops::ConflictPolicy::Append,
+        };
+        let symlink_mode = match state.symlink_mode {
+            SymlinkMode::Smart => fs_ops::SymlinkCopyMode::Smart,
+            SymlinkMode::CopyContents => fs_ops::SymlinkCopyMode::Follow,
+            SymlinkMode::CopyAsLink => fs_ops::SymlinkCopyMode::Preserve,
+        };
+        (
+            fs_ops::CopyOptions {
+                sparse: state.produce_sparse,
+                conflict,
+                copy_permissions: state.copy_access_mode,
+                copy_xattrs: state.copy_extended_attrs,
+                disable_write_cache: state.disable_write_cache,
+                use_cow: state.use_cow,
+                symlink_mode,
+            },
+            is_ask,
+        )
+    }
+
     fn confirm_copy_dialog(&mut self) {
-        let (source_paths, dest, is_move) = {
+        let (source_paths, dests, is_move, opts, is_ask) = {
             let state = match &self.mode {
                 AppMode::CopyDialog(s) => s,
                 _ => return,
@@ -4979,32 +5272,93 @@ impl App {
                 self.mode = AppMode::Normal;
                 return;
             }
+            let (opts, is_ask) = Self::build_copy_options(state);
+            let dests: Vec<PathBuf> = if state.process_multiple {
+                state
+                    .destination
+                    .text
+                    .split(';')
+                    .map(|s| PathBuf::from(s.trim()))
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .collect()
+            } else {
+                vec![PathBuf::from(state.destination.text.trim())]
+            };
             (
                 state.source_paths.clone(),
-                PathBuf::from(&state.destination.text),
+                dests,
                 state.is_move,
+                opts,
+                is_ask,
             )
         };
 
-        let mut first_err: Option<anyhow::Error> = None;
-        for source_path in &source_paths {
-            let result = if is_move {
-                fs_ops::move_entry(source_path, &dest)
-            } else {
-                fs_ops::copy_entry(source_path, &dest)
-            };
-            if let Err(e) = result {
-                first_err = Some(e);
-                break;
+        self.mode = AppMode::Normal;
+
+        if is_ask {
+            // Flatten all sources × destinations into one item list
+            let mut items = Vec::new();
+            for dest in &dests {
+                for source in &source_paths {
+                    match fs_ops::plan_copy(source, dest, opts.symlink_mode) {
+                        Ok(plan) => items.extend(plan),
+                        Err(e) => {
+                            self.status_message = Some(format!("Error: {}", e));
+                            self.reload_panels();
+                            return;
+                        }
+                    }
+                }
+            }
+            self.continue_copy_ask(items, is_move, opts);
+        } else {
+            for dest in &dests {
+                for source_path in &source_paths {
+                    let result = if is_move {
+                        fs_ops::move_entry(source_path, dest, &opts)
+                    } else {
+                        fs_ops::copy_entry(source_path, dest, &opts)
+                    };
+                    if let Err(e) = result {
+                        self.status_message = Some(format!("Error: {}", e));
+                        self.reload_panels();
+                        return;
+                    }
+                }
+            }
+            self.reload_panels();
+        }
+    }
+
+    /// Process a flat list of copy items in Ask mode. For each file item,
+    /// check if dest exists; if so, show the overwrite dialog and pause.
+    fn continue_copy_ask(
+        &mut self,
+        items: Vec<fs_ops::CopyItem>,
+        is_move: bool,
+        opts: fs_ops::CopyOptions,
+    ) {
+        let mut exec_opts = opts.clone();
+        exec_opts.conflict = fs_ops::ConflictPolicy::Overwrite;
+
+        for (i, item) in items.iter().enumerate() {
+            // Only ask about file conflicts, not directories or symlinks
+            if !item.is_dir && !item.is_symlink && item.dst.exists() {
+                self.overwrite_ask = Some(OverwriteAskState {
+                    focused: OverwriteAskChoice::Overwrite,
+                    conflict_item: item.clone(),
+                    remaining_items: items[i + 1..].to_vec(),
+                    is_move,
+                    copy_opts: opts,
+                });
+                return;
+            }
+
+            if let Err(e) = fs_ops::exec_copy_item(item, &exec_opts) {
+                self.status_message = Some(format!("Error: {}", e));
+                return;
             }
         }
-
-        match first_err {
-            None => self.status_message = None,
-            Some(e) => self.status_message = Some(format!("Error: {}", e)),
-        }
-
-        self.mode = AppMode::Normal;
         self.reload_panels();
     }
 

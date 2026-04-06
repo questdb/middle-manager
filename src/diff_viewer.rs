@@ -3,7 +3,6 @@ use std::process::{Command, Stdio};
 
 use ratatui::style::Color;
 
-use crate::editor::osc52_copy;
 use crate::syntax::SyntaxHighlighter;
 use crate::theme::theme;
 
@@ -333,7 +332,7 @@ impl DiffViewerState {
 
     pub fn copy_to_clipboard(&self) {
         if let Some(text) = self.selected_text() {
-            osc52_copy(&text);
+            crate::clipboard::copy(&text);
         }
     }
 

@@ -1,6 +1,7 @@
 mod action;
 mod app;
 mod ci;
+mod clipboard;
 mod diff_viewer;
 mod editor;
 mod event;

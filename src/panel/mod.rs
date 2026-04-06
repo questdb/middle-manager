@@ -141,6 +141,13 @@ impl Panel {
             .and_then(|i| self.entries.get(i))
     }
 
+    /// Move cursor to the entry with the given name, if found.
+    pub fn select_by_name(&mut self, name: &str) {
+        if let Some(idx) = self.entries.iter().position(|e| e.name == name) {
+            self.table_state.select(Some(idx));
+        }
+    }
+
     pub fn selected_index(&self) -> usize {
         self.table_state.selected().unwrap_or(0)
     }
@@ -273,5 +280,88 @@ impl Panel {
         } else {
             Vec::new()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    /// Helper: create a Panel rooted at `dir` with a few files.
+    fn panel_with_files(names: &[&str]) -> (tempfile::TempDir, Panel) {
+        let dir = tempdir().expect("failed to create temp dir");
+        for name in names {
+            fs::write(dir.path().join(name), "").expect("failed to create file");
+        }
+        let panel = Panel::new(dir.path().to_path_buf());
+        (dir, panel)
+    }
+
+    #[test]
+    fn select_by_name_finds_existing_entry() {
+        let (_dir, mut panel) = panel_with_files(&["alpha.txt", "beta.txt", "gamma.txt"]);
+
+        // Sanity: panel starts with selection at 0
+        assert_eq!(panel.table_state.selected(), Some(0));
+
+        // Select a file that definitely exists
+        panel.select_by_name("beta.txt");
+
+        let selected = panel
+            .selected_entry()
+            .expect("should have a selected entry");
+        assert_eq!(selected.name, "beta.txt");
+
+        // The underlying index must match the position in entries
+        let expected_idx = panel
+            .entries
+            .iter()
+            .position(|e| e.name == "beta.txt")
+            .unwrap();
+        assert_eq!(panel.table_state.selected(), Some(expected_idx));
+    }
+
+    #[test]
+    fn select_by_name_nonexistent_leaves_selection_unchanged() {
+        let (_dir, mut panel) = panel_with_files(&["alpha.txt", "beta.txt"]);
+
+        // Move to a known position first
+        panel.select_by_name("beta.txt");
+        let before = panel.table_state.selected();
+
+        // Try selecting something that does not exist
+        panel.select_by_name("does_not_exist.txt");
+
+        assert_eq!(
+            panel.table_state.selected(),
+            before,
+            "selection should not change when name is not found"
+        );
+    }
+
+    #[test]
+    fn select_by_name_selects_parent_entry() {
+        let (_dir, mut panel) = panel_with_files(&["file.txt"]);
+
+        // The temp dir has a parent, so ".." should be present
+        assert!(
+            panel.entries.iter().any(|e| e.name == ".."),
+            "panel should contain a '..' parent entry"
+        );
+
+        // Move away from ".." first
+        panel.select_by_name("file.txt");
+        assert_eq!(panel.selected_entry().unwrap().name, "file.txt");
+
+        // Now select the parent entry
+        panel.select_by_name("..");
+
+        let selected = panel
+            .selected_entry()
+            .expect("should have a selected entry");
+        assert_eq!(selected.name, "..");
+        assert!(selected.is_dir);
     }
 }
