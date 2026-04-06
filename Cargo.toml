@@ -38,6 +38,8 @@ flate2 = "1"
 xz2 = "0.1"
 zstd = "0.13"
 zip = "2"
+libc = "0.2"
+xattr = "1"
 
 [package.metadata.deb]
 maintainer = "QuestDB <hello@questdb.io>"

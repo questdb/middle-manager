@@ -141,6 +141,13 @@ impl Panel {
             .and_then(|i| self.entries.get(i))
     }
 
+    /// Move cursor to the entry with the given name, if found.
+    pub fn select_by_name(&mut self, name: &str) {
+        if let Some(idx) = self.entries.iter().position(|e| e.name == name) {
+            self.table_state.select(Some(idx));
+        }
+    }
+
     pub fn selected_index(&self) -> usize {
         self.table_state.selected().unwrap_or(0)
     }

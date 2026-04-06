@@ -895,35 +895,123 @@ impl EditorState {
         self.cursor_col = self.desired_col.min(len);
     }
 
-    /// Convert a screen click (col, row) to an editor (line, col) and move cursor there.
-    pub fn click_at(&mut self, screen_col: u16, screen_row: u16) {
+    /// Convert screen coordinates to editor (line, col). Returns None if outside text area.
+    fn screen_to_editor(&mut self, screen_col: u16, screen_row: u16) -> Option<(usize, usize)> {
         let text_x = self.viewport_x as usize + self.line_num_width;
         if (screen_col as usize) < text_x {
-            return; // clicked on line number gutter
+            return None;
         }
         if screen_row < self.viewport_y {
-            return;
+            return None;
         }
-
         let row_offset = (screen_row - self.viewport_y) as usize;
         let target_line = self.scroll_y + row_offset;
         if target_line >= self.total_virtual_lines() {
-            return;
+            return None;
         }
-
         let display_col = (screen_col as usize) - text_x;
-
-        // Convert display column to original char column (reverse of orig_col_to_display_col)
         let orig_col = if let Some(text) = self.get_line_text(target_line) {
             display_col_to_orig_col(&text, display_col, self.scroll_x)
         } else {
             0
         };
+        Some((target_line, orig_col))
+    }
 
-        self.clear_selection();
-        self.cursor_line = target_line;
-        self.cursor_col = orig_col;
-        self.desired_col = orig_col;
+    /// Single click: position cursor, clear selection.
+    pub fn click_at(&mut self, screen_col: u16, screen_row: u16) {
+        if let Some((line, col)) = self.screen_to_editor(screen_col, screen_row) {
+            self.clear_selection();
+            self.cursor_line = line;
+            self.cursor_col = col;
+            self.desired_col = col;
+        }
+    }
+
+    /// Double-click: select the word under the cursor.
+    pub fn double_click_at(&mut self, screen_col: u16, screen_row: u16) {
+        let (line, col) = match self.screen_to_editor(screen_col, screen_row) {
+            Some(pos) => pos,
+            None => return,
+        };
+        let text = match self.get_line_text(line) {
+            Some(t) => t,
+            None => return,
+        };
+        let chars: Vec<char> = text.chars().collect();
+        if col >= chars.len() {
+            return;
+        }
+
+        // Determine word boundaries based on character class at click position
+        let at_click = chars[col];
+        let same_class = |c: char| {
+            if at_click.is_alphanumeric() || at_click == '_' {
+                c.is_alphanumeric() || c == '_'
+            } else if at_click.is_whitespace() {
+                c.is_whitespace()
+            } else {
+                // punctuation: group with same punctuation
+                !c.is_alphanumeric() && c != '_' && !c.is_whitespace()
+            }
+        };
+
+        let mut start = col;
+        while start > 0 && same_class(chars[start - 1]) {
+            start -= 1;
+        }
+        let mut end = col;
+        while end < chars.len() && same_class(chars[end]) {
+            end += 1;
+        }
+
+        self.selection_anchor = Some((line, start));
+        self.search_selection = false;
+        self.cursor_line = line;
+        self.cursor_col = end;
+        self.desired_col = end;
+    }
+
+    /// Triple-click: select the entire line.
+    pub fn triple_click_at(&mut self, screen_col: u16, screen_row: u16) {
+        let (line, _) = match self.screen_to_editor(screen_col, screen_row) {
+            Some(pos) => pos,
+            None => return,
+        };
+        let line_len = self
+            .get_line_text(line)
+            .map(|t| t.chars().count())
+            .unwrap_or(0);
+        self.selection_anchor = Some((line, 0));
+        self.search_selection = false;
+        self.cursor_line = line;
+        self.cursor_col = line_len;
+        self.desired_col = line_len;
+    }
+
+    /// Shift+click: extend (or start) selection from current cursor to click position.
+    pub fn shift_click_at(&mut self, screen_col: u16, screen_row: u16) {
+        if let Some((line, col)) = self.screen_to_editor(screen_col, screen_row) {
+            self.ensure_anchor();
+            self.cursor_line = line;
+            self.cursor_col = col;
+            self.desired_col = col;
+        }
+    }
+
+    /// Drag: set anchor on first drag event, then extend selection.
+    pub fn drag_to(&mut self, screen_col: u16, screen_row: u16) {
+        if let Some((line, col)) = self.screen_to_editor(screen_col, screen_row) {
+            if self.selection_anchor.is_none() {
+                // First drag event — anchor at current cursor
+                self.selection_anchor = Some((self.cursor_line, self.cursor_col));
+                self.search_selection = false;
+            }
+            self.cursor_line = line;
+            self.cursor_col = col;
+            self.desired_col = col;
+            self.scroll_to_cursor();
+        }
     }
 
     pub fn scroll_to_cursor(&mut self) {
@@ -948,25 +1036,82 @@ impl EditorState {
     // Streams raw file bytes for Original segments (single open, large-buffer reads).
     // Buffer segments are searched in-memory. No per-line file I/O.
 
+    /// Search from the cursor in the given direction, without wrapping around.
+    /// Returns true if a match was found.
     pub fn find(&mut self, params: &SearchParams) -> bool {
+        let reverse = matches!(params.direction, SearchDirection::Backward);
+        self.find_pass(params, reverse, 0)
+    }
+
+    /// Search the wrapped portion (beginning→cursor for forward, end→cursor for backward).
+    /// Call this after `find()` returns false and the user confirms they want to wrap.
+    pub fn find_wrapped(&mut self, params: &SearchParams) -> bool {
+        let reverse = matches!(params.direction, SearchDirection::Backward);
+        self.find_pass(params, reverse, 1)
+    }
+
+    /// Execute a single search pass and apply the result if found.
+    fn find_pass(&mut self, params: &SearchParams, reverse: bool, pass: usize) -> bool {
         if params.query.is_empty() {
             return false;
         }
-        // Only scan enough to know where the cursor is (not the whole file).
-        // Segments beyond what we've scanned will trigger lazy scanning.
         let query_bytes: Vec<u8> = if params.case_sensitive {
             params.query.as_bytes().to_vec()
         } else {
             params.query.to_lowercase().into_bytes()
         };
-        match params.direction {
-            SearchDirection::Forward => {
-                self.find_streaming(&query_bytes, params.case_sensitive, false)
-            }
-            SearchDirection::Backward => {
-                self.find_streaming(&query_bytes, params.case_sensitive, true)
-            }
+
+        let plan = self.build_search_plan();
+        if plan.is_empty() {
+            return false;
         }
+
+        let cursor_line = self.cursor_line;
+        let cursor_col = self.cursor_col;
+        let anchor_col = self
+            .selection_anchor
+            .filter(|(l, _)| *l == cursor_line)
+            .map(|(_, c)| c)
+            .unwrap_or(cursor_col);
+
+        let cursor_plan_idx = plan
+            .iter()
+            .position(|(_, vl, count)| cursor_line >= *vl && cursor_line < vl + count)
+            .unwrap_or(0);
+
+        let col_for_pass = if reverse {
+            if pass == 0 {
+                cursor_col
+            } else {
+                anchor_col
+            }
+        } else if pass == 0 {
+            anchor_col
+        } else {
+            cursor_col
+        };
+
+        let result = self.find_streaming_pass(
+            &plan,
+            cursor_plan_idx,
+            cursor_line,
+            col_for_pass,
+            &query_bytes,
+            params.case_sensitive,
+            reverse,
+            pass,
+        );
+        if let Some((line, col, match_len)) = result {
+            self.selection_anchor = Some((line, col + match_len));
+            self.search_selection = true;
+            self.cursor_line = line;
+            self.cursor_col = col;
+            self.desired_col = self.cursor_col;
+            self.scroll_to_cursor();
+            return true;
+        }
+
+        false
     }
 
     /// Build a plan of (segment_index, virtual_line_start, line_count) for searching.
@@ -994,74 +1139,6 @@ impl EditorState {
             vline += count;
         }
         plan
-    }
-
-    /// Streaming search across all segments. Opens the file once for all Original segments.
-    /// Uses two passes for correct wrap-around:
-    ///   Forward:  pass 1 = cursor→end, pass 2 = beginning→cursor
-    ///   Backward: pass 1 = cursor→beginning, pass 2 = end→cursor
-    fn find_streaming(&mut self, query: &[u8], case_sensitive: bool, reverse: bool) -> bool {
-        let plan = self.build_search_plan();
-        if plan.is_empty() {
-            return false;
-        }
-
-        let cursor_line = self.cursor_line;
-        let cursor_col = self.cursor_col;
-        // After a search: cursor is at match START, anchor at match END.
-        // For forward: skip past the match end (anchor_col) to avoid re-finding.
-        // For reverse: limit to before the match start (cursor_col) to avoid re-finding.
-        let anchor_col = self
-            .selection_anchor
-            .filter(|(l, _)| *l == cursor_line)
-            .map(|(_, c)| c)
-            .unwrap_or(cursor_col);
-
-        let cursor_plan_idx = plan
-            .iter()
-            .position(|(_, vl, count)| cursor_line >= *vl && cursor_line < vl + count)
-            .unwrap_or(0);
-
-        // Two passes: from cursor in search direction, then wrap around
-        for pass in 0..2 {
-            // Forward: skip past anchor_col (match end) in pass 0, limit at cursor_col in pass 1
-            // Reverse: limit at cursor_col (match start) in pass 0, skip past anchor_col in pass 1
-            let col_for_pass = if reverse {
-                if pass == 0 {
-                    cursor_col
-                } else {
-                    anchor_col
-                }
-            } else if pass == 0 {
-                anchor_col
-            } else {
-                cursor_col
-            };
-            let result = self.find_streaming_pass(
-                &plan,
-                cursor_plan_idx,
-                cursor_line,
-                col_for_pass,
-                query,
-                case_sensitive,
-                reverse,
-                pass,
-            );
-            if let Some((line, col, match_len)) = result {
-                // Cursor at match START, anchor at match END.
-                // This highlights the match and places the cursor on its
-                // first character, so Shift+Right selects from there.
-                self.selection_anchor = Some((line, col + match_len));
-                self.search_selection = true;
-                self.cursor_line = line;
-                self.cursor_col = col;
-                self.desired_col = self.cursor_col;
-                self.scroll_to_cursor();
-                return true;
-            }
-        }
-
-        false
     }
 
     /// Execute one pass of the search.
@@ -1519,7 +1596,7 @@ impl EditorState {
 
     pub fn copy_to_clipboard(&mut self) {
         if let Some(text) = self.selected_text() {
-            osc52_copy(&text);
+            crate::clipboard::copy(&text);
             self.status_msg = Some(format!("Copied {} chars", text.len()));
         }
     }
@@ -2060,39 +2137,6 @@ fn char_to_byte(s: &str, char_pos: usize) -> usize {
         .unwrap_or(s.len())
 }
 
-pub(crate) fn osc52_copy(text: &str) {
-    use std::io::Write;
-    let encoded = base64_encode(text.as_bytes());
-    let osc = format!("\x1b]52;c;{}\x1b\\", encoded);
-    let _ = std::io::stdout().write_all(osc.as_bytes());
-    let _ = std::io::stdout().flush();
-}
-
-// Exposed for tests
-pub fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
-        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        result.push(CHARS[((n >> 18) & 0x3F) as usize] as char);
-        result.push(CHARS[((n >> 12) & 0x3F) as usize] as char);
-        result.push(if chunk.len() > 1 {
-            CHARS[((n >> 6) & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-        result.push(if chunk.len() > 2 {
-            CHARS[(n & 0x3F) as usize] as char
-        } else {
-            '='
-        });
-    }
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2272,8 +2316,10 @@ mod tests {
         editor.cursor_col = 0;
         editor.selection_anchor = Some((2, 5));
         let params = make_search("hello", SearchDirection::Forward, true);
-        assert!(editor.find(&params));
-        // Should wrap and find first "hello" at line 0
+        // find() no longer wraps — should return false
+        assert!(!editor.find(&params));
+        // find_wrapped() should find first "hello" at line 0
+        assert!(editor.find_wrapped(&params));
         assert_eq!(editor.cursor_line, 0);
         assert_eq!(editor.cursor_col, 0);
         assert_eq!(editor.selection_anchor, Some((0, 5)));
@@ -2315,8 +2361,10 @@ mod tests {
         editor.cursor_line = 0;
         editor.cursor_col = 0;
         let params = make_search("hello", SearchDirection::Backward, true);
-        assert!(editor.find(&params));
-        // Should wrap and find "hello" on line 2; cursor at match start, anchor at match end
+        // find() no longer wraps — should return false
+        assert!(!editor.find(&params));
+        // find_wrapped() should find "hello" on line 2
+        assert!(editor.find_wrapped(&params));
         assert_eq!(editor.cursor_line, 2);
         assert_eq!(editor.cursor_col, 0);
         assert_eq!(editor.selection_anchor, Some((2, 5)));
@@ -2397,15 +2445,19 @@ mod tests {
         assert_eq!(editor.cursor_col, 0);
         assert_eq!(editor.selection_anchor, Some((4, 3)));
 
-        // Fourth forward: wraps to line 0
-        assert!(editor.find(&fwd));
+        // Fourth forward: no more matches ahead, find() returns false
+        assert!(!editor.find(&fwd));
+        // find_wrapped() wraps to line 0
+        assert!(editor.find_wrapped(&fwd));
         assert_eq!(editor.cursor_line, 0);
         assert_eq!(editor.cursor_col, 0);
         assert_eq!(editor.selection_anchor, Some((0, 3)));
 
-        // Now backward from line 0: should wrap to line 4
+        // Now backward from line 0: no matches before, find() returns false
         let bwd = make_search("aaa", SearchDirection::Backward, true);
-        assert!(editor.find(&bwd));
+        assert!(!editor.find(&bwd));
+        // find_wrapped() wraps to line 4
+        assert!(editor.find_wrapped(&bwd));
         assert_eq!(editor.cursor_line, 4);
         assert_eq!(editor.cursor_col, 0);
         assert_eq!(editor.selection_anchor, Some((4, 3)));
@@ -2440,8 +2492,10 @@ mod tests {
         assert_eq!(editor.cursor_col, 6);
         assert_eq!(editor.selection_anchor, Some((0, 8)));
 
+        // No more matches ahead — find() returns false
+        assert!(!editor.find(&fwd));
         // Wraps back to col 0
-        assert!(editor.find(&fwd));
+        assert!(editor.find_wrapped(&fwd));
         assert_eq!(editor.cursor_col, 0);
         assert_eq!(editor.selection_anchor, Some((0, 2)));
     }
@@ -2470,8 +2524,10 @@ mod tests {
         assert_eq!(editor.cursor_col, 0);
         assert_eq!(editor.selection_anchor, Some((0, 2)));
 
+        // No more matches behind — find() returns false
+        assert!(!editor.find(&bwd));
         // Wraps to col 6
-        assert!(editor.find(&bwd));
+        assert!(editor.find_wrapped(&bwd));
         assert_eq!(editor.cursor_col, 6);
         assert_eq!(editor.selection_anchor, Some((0, 8)));
     }
@@ -2705,7 +2761,10 @@ mod tests {
         editor.cursor_col = 50; // cursor was here before search
 
         let params = make_search("NEEDLE", SearchDirection::Forward, true);
-        assert!(editor.find(&params));
+        // Match is before cursor, so find() (no wrap) returns false
+        assert!(!editor.find(&params));
+        // find_wrapped() finds it
+        assert!(editor.find_wrapped(&params));
         // Match at col 11; cursor at match start (11), anchor at match end (17)
         assert_eq!(editor.cursor_col, 11);
         assert_eq!(editor.selection_anchor, Some((0, 17)));
@@ -3267,6 +3326,102 @@ mod tests {
         assert_eq!(editor.cursor_col, 2);
     }
 
+    // --- Mouse interaction tests ---
+
+    /// Helper: set up viewport for mouse tests (viewport at screen origin, 6-char gutter).
+    fn setup_viewport(editor: &mut EditorState) {
+        editor.viewport_x = 0;
+        editor.viewport_y = 0;
+        editor.line_num_width = 4;
+        editor.scroll_y = 0;
+        editor.scroll_x = 0;
+        editor.visible_lines = 20;
+        editor.visible_cols = 80;
+    }
+
+    #[test]
+    fn double_click_selects_word() {
+        let mut editor = create_test_editor("hello world foo\n");
+        setup_viewport(&mut editor);
+        // Double-click on "world" (screen col 4 + 6 = 10 for 'w', offset by gutter)
+        editor.double_click_at(10, 0); // col 10 - 4 gutter = display col 6 = 'w'
+        assert_eq!(editor.selection_anchor, Some((0, 6)));
+        assert_eq!(editor.cursor_col, 11);
+        assert_eq!(editor.selected_text(), Some("world".to_string()));
+    }
+
+    #[test]
+    fn double_click_selects_word_at_start() {
+        let mut editor = create_test_editor("hello world\n");
+        setup_viewport(&mut editor);
+        // Double-click on "hello" (col 4 = gutter end, display col 0 = 'h')
+        editor.double_click_at(4, 0);
+        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        assert_eq!(editor.cursor_col, 5);
+        assert_eq!(editor.selected_text(), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn double_click_selects_word_with_underscore() {
+        let mut editor = create_test_editor("foo_bar baz\n");
+        setup_viewport(&mut editor);
+        // Click on 'b' of "foo_bar" at col 7 (display col 3)
+        editor.double_click_at(7, 0);
+        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        assert_eq!(editor.cursor_col, 7);
+        assert_eq!(editor.selected_text(), Some("foo_bar".to_string()));
+    }
+
+    #[test]
+    fn triple_click_selects_line() {
+        let mut editor = create_test_editor("first line\nsecond line\nthird\n");
+        setup_viewport(&mut editor);
+        // Triple-click on second line
+        editor.triple_click_at(4, 1);
+        assert_eq!(editor.selection_anchor, Some((1, 0)));
+        assert_eq!(editor.cursor_line, 1);
+        assert_eq!(editor.cursor_col, 11);
+        assert_eq!(editor.selected_text(), Some("second line".to_string()));
+    }
+
+    #[test]
+    fn shift_click_extends_selection() {
+        let mut editor = create_test_editor("hello world\nfoo bar\n");
+        setup_viewport(&mut editor);
+        // Position cursor at (0, 2)
+        editor.cursor_line = 0;
+        editor.cursor_col = 2;
+        // Shift+click at (1, 3)
+        editor.shift_click_at(7, 1);
+        // Anchor should be at original cursor (0, 2), cursor at (1, 3)
+        assert_eq!(editor.selection_anchor, Some((0, 2)));
+        assert_eq!(editor.cursor_line, 1);
+        assert_eq!(editor.cursor_col, 3);
+        assert_eq!(editor.selected_text(), Some("llo world\nfoo".to_string()));
+    }
+
+    #[test]
+    fn drag_creates_selection() {
+        let mut editor = create_test_editor("hello world\n");
+        setup_viewport(&mut editor);
+        // Click at col 2 to position cursor
+        editor.click_at(6, 0);
+        assert_eq!(editor.cursor_col, 2);
+        assert!(editor.selection_anchor.is_none());
+
+        // First drag — sets anchor at current cursor, moves cursor
+        editor.drag_to(12, 0);
+        assert_eq!(editor.selection_anchor, Some((0, 2)));
+        assert_eq!(editor.cursor_col, 8);
+        assert_eq!(editor.selected_text(), Some("llo wo".to_string()));
+
+        // Continue dragging — extends selection
+        editor.drag_to(14, 0);
+        assert_eq!(editor.selection_anchor, Some((0, 2)));
+        assert_eq!(editor.cursor_col, 10);
+        assert_eq!(editor.selected_text(), Some("llo worl".to_string()));
+    }
+
     // --- Large file / multi-chunk search tests ---
 
     /// Create a test file large enough to force multi-chunk reads (>4MB).
@@ -3335,7 +3490,8 @@ mod tests {
         editor.cursor_line = 60_000;
         editor.cursor_col = 0;
         let params = make_search("NEEDLE_PATTERN_HERE", SearchDirection::Forward, true);
-        assert!(editor.find(&params));
+        assert!(!editor.find(&params));
+        assert!(editor.find_wrapped(&params));
         assert_eq!(
             editor.selection_anchor.unwrap().0,
             needle_line,
@@ -3351,7 +3507,8 @@ mod tests {
         editor.cursor_line = 5_000;
         editor.cursor_col = 0;
         let params = make_search("NEEDLE_PATTERN_HERE", SearchDirection::Backward, true);
-        assert!(editor.find(&params));
+        assert!(!editor.find(&params));
+        assert!(editor.find_wrapped(&params));
         assert_eq!(
             editor.selection_anchor.unwrap().0,
             needle_line,
@@ -3409,14 +3566,5 @@ mod tests {
             "Second backward should find needle at line {}",
             needle1
         );
-    }
-
-    #[test]
-    fn base64_encode_basic() {
-        assert_eq!(base64_encode(b"hello"), "aGVsbG8=");
-        assert_eq!(base64_encode(b""), "");
-        assert_eq!(base64_encode(b"a"), "YQ==");
-        assert_eq!(base64_encode(b"ab"), "YWI=");
-        assert_eq!(base64_encode(b"abc"), "YWJj");
     }
 }

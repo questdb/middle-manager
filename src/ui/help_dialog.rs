@@ -198,7 +198,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
-/// Build the help content (cached — only built once).
+/// Build unfiltered help lines (cached — only built once).
 fn help_lines() -> &'static Vec<Line<'static>> {
     use std::sync::OnceLock;
     static LINES: OnceLock<Vec<Line<'static>>> = OnceLock::new();
@@ -244,7 +244,105 @@ fn build_help_lines() -> Vec<Line<'static>> {
     lines
 }
 
-pub fn render(frame: &mut Frame, scroll: usize) -> Rect {
+/// Build filtered help lines with highlighted matches.
+fn build_filtered_lines(filter: &str) -> Vec<Line<'static>> {
+    let t = theme();
+    let section_style = Style::default()
+        .fg(t.dialog_input_fg_focused)
+        .bg(t.dialog_input_bg)
+        .add_modifier(Modifier::BOLD);
+    let key_style = Style::default()
+        .fg(t.dialog_title_fg)
+        .bg(t.dialog_bg)
+        .add_modifier(Modifier::BOLD);
+    let desc_style = Style::default().fg(t.dialog_text_fg).bg(t.dialog_bg);
+    let highlight_style = Style::default()
+        .fg(t.dialog_bg)
+        .bg(t.dialog_title_fg)
+        .add_modifier(Modifier::BOLD);
+    let blank = Line::from(Span::styled("", desc_style));
+    let filter_lower = filter.to_lowercase();
+
+    let mut lines = Vec::new();
+
+    for (section, entries) in HELP_SECTIONS {
+        // Collect matching entries for this section
+        let matching: Vec<_> = entries
+            .iter()
+            .filter(|(key, desc)| {
+                key.to_lowercase().contains(&filter_lower)
+                    || desc.to_lowercase().contains(&filter_lower)
+                    || section.to_lowercase().contains(&filter_lower)
+            })
+            .collect();
+
+        if matching.is_empty() {
+            continue;
+        }
+
+        if !lines.is_empty() {
+            lines.push(blank.clone());
+        }
+        lines.push(Line::from(Span::styled(
+            format!("  {}", section),
+            section_style,
+        )));
+        lines.push(Line::from(Span::styled(
+            format!("  {}", "─".repeat(section.len())),
+            Style::default().fg(t.dialog_border_fg).bg(t.dialog_bg),
+        )));
+
+        for (key, desc) in matching {
+            let key_fmt = format!("  {:>20}  ", key);
+            let key_spans = highlight_spans(&key_fmt, &filter_lower, key_style, highlight_style);
+            let desc_spans = highlight_spans(desc, &filter_lower, desc_style, highlight_style);
+            let mut spans = key_spans;
+            spans.extend(desc_spans);
+            lines.push(Line::from(spans));
+        }
+    }
+
+    if lines.is_empty() {
+        lines.push(Line::from(Span::styled("  No matches found", desc_style)));
+    }
+
+    lines
+}
+
+/// Split text into spans, highlighting all case-insensitive occurrences of `needle`.
+fn highlight_spans(
+    text: &str,
+    needle: &str,
+    normal: Style,
+    highlight: Style,
+) -> Vec<Span<'static>> {
+    if needle.is_empty() {
+        return vec![Span::styled(text.to_string(), normal)];
+    }
+    let text_lower = text.to_lowercase();
+    let mut spans = Vec::new();
+    let mut pos = 0;
+
+    while let Some(idx) = text_lower[pos..].find(needle) {
+        let start = pos + idx;
+        if start > pos {
+            spans.push(Span::styled(text[pos..start].to_string(), normal));
+        }
+        spans.push(Span::styled(
+            text[start..start + needle.len()].to_string(),
+            highlight,
+        ));
+        pos = start + needle.len();
+    }
+
+    if pos < text.len() {
+        spans.push(Span::styled(text[pos..].to_string(), normal));
+    }
+
+    spans
+}
+
+pub fn render(frame: &mut Frame, scroll: usize, filter: &str) -> Rect {
     let t = theme();
     let area = frame.area();
 
@@ -257,11 +355,14 @@ pub fn render(frame: &mut Frame, scroll: usize) -> Rect {
 
     frame.render_widget(Clear, rect);
 
+    let title = if filter.is_empty() {
+        " Help — F1/Esc close, ↑↓ scroll, type to search ".to_string()
+    } else {
+        format!(" Help — search: {} ", filter)
+    };
+
     let block = Block::default()
-        .title(Span::styled(
-            " Help — F1/Esc to close, ↑↓ to scroll ",
-            t.dialog_title_style(),
-        ))
+        .title(Span::styled(title, t.dialog_title_style()))
         .borders(Borders::ALL)
         .border_style(t.dialog_border_style())
         .style(t.dialog_bg_style());
@@ -269,15 +370,23 @@ pub fn render(frame: &mut Frame, scroll: usize) -> Rect {
     let inner = block.inner(rect);
     frame.render_widget(block, rect);
 
-    let lines = help_lines();
-    let total = lines.len();
-    let visible = inner.height as usize;
-    let max_scroll = total.saturating_sub(visible);
-    let scroll = scroll.min(max_scroll);
-
-    let visible_lines: Vec<Line> = lines.iter().skip(scroll).take(visible).cloned().collect();
-
-    frame.render_widget(Paragraph::new(visible_lines), inner);
+    if filter.is_empty() {
+        let lines = help_lines();
+        let total = lines.len();
+        let visible = inner.height as usize;
+        let max_scroll = total.saturating_sub(visible);
+        let scroll = scroll.min(max_scroll);
+        let visible_lines: Vec<Line> = lines.iter().skip(scroll).take(visible).cloned().collect();
+        frame.render_widget(Paragraph::new(visible_lines), inner);
+    } else {
+        let lines = build_filtered_lines(filter);
+        let total = lines.len();
+        let visible = inner.height as usize;
+        let max_scroll = total.saturating_sub(visible);
+        let scroll = scroll.min(max_scroll);
+        let visible_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible).collect();
+        frame.render_widget(Paragraph::new(visible_lines), inner);
+    };
 
     rect
 }

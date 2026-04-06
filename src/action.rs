@@ -88,8 +88,11 @@ pub enum Action {
     EditorDeleteLine,
 
     // Mouse
-    MouseClick(u16, u16), // (column, row)
-    MouseDoubleClick(u16, u16),
+    MouseClick(u16, u16),       // (column, row)
+    MouseShiftClick(u16, u16),  // shift+click: extend selection
+    MouseDoubleClick(u16, u16), // select word
+    MouseTripleClick(u16, u16), // select line
+    MouseDrag(u16, u16),        // click-and-drag: extend selection
     MouseScrollUp(u16, u16),
     MouseScrollDown(u16, u16),
 
