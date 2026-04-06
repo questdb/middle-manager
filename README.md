@@ -136,11 +136,35 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 
 ## Install
 
+### Homebrew (macOS)
+
 ```
-cargo install --path .
+brew install questdb/middle-manager/mm
 ```
 
-Or build from source:
+### Linux (quick install)
+
+```
+curl -fsSL https://mm.questdb.io | sh
+```
+
+### Download binary
+
+Grab a prebuilt binary from the [latest release](https://github.com/questdb/middle-manager/releases/latest). Available for macOS (ARM, Intel) and Linux (x86_64, aarch64).
+
+### Linux packages
+
+`.deb` and `.rpm` packages are attached to each [release](https://github.com/questdb/middle-manager/releases/latest):
+
+```bash
+# Debian / Ubuntu
+sudo dpkg -i middle-manager_*.deb
+
+# Fedora / RHEL
+sudo rpm -i middle-manager-*.rpm
+```
+
+### Build from source
 
 ```
 git clone https://github.com/questdb/middle-manager.git
