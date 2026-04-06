@@ -342,6 +342,12 @@ fn highlight_spans(
     spans
 }
 
+/// Expose `HELP_SECTIONS` count for tests.
+#[cfg(test)]
+fn total_entry_count() -> usize {
+    HELP_SECTIONS.iter().map(|(_, entries)| entries.len()).sum()
+}
+
 pub fn render(frame: &mut Frame, scroll: usize, filter: &str) -> Rect {
     let t = theme();
     let area = frame.area();
@@ -389,4 +395,223 @@ pub fn render(frame: &mut Frame, scroll: usize, filter: &str) -> Rect {
     };
 
     rect
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::style::Style;
+
+    // ── helpers ──────────────────────────────────────────────────────
+
+    /// Concatenate all Span content in a Line into a single String.
+    fn line_text(line: &Line) -> String {
+        line.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    /// True if any Span in the Line contains `needle` (case-insensitive).
+    fn line_contains_ci(line: &Line, needle: &str) -> bool {
+        let full = line_text(line).to_lowercase();
+        full.contains(&needle.to_lowercase())
+    }
+
+    /// Collect *entry* lines (skip blank + section-header + underline lines).
+    fn entry_lines<'a>(lines: &'a [Line<'a>]) -> Vec<&'a Line<'a>> {
+        lines
+            .iter()
+            .filter(|l| {
+                let text = line_text(l);
+                let trimmed = text.trim();
+                // Skip blank lines, section headers (no double-space + key pattern), and
+                // underline rows made of '─'.
+                !trimmed.is_empty()
+                    && !trimmed.chars().all(|c| c == '─')
+                    // Entry lines always have a key right-justified in the first ~22 chars
+                    // followed by two spaces and a description.  Section headers don't.
+                    && text.contains("  ") && l.spans.len() >= 2
+            })
+            .collect()
+    }
+
+    // ── build_filtered_lines ────────────────────────────────────────
+
+    #[test]
+    fn empty_filter_returns_all_entries() {
+        // With an empty filter build_filtered_lines should include every
+        // key/description entry from HELP_SECTIONS.
+        let lines = build_filtered_lines("");
+        let entries = entry_lines(&lines);
+        assert_eq!(
+            entries.len(),
+            total_entry_count(),
+            "empty filter should return every entry"
+        );
+    }
+
+    #[test]
+    fn filter_matching_key() {
+        // "Ctrl+Q" appears as a key but not in any section name, so only
+        // entries whose key or description contain "Ctrl+Q" are returned.
+        let lines = build_filtered_lines("Ctrl+Q");
+        let entries = entry_lines(&lines);
+        assert!(!entries.is_empty(), "should have matches for Ctrl+Q");
+        for entry in &entries {
+            assert!(
+                line_contains_ci(entry, "ctrl+q"),
+                "entry should contain the filter: {:?}",
+                line_text(entry),
+            );
+        }
+    }
+
+    #[test]
+    fn filter_matching_description() {
+        // "clipboard" appears in description text.
+        let lines = build_filtered_lines("clipboard");
+        let entries = entry_lines(&lines);
+        assert!(!entries.is_empty(), "should have matches for clipboard");
+        for entry in &entries {
+            assert!(
+                line_contains_ci(entry, "clipboard"),
+                "entry should mention clipboard: {:?}",
+                line_text(entry),
+            );
+        }
+    }
+
+    #[test]
+    fn filter_matching_section_name_includes_all_section_entries() {
+        // Filtering by a section name (e.g., "Parquet Viewer") should include
+        // ALL entries from that section because the section name matches.
+        let section_name = "Parquet Viewer";
+        let expected_count = HELP_SECTIONS
+            .iter()
+            .find(|(name, _)| *name == section_name)
+            .map(|(_, entries)| entries.len())
+            .expect("section should exist");
+
+        let lines = build_filtered_lines(section_name);
+        let entries = entry_lines(&lines);
+        // The filter matches the section header, so every entry in that section
+        // is included. Other sections should NOT match (no other section has
+        // "Parquet Viewer" in a key or description).
+        assert_eq!(
+            entries.len(),
+            expected_count,
+            "all entries from the matching section should be present"
+        );
+    }
+
+    #[test]
+    fn case_insensitive_matching() {
+        let upper = build_filtered_lines("CLIPBOARD");
+        let lower = build_filtered_lines("clipboard");
+        let mixed = build_filtered_lines("ClipBoard");
+
+        let count_upper = entry_lines(&upper).len();
+        let count_lower = entry_lines(&lower).len();
+        let count_mixed = entry_lines(&mixed).len();
+
+        assert!(count_upper > 0);
+        assert_eq!(count_upper, count_lower);
+        assert_eq!(count_upper, count_mixed);
+    }
+
+    #[test]
+    fn non_matching_filter_returns_no_matches_message() {
+        let lines = build_filtered_lines("zzzzznotamatch99999");
+        assert_eq!(lines.len(), 1, "should have exactly one line");
+        let text = line_text(&lines[0]);
+        assert!(
+            text.contains("No matches found"),
+            "expected 'No matches found', got: {:?}",
+            text,
+        );
+    }
+
+    // ── highlight_spans ─────────────────────────────────────────────
+
+    fn plain() -> Style {
+        Style::default()
+    }
+
+    fn hl() -> Style {
+        Style::default().add_modifier(Modifier::BOLD)
+    }
+
+    /// Convenience: extract (content, is_highlight) pairs from spans.
+    fn span_parts<'a>(spans: &'a [Span<'a>]) -> Vec<(&'a str, bool)> {
+        spans
+            .iter()
+            .map(|s| (s.content.as_ref(), s.style == hl()))
+            .collect()
+    }
+
+    #[test]
+    fn no_needle_returns_full_text() {
+        let spans = highlight_spans("hello world", "", plain(), hl());
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "hello world");
+        assert_eq!(spans[0].style, plain());
+    }
+
+    #[test]
+    fn single_match_splits_three_spans() {
+        // "Copy selection" with needle "sel"
+        let spans = highlight_spans("Copy selection", "sel", plain(), hl());
+        let parts = span_parts(&spans);
+        assert_eq!(
+            parts,
+            vec![("Copy ", false), ("sel", true), ("ection", false)]
+        );
+    }
+
+    #[test]
+    fn multiple_matches() {
+        let spans = highlight_spans("abcabc", "ab", plain(), hl());
+        let parts = span_parts(&spans);
+        assert_eq!(
+            parts,
+            vec![("ab", true), ("c", false), ("ab", true), ("c", false)]
+        );
+    }
+
+    #[test]
+    fn match_at_start() {
+        let spans = highlight_spans("hello world", "hello", plain(), hl());
+        let parts = span_parts(&spans);
+        assert_eq!(parts, vec![("hello", true), (" world", false)]);
+    }
+
+    #[test]
+    fn match_at_end() {
+        let spans = highlight_spans("hello world", "world", plain(), hl());
+        let parts = span_parts(&spans);
+        assert_eq!(parts, vec![("hello ", false), ("world", true)]);
+    }
+
+    #[test]
+    fn case_insensitive_highlight() {
+        // The needle passed to highlight_spans is already lowered by the
+        // caller (build_filtered_lines), but the text may have mixed case.
+        let spans = highlight_spans("Ctrl+C", "ctrl", plain(), hl());
+        let parts = span_parts(&spans);
+        // The highlighted portion preserves original case.
+        assert_eq!(parts, vec![("Ctrl", true), ("+C", false)]);
+    }
+
+    // ── help_lines ──────────────────────────────────────────────────
+
+    #[test]
+    fn help_lines_returns_non_empty() {
+        let lines = help_lines();
+        assert!(!lines.is_empty(), "help_lines should not be empty");
+    }
+
+    #[test]
+    fn help_lines_is_cached() {
+        let first = help_lines() as *const Vec<Line>;
+        let second = help_lines() as *const Vec<Line>;
+        assert_eq!(first, second, "help_lines should return the same reference");
+    }
 }
