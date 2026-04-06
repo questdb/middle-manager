@@ -441,7 +441,7 @@ fn cow_linux(src: &Path, dst: &Path) -> Result<bool> {
         .open(dst)?;
 
     // FICLONE ioctl
-    const FICLONE: libc::c_ulong = 0x40049409;
+    const FICLONE: libc::Ioctl = 0x40049409;
     let ret = unsafe { libc::ioctl(dst_file.as_raw_fd(), FICLONE, src_file.as_raw_fd()) };
     if ret == 0 {
         Ok(true)
