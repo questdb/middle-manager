@@ -32,6 +32,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "File Operations",
         &[
+            ("F3", "Calculate directory / selection size"),
             ("F4", "Open file (editor / hex / parquet)"),
             ("Shift+F4", "Edit file with $EDITOR"),
             ("F5", "Copy file/selection"),

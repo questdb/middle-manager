@@ -12,6 +12,7 @@ Designed to handle **very large files** — the hex editor and text editor both 
 **File Manager**
 - Dual-panel layout with directory listings (name, size, date, permissions)
 - File operations: copy (F5), move (F6), rename (Shift+F6), mkdir (F7), delete (F8), archive (Shift+F5)
+- Directory size calculation (F3) — async recursive scan with live progress, works on selections
 - Multi-file selection with Shift+Up/Down (toggle) and Insert key for batch operations
 - Far Manager-style dialogs with keyboard navigation (copy, mkdir, delete, rename)
 - Quick search — just start typing to jump to a file, Enter to open
@@ -200,6 +201,7 @@ cargo build --release
 | Ctrl+O | Toggle shell panel |
 | Ctrl+P | Copy full path to clipboard |
 | F2 | Toggle CI panel |
+| F3 | Calculate directory / selection size |
 | F4 | Open file (editor / hex / parquet) |
 | Shift+F4 | Edit file ($EDITOR) |
 | F5 | Copy (operates on selection if active) |

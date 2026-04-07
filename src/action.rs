@@ -31,6 +31,7 @@ pub enum Action {
     Delete,
     EditFile,
     Archive,
+    CalcSize,
 
     // Sorting
     CycleSort,

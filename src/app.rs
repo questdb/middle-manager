@@ -1658,6 +1658,7 @@ impl App {
             KeyCode::Tab => Action::SwitchPanel,
             KeyCode::BackTab => Action::SwitchPanelReverse,
             KeyCode::F(1) => Action::ShowHelp,
+            KeyCode::F(3) => Action::CalcSize,
             KeyCode::F(4) => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     Action::EditFile // external $EDITOR
@@ -2287,9 +2288,16 @@ impl App {
                 .map(|s| s.searching)
                 .unwrap_or(false)
             || self.git_cache.has_pending()
-            || self.archive_progress.is_some();
+            || self.archive_progress.is_some()
+            || self.panels[0].has_pending_size_calcs()
+            || self.panels[1].has_pending_size_calcs();
         if has_active_async {
             self.dirty = true;
+        }
+
+        // Poll directory size calculations
+        for panel in &mut self.panels {
+            panel.poll_dir_sizes();
         }
         if let Some(ref w) = self.dir_watcher {
             if w.has_changes() {
@@ -2975,6 +2983,7 @@ impl App {
             Action::Rename => self.handle_rename(),
             Action::CreateDir => self.handle_create_dir(),
             Action::Delete => self.handle_delete(),
+            Action::CalcSize => self.handle_calc_size(),
             Action::EditFile => self.handle_edit_file(),
 
             // Clipboard
@@ -4665,6 +4674,55 @@ impl App {
             has_input: false,
             focused: DialogField::ButtonOk,
         });
+    }
+
+    fn handle_calc_size(&mut self) {
+        let panel = &self.panels[self.active_panel];
+
+        // Gather entries to calculate: multi-selection or cursor item
+        let entries: Vec<(PathBuf, bool, u64)> = if !panel.selected_indices.is_empty() {
+            panel
+                .selected_indices
+                .iter()
+                .filter_map(|&i| panel.entries.get(i))
+                .filter(|e| e.name != "..")
+                .map(|e| (e.path.clone(), e.is_dir, e.size))
+                .collect()
+        } else if let Some(entry) = panel.selected_entry() {
+            if entry.name == ".." {
+                return;
+            }
+            vec![(entry.path.clone(), entry.is_dir, entry.size)]
+        } else {
+            return;
+        };
+
+        let panel = &mut self.panels[self.active_panel];
+        let mut file_total: u64 = 0;
+        let mut dir_count = 0usize;
+        let mut file_count = 0usize;
+
+        for (path, is_dir, size) in &entries {
+            if *is_dir {
+                // Remove existing calculation (allows re-scan on repeated F3)
+                panel.dir_sizes.remove(path);
+                panel.start_size_calc(path.clone());
+                dir_count += 1;
+            } else {
+                file_total += size;
+                file_count += 1;
+            }
+        }
+
+        // Show immediate status for file-only selections
+        if dir_count == 0 && file_count > 0 {
+            self.status_message = Some(format!(
+                "{} file{}: {}",
+                file_count,
+                if file_count == 1 { "" } else { "s" },
+                crate::panel::format_size_short(file_total),
+            ));
+        }
     }
 
     fn handle_edit_file(&mut self) {

@@ -3,13 +3,27 @@ pub mod git;
 pub mod github;
 pub mod sort;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use ratatui::widgets::TableState;
 
 use entry::FileEntry;
 use sort::{sort_entries, SortField};
+
+/// State of a directory size calculation.
+#[derive(Clone)]
+pub enum DirSizeState {
+    /// Background scan in progress. Accumulator holds bytes counted so far.
+    Calculating {
+        accumulator: Arc<AtomicU64>,
+        finished: Arc<AtomicBool>,
+    },
+    /// Scan complete.
+    Done(u64),
+}
 
 pub struct Panel {
     pub current_dir: PathBuf,
@@ -21,6 +35,8 @@ pub struct Panel {
     pub error: Option<String>,
     pub selected_indices: BTreeSet<usize>,
     pub git_info: Option<git::GitInfo>,
+    /// Calculated directory sizes (persists until panel reload).
+    pub dir_sizes: HashMap<PathBuf, DirSizeState>,
 }
 
 impl Panel {
@@ -35,6 +51,7 @@ impl Panel {
             error: None,
             selected_indices: BTreeSet::new(),
             git_info: None,
+            dir_sizes: HashMap::new(),
         };
         panel.reload();
         if !panel.entries.is_empty() {
@@ -56,6 +73,7 @@ impl Panel {
 
         self.entries.clear();
         self.selected_indices.clear();
+        self.dir_sizes.clear();
         self.error = None;
 
         // Add parent directory entry
@@ -280,6 +298,116 @@ impl Panel {
         } else {
             Vec::new()
         }
+    }
+
+    // --- Directory size calculation ---
+
+    /// Start an async directory size calculation for the given path.
+    /// Returns false if already calculating or done.
+    pub fn start_size_calc(&mut self, path: PathBuf) -> bool {
+        if self.dir_sizes.contains_key(&path) {
+            return false;
+        }
+        let accumulator = Arc::new(AtomicU64::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let acc = accumulator.clone();
+        let fin = finished.clone();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            calc_dir_size_recursive(&p, &acc);
+            fin.store(true, Ordering::Release);
+        });
+        self.dir_sizes.insert(
+            path,
+            DirSizeState::Calculating {
+                accumulator,
+                finished,
+            },
+        );
+        true
+    }
+
+    /// Poll in-progress calculations and promote finished ones to Done.
+    /// Returns true if any calculation finished this tick.
+    pub fn poll_dir_sizes(&mut self) -> bool {
+        let mut newly_done = Vec::new();
+        for (path, state) in &self.dir_sizes {
+            if let DirSizeState::Calculating {
+                accumulator,
+                finished,
+            } = state
+            {
+                if finished.load(Ordering::Acquire) {
+                    newly_done.push((path.clone(), accumulator.load(Ordering::Relaxed)));
+                }
+            }
+        }
+        let changed = !newly_done.is_empty();
+        for (path, size) in newly_done {
+            self.dir_sizes.insert(path, DirSizeState::Done(size));
+        }
+        changed
+    }
+
+    /// Get the display size for an entry, checking dir_sizes for overrides.
+    pub fn display_size(&self, entry: &FileEntry) -> String {
+        if entry.is_dir {
+            if let Some(state) = self.dir_sizes.get(&entry.path) {
+                return match state {
+                    DirSizeState::Calculating { accumulator, .. } => {
+                        let bytes = accumulator.load(Ordering::Relaxed);
+                        if bytes == 0 {
+                            "\u{25F7}".to_string() // spinner ◷
+                        } else {
+                            format!("\u{25F7}{}", format_size_short(bytes))
+                        }
+                    }
+                    DirSizeState::Done(size) => format_size_short(*size),
+                };
+            }
+            "<DIR>".to_string()
+        } else {
+            entry.formatted_size()
+        }
+    }
+
+    /// Check if any size calculations are in progress.
+    pub fn has_pending_size_calcs(&self) -> bool {
+        self.dir_sizes
+            .values()
+            .any(|s| matches!(s, DirSizeState::Calculating { .. }))
+    }
+}
+
+/// Recursively calculate directory size. Runs in a background thread.
+fn calc_dir_size_recursive(path: &std::path::Path, acc: &AtomicU64) {
+    let entries = match std::fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_dir() {
+            calc_dir_size_recursive(&entry.path(), acc);
+        } else {
+            acc.fetch_add(meta.len(), Ordering::Relaxed);
+        }
+    }
+}
+
+/// Format a byte size compactly for the 8-char size column.
+pub fn format_size_short(size: u64) -> String {
+    if size < 1024 {
+        format!("{}", size)
+    } else if size < 1024 * 1024 {
+        format!("{}K", size / 1024)
+    } else if size < 1024 * 1024 * 1024 {
+        format!("{:.1}M", size as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1}G", size as f64 / (1024.0 * 1024.0 * 1024.0))
     }
 }
 
