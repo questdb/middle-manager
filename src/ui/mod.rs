@@ -295,20 +295,24 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
         terminal_view::render(frame, claude_area, cp, app.focus == PanelFocus::Claude(1));
     }
 
-    // Show appropriate footer
-    match app.focus {
-        PanelFocus::Search => footer::render_search(frame, footer_area),
-        PanelFocus::Shell(_) => footer::render_shell(frame, footer_area),
-        PanelFocus::Claude(_) => footer::render_terminal(frame, footer_area),
-        PanelFocus::Ci(side) => {
-            if let Some(ref ci) = app.ci_panels[side] {
-                footer::render_ci(frame, footer_area, &ci.view);
-            } else {
-                footer::render(frame, footer_area);
+    // Show status message in footer if set, otherwise show key hints
+    if let Some(ref msg) = app.status_message {
+        footer::render_status(frame, footer_area, msg);
+    } else {
+        match app.focus {
+            PanelFocus::Search => footer::render_search(frame, footer_area),
+            PanelFocus::Shell(_) => footer::render_shell(frame, footer_area),
+            PanelFocus::Claude(_) => footer::render_terminal(frame, footer_area),
+            PanelFocus::Ci(side) => {
+                if let Some(ref ci) = app.ci_panels[side] {
+                    footer::render_ci(frame, footer_area, &ci.view);
+                } else {
+                    footer::render(frame, footer_area);
+                }
             }
+            PanelFocus::Diff(_) => footer::render_diff(frame, footer_area),
+            PanelFocus::FilePanel => footer::render(frame, footer_area),
         }
-        PanelFocus::Diff(_) => footer::render_diff(frame, footer_area),
-        PanelFocus::FilePanel => footer::render(frame, footer_area),
     }
 
     let dialog_area = match &app.mode {

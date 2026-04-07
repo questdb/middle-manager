@@ -2298,6 +2298,9 @@ impl App {
         // Poll directory size calculations
         for panel in &mut self.panels {
             panel.poll_dir_sizes();
+            if let Some(msg) = panel.check_size_total() {
+                self.status_message = Some(msg);
+            }
         }
         if let Some(ref w) = self.dir_watcher {
             if w.has_changes() {
@@ -2399,6 +2402,10 @@ impl App {
         // Mark dirty for any action that changes state (not idle ticks)
         if !matches!(action, Action::Tick | Action::None) {
             self.dirty = true;
+            // Clear status message on any user action
+            if !matches!(action, Action::Resize(_, _)) {
+                self.status_message = None;
+            }
         }
 
         // Global tick: poll all async sources regardless of focus
@@ -4689,9 +4696,6 @@ impl App {
                 .map(|e| (e.path.clone(), e.is_dir, e.size))
                 .collect()
         } else if let Some(entry) = panel.selected_entry() {
-            if entry.name == ".." {
-                return;
-            }
             vec![(entry.path.clone(), entry.is_dir, entry.size)]
         } else {
             return;
@@ -4704,7 +4708,12 @@ impl App {
 
         for (path, is_dir, size) in &entries {
             if *is_dir {
-                // Remove existing calculation (allows re-scan on repeated F3)
+                // Cancel and remove existing calculation (allows re-scan on repeated F3)
+                if let Some(crate::panel::DirSizeState::Calculating { cancelled, .. }) =
+                    panel.dir_sizes.get(path)
+                {
+                    cancelled.store(true, std::sync::atomic::Ordering::Release);
+                }
                 panel.dir_sizes.remove(path);
                 panel.start_size_calc(path.clone());
                 dir_count += 1;
@@ -4722,6 +4731,14 @@ impl App {
                 if file_count == 1 { "" } else { "s" },
                 crate::panel::format_size_short(file_total),
             ));
+        } else if dir_count > 0 {
+            // Track pending total for when all dir scans finish
+            let dir_paths: Vec<PathBuf> = entries
+                .iter()
+                .filter(|(_, is_dir, _)| *is_dir)
+                .map(|(p, _, _)| p.clone())
+                .collect();
+            panel.pending_size_total = Some((dir_paths, file_total, file_count, dir_count));
         }
     }
 

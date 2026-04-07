@@ -20,6 +20,7 @@ pub enum DirSizeState {
     Calculating {
         accumulator: Arc<AtomicU64>,
         finished: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
     },
     /// Scan complete.
     Done(u64),
@@ -37,6 +38,8 @@ pub struct Panel {
     pub git_info: Option<git::GitInfo>,
     /// Calculated directory sizes (persists until panel reload).
     pub dir_sizes: HashMap<PathBuf, DirSizeState>,
+    /// Pending F3 size total: (dir paths to wait for, file bytes already summed, file count, dir count).
+    pub pending_size_total: Option<(Vec<PathBuf>, u64, usize, usize)>,
 }
 
 impl Panel {
@@ -52,6 +55,7 @@ impl Panel {
             selected_indices: BTreeSet::new(),
             git_info: None,
             dir_sizes: HashMap::new(),
+            pending_size_total: None,
         };
         panel.reload();
         if !panel.entries.is_empty() {
@@ -73,7 +77,9 @@ impl Panel {
 
         self.entries.clear();
         self.selected_indices.clear();
+        self.cancel_size_calcs();
         self.dir_sizes.clear();
+        self.pending_size_total = None;
         self.error = None;
 
         // Add parent directory entry
@@ -137,9 +143,19 @@ impl Panel {
             .unwrap_or(false);
 
         if has_parent && self.entries.len() > 1 {
-            sort_entries(&mut self.entries[1..], self.sort_field, self.sort_ascending);
+            sort_entries(
+                &mut self.entries[1..],
+                self.sort_field,
+                self.sort_ascending,
+                &self.dir_sizes,
+            );
         } else {
-            sort_entries(&mut self.entries, self.sort_field, self.sort_ascending);
+            sort_entries(
+                &mut self.entries,
+                self.sort_field,
+                self.sort_ascending,
+                &self.dir_sizes,
+            );
         }
 
         // Rebuild selected indices from paths
@@ -310,11 +326,13 @@ impl Panel {
         }
         let accumulator = Arc::new(AtomicU64::new(0));
         let finished = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
         let acc = accumulator.clone();
         let fin = finished.clone();
+        let can = cancelled.clone();
         let p = path.clone();
         std::thread::spawn(move || {
-            calc_dir_size_recursive(&p, &acc);
+            calc_dir_size_recursive(&p, &acc, &can);
             fin.store(true, Ordering::Release);
         });
         self.dir_sizes.insert(
@@ -322,9 +340,19 @@ impl Panel {
             DirSizeState::Calculating {
                 accumulator,
                 finished,
+                cancelled,
             },
         );
         true
+    }
+
+    /// Signal all in-progress size calculations to stop.
+    fn cancel_size_calcs(&self) {
+        for state in self.dir_sizes.values() {
+            if let DirSizeState::Calculating { cancelled, .. } = state {
+                cancelled.store(true, Ordering::Release);
+            }
+        }
     }
 
     /// Poll in-progress calculations and promote finished ones to Done.
@@ -335,6 +363,7 @@ impl Panel {
             if let DirSizeState::Calculating {
                 accumulator,
                 finished,
+                ..
             } = state
             {
                 if finished.load(Ordering::Acquire) {
@@ -345,6 +374,10 @@ impl Panel {
         let changed = !newly_done.is_empty();
         for (path, size) in newly_done {
             self.dir_sizes.insert(path, DirSizeState::Done(size));
+        }
+        // Re-sort if sorting by size so newly calculated dirs move to correct position
+        if changed && self.sort_field == SortField::Size {
+            self.apply_sort();
         }
         changed
     }
@@ -377,21 +410,64 @@ impl Panel {
             .values()
             .any(|s| matches!(s, DirSizeState::Calculating { .. }))
     }
+
+    /// Check if all dirs in the pending total are done. Returns the formatted total string.
+    pub fn check_size_total(&mut self) -> Option<String> {
+        let (dir_paths, file_bytes, file_count, dir_count) = self.pending_size_total.as_ref()?;
+        // Check if all dir scans are done
+        let mut dir_total: u64 = 0;
+        for path in dir_paths {
+            match self.dir_sizes.get(path) {
+                Some(DirSizeState::Done(size)) => dir_total += size,
+                _ => return None, // still calculating
+            }
+        }
+        let total = file_bytes + dir_total;
+        let item_count = file_count + dir_count;
+        let msg = format!(
+            "{} item{}: {} ({} file{}, {} dir{})",
+            item_count,
+            if item_count == 1 { "" } else { "s" },
+            format_size_short(total),
+            file_count,
+            if *file_count == 1 { "" } else { "s" },
+            dir_count,
+            if *dir_count == 1 { "" } else { "s" },
+        );
+        self.pending_size_total = None;
+        Some(msg)
+    }
 }
 
 /// Recursively calculate directory size. Runs in a background thread.
-fn calc_dir_size_recursive(path: &std::path::Path, acc: &AtomicU64) {
+/// Uses symlink_metadata to avoid following symlink cycles.
+/// Checks `cancelled` flag to stop early on panel reload.
+fn calc_dir_size_recursive(path: &std::path::Path, acc: &AtomicU64, cancelled: &AtomicBool) {
+    if cancelled.load(Ordering::Relaxed) {
+        return;
+    }
     let entries = match std::fs::read_dir(path) {
         Ok(rd) => rd,
         Err(_) => return,
     };
     for entry in entries.flatten() {
-        let meta = match entry.metadata() {
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+        // Use symlink_metadata to avoid following symlinks (prevents cycles)
+        let meta = match std::fs::symlink_metadata(entry.path()) {
             Ok(m) => m,
             Err(_) => continue,
         };
-        if meta.is_dir() {
-            calc_dir_size_recursive(&entry.path(), acc);
+        if meta.is_symlink() {
+            // Count symlink's target size but don't recurse into symlinked dirs
+            if let Ok(target_meta) = entry.metadata() {
+                if !target_meta.is_dir() {
+                    acc.fetch_add(target_meta.len(), Ordering::Relaxed);
+                }
+            }
+        } else if meta.is_dir() {
+            calc_dir_size_recursive(&entry.path(), acc, cancelled);
         } else {
             acc.fetch_add(meta.len(), Ordering::Relaxed);
         }

@@ -206,3 +206,17 @@ pub fn render_search(frame: &mut Frame, area: Rect) {
 
     frame.render_widget(Paragraph::new(Line::from(spans)), area);
 }
+
+/// Render a status message in the footer area (replaces key hints temporarily).
+pub fn render_status(frame: &mut Frame, area: Rect, msg: &str) {
+    let t = theme();
+    let style = Style::default().fg(t.footer_key_fg).bg(t.footer_key_bg);
+    let width = area.width as usize;
+    let text = format!(" {}", msg);
+    let padded = if text.len() < width {
+        format!("{}{}", text, " ".repeat(width - text.len()))
+    } else {
+        text[..width].to_string()
+    };
+    frame.render_widget(Paragraph::new(Span::styled(padded, style)), area);
+}
