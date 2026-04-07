@@ -18,7 +18,6 @@ pub mod search_dialog;
 pub mod search_results_view;
 mod shadow;
 pub mod terminal_view;
-pub mod viewer_view;
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -136,7 +135,6 @@ fn split_panel_column(
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     match &app.mode {
-        AppMode::Viewing(_) => render_viewer(frame, app),
         AppMode::HexViewing(_) => render_hex_viewer(frame, app),
         AppMode::ParquetViewing(_) => render_parquet_viewer(frame, app),
         AppMode::DiffViewing(_) => render_diff_viewer(frame, app),
@@ -317,12 +315,6 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
     };
     if let Some(area) = dialog_area {
         shadow::render_shadow(frame, area);
-    }
-}
-
-fn render_viewer(frame: &mut Frame, app: &mut App) {
-    if let AppMode::Viewing(ref mut viewer) = app.mode {
-        viewer_view::render(frame, frame.area(), viewer);
     }
 }
 

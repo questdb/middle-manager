@@ -16,7 +16,6 @@ pub fn render(frame: &mut Frame, area: Rect) {
     let items: &[(&str, &str)] = &[
         ("F1", "Help"),
         ("F2", "CI"),
-        ("F3", "View"),
         ("F4", "Edit"),
         ("F5", "Copy"),
         ("F6", "RnMov"),

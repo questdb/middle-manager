@@ -80,7 +80,7 @@ pub fn render(frame: &mut Frame, area: Rect, hex: &mut HexViewerState) {
     frame.render_widget(paragraph, area);
 
     // Footer hint
-    let hint = " Scroll: Arrows/PgUp/Dn | Home/End | g: Go to | F4/Tab: Text | q/Esc: Close ";
+    let hint = " Scroll: Arrows/PgUp/Dn | Home/End | g: Go to | q/Esc: Close ";
     let hint_area = Rect::new(
         area.x,
         area.y + area.height.saturating_sub(1),

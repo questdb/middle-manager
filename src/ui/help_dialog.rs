@@ -32,8 +32,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "File Operations",
         &[
-            ("F3", "View file"),
-            ("F4", "Edit file (built-in editor)"),
+            ("F4", "Open file (editor / hex / parquet)"),
             ("Shift+F4", "Edit file with $EDITOR"),
             ("F5", "Copy file/selection"),
             ("F6", "Move file/selection"),
@@ -145,14 +144,13 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
-        "Viewer / Hex Viewer",
+        "Hex Viewer",
         &[
             ("Up / Down", "Scroll line by line"),
             ("PageUp / PageDown", "Scroll by page"),
             ("Home / End", "Jump to top / bottom"),
             ("g", "Go to line"),
-            ("Tab / F4", "Toggle text / hex view"),
-            ("q / Esc", "Close viewer"),
+            ("q / Esc", "Close"),
         ],
     ),
     (
@@ -163,9 +161,9 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Left", "Collapse node / jump to parent"),
             ("PageUp / PageDown", "Page through tree or table"),
             ("Home / End", "Jump to top / bottom"),
-            ("Tab / F4", "Toggle tree / table view"),
+            ("Tab", "Toggle tree / table view"),
             ("g", "Go to row"),
-            ("q / Esc", "Close viewer"),
+            ("q / Esc", "Close"),
         ],
     ),
     (

@@ -46,7 +46,6 @@ fn sort_field_to_u8(f: SortField) -> u8 {
         SortField::Date => 2,
     }
 }
-use crate::viewer::ViewerState;
 
 pub struct App {
     pub panels: [Panel; 2],
@@ -369,7 +368,6 @@ pub enum AppMode {
     MkdirDialog(MkdirDialogState),
     CopyDialog(CopyDialogState),
     ArchiveDialog(ArchiveDialogState),
-    Viewing(Box<ViewerState>),
     HexViewing(Box<HexViewerState>),
     ParquetViewing(Box<ParquetViewerState>),
     DiffViewing(Box<crate::diff_viewer::DiffViewerState>),
@@ -1472,6 +1470,13 @@ impl App {
                     KeyCode::F(12) => Action::ToggleClaude,
                     KeyCode::F(10) => Action::Quit,
                     KeyCode::F(1) => Action::SwitchPanel,
+                    // Ctrl+Shift+C → copy selection from terminal
+                    KeyCode::Char('c') | KeyCode::Char('C')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                    {
+                        Action::CopySelection
+                    }
                     _ => Action::TerminalInput(crate::terminal::encode_key_event(key)),
                 };
             }
@@ -1608,7 +1613,7 @@ impl App {
             AppMode::MkdirDialog(state) => Self::map_mkdir_dialog_key(key, state.focused),
             AppMode::CopyDialog(state) => Self::map_copy_dialog_key(key, state.focused),
             AppMode::ArchiveDialog(state) => Self::map_archive_dialog_key(key, state.focused),
-            AppMode::Viewing(_) | AppMode::HexViewing(_) => self.map_viewer_key(key),
+            AppMode::HexViewing(_) => self.map_viewer_key(key),
             AppMode::ParquetViewing(_) => self.map_parquet_key(key),
             AppMode::DiffViewing(ref d) => {
                 if d.search_input.is_some() {
@@ -1642,7 +1647,6 @@ impl App {
             KeyCode::Tab => Action::SwitchPanel,
             KeyCode::BackTab => Action::SwitchPanelReverse,
             KeyCode::F(1) => Action::ShowHelp,
-            KeyCode::F(3) => Action::ViewFile,
             KeyCode::F(4) => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     Action::EditFile // external $EDITOR
@@ -2105,7 +2109,6 @@ impl App {
             KeyCode::PageDown => Action::PageDown,
             KeyCode::Home => Action::MoveToTop,
             KeyCode::End => Action::MoveToBottom,
-            KeyCode::Tab | KeyCode::F(4) => Action::Toggle, // switch text <-> hex
             KeyCode::Char('g') => Action::GotoLinePrompt,
             KeyCode::Char('q') | KeyCode::Esc => Action::DialogCancel,
             _ => Action::None,
@@ -2161,7 +2164,7 @@ impl App {
             KeyCode::PageDown => Action::PageDown,
             KeyCode::Home => Action::MoveToTop,
             KeyCode::End => Action::MoveToBottom,
-            KeyCode::Tab | KeyCode::F(4) => Action::Toggle,
+            KeyCode::Tab => Action::Toggle,
             KeyCode::Char('g') => Action::GotoLinePrompt,
             KeyCode::Char('q') | KeyCode::Esc => Action::DialogCancel,
             _ => Action::None,
@@ -2853,11 +2856,10 @@ impl App {
             Action::Quit => self.should_quit = true,
             Action::Toggle => self.handle_toggle_viewer(),
             Action::GotoLinePrompt => {
-                // Only works in viewer/hex/editor/parquet modes
+                // Only works in hex/editor/parquet modes
                 if matches!(
                     self.mode,
-                    AppMode::Viewing(_)
-                        | AppMode::HexViewing(_)
+                    AppMode::HexViewing(_)
                         | AppMode::ParquetViewing(_)
                         | AppMode::Editing(_)
                 ) {
@@ -2922,7 +2924,6 @@ impl App {
             Action::Rename => self.handle_rename(),
             Action::CreateDir => self.handle_create_dir(),
             Action::Delete => self.handle_delete(),
-            Action::ViewFile => self.handle_view_file(),
             Action::EditFile => self.handle_edit_file(),
 
             // Clipboard
@@ -3121,7 +3122,6 @@ impl App {
 
     fn handle_move_up(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => v.scroll_up(1),
             AppMode::HexViewing(h) => h.scroll_up(1),
             AppMode::ParquetViewing(p) => p.move_up(1),
             AppMode::DiffViewing(d) => d.scroll_up(1),
@@ -3131,7 +3131,6 @@ impl App {
 
     fn handle_move_down(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => v.scroll_down(1),
             AppMode::HexViewing(h) => h.scroll_down(1),
             AppMode::ParquetViewing(p) => p.move_down(1),
             AppMode::DiffViewing(d) => d.scroll_down(1),
@@ -3141,7 +3140,6 @@ impl App {
 
     fn handle_move_to_top(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => v.scroll_to_top(),
             AppMode::HexViewing(h) => h.scroll_to_top(),
             AppMode::ParquetViewing(p) => p.move_to_top(),
             AppMode::DiffViewing(d) => d.scroll_to_top(),
@@ -3151,7 +3149,6 @@ impl App {
 
     fn handle_move_to_bottom(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => v.scroll_to_bottom(),
             AppMode::HexViewing(h) => h.scroll_to_bottom(),
             AppMode::ParquetViewing(p) => p.move_to_bottom(),
             AppMode::DiffViewing(d) => d.scroll_to_bottom(),
@@ -3161,10 +3158,6 @@ impl App {
 
     fn handle_page_up(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => {
-                let page = v.visible_lines.max(1);
-                v.scroll_up(page);
-            }
             AppMode::HexViewing(h) => {
                 let page = h.visible_rows.max(1);
                 h.scroll_up(page);
@@ -3177,10 +3170,6 @@ impl App {
 
     fn handle_page_down(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => {
-                let page = v.visible_lines.max(1);
-                v.scroll_down(page);
-            }
             AppMode::HexViewing(h) => {
                 let page = h.visible_rows.max(1);
                 h.scroll_down(page);
@@ -3212,7 +3201,7 @@ impl App {
                 self.update_watched_dirs();
                 self.check_ci_panels();
             } else {
-                self.open_file(entry.path);
+                self.open_file_for_edit(entry.path);
             }
         }
     }
@@ -3588,9 +3577,7 @@ impl App {
                         let full_path = self.panels[side].current_dir.join(rel_path);
                         if full_path.is_file() {
                             self.fuzzy_search[side] = None;
-                            self.mode = AppMode::Editing(Box::new(
-                                crate::editor::EditorState::open(full_path),
-                            ));
+                            self.open_file_for_edit(full_path);
                             return;
                         }
                     }
@@ -3862,11 +3849,6 @@ impl App {
         };
 
         match &mut self.mode {
-            AppMode::Viewing(v) => {
-                // Scan ahead if needed
-                v.scroll_offset = line;
-                v.scroll_down(0); // clamps and loads buffer
-            }
             AppMode::HexViewing(h) => {
                 // Each row = 16 bytes, interpret line as a row number
                 h.scroll_offset = line;
@@ -3899,9 +3881,33 @@ impl App {
     fn handle_edit_builtin(&mut self) {
         if let Some(entry) = self.active_panel().selected_entry().cloned() {
             if !entry.is_dir {
-                self.mode = AppMode::Editing(Box::new(EditorState::open(entry.path)));
+                self.open_file_for_edit(entry.path);
             }
         }
+    }
+
+    /// Open a file with the appropriate mode: parquet viewer, hex viewer, or text editor.
+    fn open_file_for_edit(&mut self, path: PathBuf) {
+        // Parquet files → read-only parquet viewer
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
+        {
+            if let Ok(pq) = ParquetViewerState::open(path.clone()) {
+                self.mode = AppMode::ParquetViewing(Box::new(pq));
+                return;
+            }
+            // Fall through to binary/text on parse failure
+        }
+
+        // Binary files → read-only hex viewer
+        if HexViewerState::is_binary(&path) {
+            self.mode = AppMode::HexViewing(Box::new(HexViewerState::open(path)));
+            return;
+        }
+
+        // Text files → editor
+        self.mode = AppMode::Editing(Box::new(EditorState::open(path)));
     }
 
     fn handle_editor_action(&mut self, action: Action) {
@@ -4213,14 +4219,6 @@ impl App {
 
     fn handle_toggle_viewer(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => {
-                let path = v.path.clone();
-                self.mode = AppMode::HexViewing(Box::new(HexViewerState::open(path)));
-            }
-            AppMode::HexViewing(h) => {
-                let path = h.path.clone();
-                self.mode = AppMode::Viewing(Box::new(ViewerState::open(path)));
-            }
             AppMode::ParquetViewing(p) => {
                 p.switch_view();
             }
@@ -4228,25 +4226,6 @@ impl App {
         }
     }
 
-    fn open_file(&mut self, path: PathBuf) {
-        // Try parquet viewer for .parquet files
-        if path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
-        {
-            if let Ok(pq) = ParquetViewerState::open(path.clone()) {
-                self.mode = AppMode::ParquetViewing(Box::new(pq));
-                return;
-            }
-            // Fall through to binary/text viewer on parse failure
-        }
-
-        if HexViewerState::is_binary(&path) {
-            self.mode = AppMode::HexViewing(Box::new(HexViewerState::open(path)));
-        } else {
-            self.mode = AppMode::Viewing(Box::new(ViewerState::open(path)));
-        }
-    }
 
     // --- File operation handlers ---
 
@@ -4355,13 +4334,6 @@ impl App {
         });
     }
 
-    fn handle_view_file(&mut self) {
-        if let Some(entry) = self.active_panel().selected_entry().cloned() {
-            if !entry.is_dir {
-                self.open_file(entry.path);
-            }
-        }
-    }
 
     fn handle_edit_file(&mut self) {
         if let Some(entry) = self.active_panel().selected_entry().cloned() {
@@ -4719,10 +4691,10 @@ impl App {
                 }
             }
             Action::EditBuiltin => {
-                // F4: open file in editor
+                // F4: open file in editor/hex/parquet
                 let file_path = self.diff_panels[side].as_mut().and_then(|d| d.enter());
                 if let Some(path) = file_path {
-                    self.mode = AppMode::Editing(Box::new(crate::editor::EditorState::open(path)));
+                    self.open_file_for_edit(path);
                 }
             }
             Action::CursorRight => {
@@ -4789,9 +4761,16 @@ impl App {
             Action::None | Action::Tick | Action::Resize(_, _) => {}
             Action::TerminalInput(bytes) => {
                 if let Some(ref mut tp) = self.claude_panels[side] {
-                    // Auto-scroll to bottom when user types
+                    tp.clear_selection();
                     tp.scroll_to_bottom();
                     tp.write_bytes(&bytes);
+                }
+            }
+            Action::CopySelection => {
+                if let Some(ref tp) = self.claude_panels[side] {
+                    if let Some(len) = tp.copy_selection() {
+                        self.status_message = Some(format!("Copied {} chars", len));
+                    }
                 }
             }
             Action::SwitchPanel => self.handle_switch_panel(),
@@ -4807,7 +4786,12 @@ impl App {
             }
             Action::MouseClick(col, row) => {
                 if self.click_in_claude(col, row) {
-                    // Click inside Claude panel — stay focused
+                    let coords = self.claude_screen_coords(side, col, row);
+                    if let Some(ref mut tp) = self.claude_panels[side] {
+                        if let Some((sr, sc)) = coords {
+                            tp.click_select(sr, sc);
+                        }
+                    }
                 } else {
                     self.focus = PanelFocus::FilePanel;
                     self.handle_mouse_click(col, row);
@@ -4815,24 +4799,99 @@ impl App {
             }
             Action::MouseDoubleClick(col, row) => {
                 if self.click_in_claude(col, row) {
-                    // Double-click inside Claude panel — absorb
+                    let coords = self.claude_screen_coords(side, col, row);
+                    if let Some(ref mut tp) = self.claude_panels[side] {
+                        if let Some((sr, sc)) = coords {
+                            tp.select_word_at(sr, sc);
+                        }
+                    }
                 } else {
                     self.focus = PanelFocus::FilePanel;
                     self.handle_mouse_double_click(col, row);
                 }
             }
+            Action::MouseTripleClick(col, row) => {
+                if self.click_in_claude(col, row) {
+                    let coords = self.claude_screen_coords(side, col, row);
+                    if let Some(ref mut tp) = self.claude_panels[side] {
+                        if let Some((sr, _)) = coords {
+                            tp.select_line_at(sr);
+                        }
+                    }
+                } else {
+                    self.focus = PanelFocus::FilePanel;
+                    self.handle_mouse_click(col, row);
+                }
+            }
+            Action::MouseDrag(col, row) => {
+                // Clamp coords so drag outside panel extends selection to edge
+                let coords = self.claude_screen_coords_clamped(side, col, row);
+                if let Some(ref mut tp) = self.claude_panels[side] {
+                    if let Some((sr, sc)) = coords {
+                        tp.drag_select(sr, sc);
+                    }
+                }
+            }
+            Action::MouseShiftClick(col, row) => {
+                if self.click_in_claude(col, row) {
+                    let coords = self.claude_screen_coords(side, col, row);
+                    if let Some(ref mut tp) = self.claude_panels[side] {
+                        if let Some((sr, sc)) = coords {
+                            // Shift+click extends selection
+                            tp.drag_select(sr, sc);
+                        }
+                    }
+                }
+            }
             Action::MouseScrollUp(_, _) => {
                 if let Some(ref mut tp) = self.claude_panels[side] {
+                    tp.clear_selection();
                     tp.scroll_up(3);
                 }
             }
             Action::MouseScrollDown(_, _) => {
                 if let Some(ref mut tp) = self.claude_panels[side] {
+                    tp.clear_selection();
                     tp.scroll_down(3);
                 }
             }
             _ => {}
         }
+    }
+
+    /// Convert global screen coordinates to Claude panel inner (screen) coordinates.
+    /// Returns None if the position is outside the panel's inner area.
+    fn claude_screen_coords(&self, side: usize, col: u16, row: u16) -> Option<(u16, u16)> {
+        let area = self.claude_panel_areas[side]?;
+        let inner_x = area.x + 1;
+        let inner_y = area.y + 1;
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = area.height.saturating_sub(2);
+        if col < inner_x || row < inner_y {
+            return None;
+        }
+        let screen_col = col - inner_x;
+        let screen_row = row - inner_y;
+        if screen_col >= inner_w || screen_row >= inner_h {
+            return None;
+        }
+        Some((screen_row, screen_col))
+    }
+
+    /// Convert global screen coordinates to Claude panel inner coordinates, clamped to bounds.
+    /// Used for drag selection so the mouse can extend beyond the panel edge.
+    fn claude_screen_coords_clamped(&self, side: usize, col: u16, row: u16) -> Option<(u16, u16)> {
+        let area = self.claude_panel_areas[side]?;
+        let inner_x = area.x + 1;
+        let inner_y = area.y + 1;
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = area.height.saturating_sub(2);
+        if inner_w == 0 || inner_h == 0 {
+            return None;
+        }
+        let screen_col = col.saturating_sub(inner_x).min(inner_w - 1);
+        let screen_row = row.saturating_sub(inner_y).min(inner_h - 1);
+        Some((screen_row, screen_col))
     }
 
     fn click_in_claude(&self, col: u16, row: u16) -> bool {
@@ -5653,7 +5712,7 @@ impl App {
         }
         if matches!(
             self.mode,
-            AppMode::Viewing(_) | AppMode::HexViewing(_) | AppMode::ParquetViewing(_)
+            AppMode::HexViewing(_) | AppMode::ParquetViewing(_)
         ) {
             return;
         }
@@ -5842,14 +5901,6 @@ impl App {
 
     fn handle_mouse_scroll(&mut self, col: u16, row: u16, delta: i32) {
         match &mut self.mode {
-            AppMode::Viewing(v) => {
-                if delta < 0 {
-                    v.scroll_up((-delta) as usize);
-                } else {
-                    v.scroll_down(delta as usize);
-                }
-                return;
-            }
             AppMode::HexViewing(h) => {
                 if delta < 0 {
                     h.scroll_up((-delta) as usize);
@@ -6038,8 +6089,7 @@ impl App {
 
     fn handle_dialog_cancel(&mut self) {
         match &self.mode {
-            AppMode::Viewing(_)
-            | AppMode::HexViewing(_)
+            AppMode::HexViewing(_)
             | AppMode::ParquetViewing(_)
             | AppMode::DiffViewing(_) => {
                 self.mode = AppMode::Normal;

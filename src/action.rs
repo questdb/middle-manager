@@ -29,7 +29,6 @@ pub enum Action {
     Rename,
     CreateDir,
     Delete,
-    ViewFile,
     EditFile,
     Archive,
 
