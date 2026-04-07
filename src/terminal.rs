@@ -301,7 +301,7 @@ impl TerminalPanel {
                     cell.contents()
                         .chars()
                         .next()
-                        .map_or(false, |ch| ch.is_alphanumeric() || ch == '_')
+                        .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
                 })
                 .unwrap_or(false)
         };

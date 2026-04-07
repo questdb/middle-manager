@@ -144,7 +144,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     // Render goto-line prompt overlay if active
     if let Some(ref input) = app.goto_line_input {
-        render_goto_prompt(frame, input);
+        let title = if matches!(app.mode, AppMode::HexViewing(_)) {
+            " Go to Offset (hex) "
+        } else {
+            " Go to Line[:Col] "
+        };
+        render_goto_prompt(frame, input, title);
     }
 
     // Render quit confirmation overlay
@@ -321,6 +326,14 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
 fn render_hex_viewer(frame: &mut Frame, app: &mut App) {
     if let AppMode::HexViewing(ref mut hex) = app.mode {
         hex_view::render(frame, frame.area(), hex);
+    }
+    if let Some(ref state) = app.search_dialog {
+        let area = search_dialog::render(frame, state);
+        shadow::render_shadow(frame, area);
+    }
+    if let Some(focused) = app.unsaved_dialog {
+        let area = render_unsaved_dialog(frame, focused);
+        shadow::render_shadow(frame, area);
     }
 }
 
@@ -587,7 +600,7 @@ fn render_quit_dialog(frame: &mut Frame, quit_focused: bool) -> Rect {
     layout.outer
 }
 
-fn render_goto_prompt(frame: &mut Frame, input: &str) {
+fn render_goto_prompt(frame: &mut Frame, input: &str, title: &str) {
     let t = theme();
     let width: u16 = 36;
     let height: u16 = 3;
@@ -599,7 +612,7 @@ fn render_goto_prompt(frame: &mut Frame, input: &str) {
     frame.render_widget(Clear, rect);
 
     let block = Block::default()
-        .title(Span::styled(" Go to Line[:Col] ", t.dialog_title_style()))
+        .title(Span::styled(title, t.dialog_title_style()))
         .borders(Borders::ALL)
         .border_style(t.dialog_border_style())
         .style(t.dialog_bg_style());
