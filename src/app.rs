@@ -2111,6 +2111,9 @@ impl App {
             KeyCode::End => Action::MoveToBottom,
             KeyCode::Tab | KeyCode::F(4) => Action::Toggle, // switch text <-> hex
             KeyCode::Char('g') => Action::GotoLinePrompt,
+            KeyCode::Char('f') => Action::SearchPrompt,
+            KeyCode::Char('n') => Action::FindNext,
+            KeyCode::Char('b') => Action::FindPrev,
             KeyCode::Char('q') | KeyCode::Esc => Action::DialogCancel,
             _ => Action::None,
         }
@@ -2907,10 +2910,50 @@ impl App {
             | Action::WordLeft
             | Action::WordRight
             | Action::EditorUndo
-            | Action::EditorRedo
-            | Action::SearchPrompt
-            | Action::FindNext
-            | Action::FindPrev => {}
+            | Action::EditorRedo => {}
+
+            Action::SearchPrompt => {
+                if let AppMode::Viewing(ref v) = self.mode {
+                    let (query, direction, case_sensitive) = if let Some(ref s) = v.search {
+                        (s.query.clone(), SearchDirection::Forward, s.case_sensitive)
+                    } else if !self.persisted.search_query.is_empty() {
+                        let dir = if self.persisted.search_direction_forward {
+                            SearchDirection::Forward
+                        } else {
+                            SearchDirection::Backward
+                        };
+                        (
+                            self.persisted.search_query.clone(),
+                            dir,
+                            self.persisted.search_case_sensitive,
+                        )
+                    } else {
+                        (String::new(), SearchDirection::Forward, false)
+                    };
+                    let mut q = TextInput::new(query);
+                    q.select_all();
+                    self.search_dialog = Some(SearchDialogState {
+                        query: q,
+                        direction,
+                        case_sensitive,
+                        focused: SearchDialogField::Query,
+                    });
+                }
+            }
+            Action::FindNext => {
+                if let AppMode::Viewing(ref mut v) = self.mode {
+                    if v.search.is_some() {
+                        v.find_next();
+                    }
+                }
+            }
+            Action::FindPrev => {
+                if let AppMode::Viewing(ref mut v) = self.mode {
+                    if v.search.is_some() {
+                        v.find_prev();
+                    }
+                }
+            }
 
             // Panel multi-file selection
             Action::ToggleSelect => self.active_panel_mut().toggle_select_current(),
@@ -4486,6 +4529,19 @@ impl App {
         self.persisted.search_direction_forward =
             matches!(params.direction, SearchDirection::Forward);
         self.persisted.search_case_sensitive = params.case_sensitive;
+
+        // Viewer mode: use viewer search
+        if let AppMode::Viewing(ref mut v) = self.mode {
+            v.set_search(params.query.clone(), params.case_sensitive);
+            let found = match params.direction {
+                SearchDirection::Forward => v.find_next(),
+                SearchDirection::Backward => v.find_prev(),
+            };
+            if !found {
+                self.status_message = Some(format!("\"{}\" not found", params.query));
+            }
+            return;
+        }
 
         self.do_find(params, true);
     }

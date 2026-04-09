@@ -324,6 +324,10 @@ fn render_viewer(frame: &mut Frame, app: &mut App) {
     if let AppMode::Viewing(ref mut viewer) = app.mode {
         viewer_view::render(frame, frame.area(), viewer);
     }
+    if let Some(ref state) = app.search_dialog {
+        let area = search_dialog::render(frame, state);
+        shadow::render_shadow(frame, area);
+    }
 }
 
 fn render_hex_viewer(frame: &mut Frame, app: &mut App) {

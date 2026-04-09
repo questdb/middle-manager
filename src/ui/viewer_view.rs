@@ -34,6 +34,15 @@ pub fn render(frame: &mut Frame, area: Rect, viewer: &mut ViewerState) {
     let bg_style = Style::default().bg(t.bg);
     let line_num_style = Style::default().fg(t.viewer_line_num_fg).bg(t.bg);
     let text_style = Style::default().fg(t.viewer_text_fg).bg(t.bg);
+    let match_style = Style::default().fg(t.search_label_fg).bg(t.search_label_bg);
+
+    let search_info = viewer.search.as_ref().and_then(|s| {
+        if s.query.is_empty() {
+            None
+        } else {
+            Some((s.query.clone(), s.case_sensitive))
+        }
+    });
 
     let line_num_width: usize = 7; // "{:>6} " = 7 chars
     let text_width = inner_width.saturating_sub(line_num_width);
@@ -42,9 +51,13 @@ pub fn render(frame: &mut Frame, area: Rect, viewer: &mut ViewerState) {
     for (line_num, text) in visible.iter() {
         let num_span = Span::styled(format!("{:>6} ", line_num + 1), line_num_style);
         let display_text = sanitize_and_truncate(text, text_width);
-        let text_span = Span::styled(display_text, text_style);
 
-        let mut spans = vec![num_span, text_span];
+        let mut spans = vec![num_span];
+        if let Some((ref query, case_sensitive)) = search_info {
+            spans.extend(highlight_matches(&display_text, query, case_sensitive, text_style, match_style));
+        } else {
+            spans.push(Span::styled(display_text, text_style));
+        }
 
         let used: usize = spans.iter().map(|s| s.width()).sum();
         if used < inner_width {
@@ -74,7 +87,8 @@ pub fn render(frame: &mut Frame, area: Rect, viewer: &mut ViewerState) {
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, area);
 
-    let hint = " Scroll: Arrows/PgUp/Dn | Home/End | g: Go to | F4/Tab: Hex | q/Esc: Close ";
+    let hint =
+        " Arrows/PgUp/Dn | Home/End | g:Goto | f:Find n/b:Next/Prev | F4/Tab:Hex | q/Esc:Close ";
     let hint_area = Rect::new(
         area.x,
         area.y + area.height.saturating_sub(1),
@@ -88,6 +102,64 @@ pub fn render(frame: &mut Frame, area: Rect, viewer: &mut ViewerState) {
         )),
         hint_area,
     );
+}
+
+/// Build spans for a line, highlighting all occurrences of `query`.
+fn highlight_matches(
+    text: &str,
+    query: &str,
+    case_sensitive: bool,
+    normal_style: Style,
+    match_style: Style,
+) -> Vec<Span<'static>> {
+    if text.is_empty() {
+        return vec![Span::styled(String::new(), normal_style)];
+    }
+
+    let (search_text, search_query) = if case_sensitive {
+        (text.to_owned(), query.to_owned())
+    } else {
+        (text.to_lowercase(), query.to_lowercase())
+    };
+
+    let mut spans = Vec::new();
+    let mut last_end = 0;
+    let mut pos = 0;
+
+    while pos < search_text.len() {
+        if let Some(offset) = search_text[pos..].find(&search_query) {
+            let match_start = pos + offset;
+            let match_end = match_start + search_query.len();
+
+            // Clamp to original text length (lowering can change byte length)
+            let ms = match_start.min(text.len());
+            let me = match_end.min(text.len());
+            let le = last_end.min(text.len());
+
+            if ms > le {
+                spans.push(Span::styled(text[le..ms].to_owned(), normal_style));
+            }
+            if me > ms {
+                spans.push(Span::styled(text[ms..me].to_owned(), match_style));
+            }
+
+            last_end = match_end;
+            pos = match_end;
+        } else {
+            break;
+        }
+    }
+
+    let le = last_end.min(text.len());
+    if le < text.len() {
+        spans.push(Span::styled(text[le..].to_owned(), normal_style));
+    }
+
+    if spans.is_empty() {
+        spans.push(Span::styled(text.to_owned(), normal_style));
+    }
+
+    spans
 }
 
 /// Expand tabs to spaces, strip control characters, and truncate to `max_width` display cells.

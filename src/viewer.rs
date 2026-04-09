@@ -10,6 +10,14 @@ const INDEX_INTERVAL: usize = 1000;
 const BUFFER_MARGIN: usize = 500;
 
 #[derive(Clone)]
+pub struct ViewerSearch {
+    pub query: String,
+    pub case_sensitive: bool,
+    /// (global_line, byte_column) of the current match.
+    pub current_match: Option<(usize, usize)>,
+}
+
+#[derive(Clone)]
 pub struct ViewerState {
     pub path: PathBuf,
 
@@ -32,6 +40,9 @@ pub struct ViewerState {
     pub visible_lines: usize,
 
     pub error: Option<String>,
+
+    /// Active search state.
+    pub search: Option<ViewerSearch>,
 }
 
 impl ViewerState {
@@ -47,6 +58,7 @@ impl ViewerState {
             scroll_offset: 0,
             visible_lines: 0,
             error: None,
+            search: None,
         };
 
         // Load the initial buffer (first BUFFER_LINES lines).
@@ -282,5 +294,182 @@ impl ViewerState {
     fn nearest_index_before(&self, line: usize) -> (usize, u64) {
         let idx = (line / INDEX_INTERVAL).min(self.line_index.len() - 1);
         (idx * INDEX_INTERVAL, self.line_index[idx])
+    }
+
+    // --- Search ----------------------------------------------------------------
+
+    pub fn set_search(&mut self, query: String, case_sensitive: bool) {
+        self.search = Some(ViewerSearch {
+            query,
+            case_sensitive,
+            current_match: None,
+        });
+    }
+
+    /// Find the next match after the current one (wraps around).
+    pub fn find_next(&mut self) -> bool {
+        let (query, case_sensitive) = match &self.search {
+            Some(s) if !s.query.is_empty() => (s.query.clone(), s.case_sensitive),
+            _ => return false,
+        };
+        let lower_query = query.to_lowercase();
+
+        let (start_line, start_byte) = match self.search.as_ref().unwrap().current_match {
+            Some((line, col)) => {
+                let advance = if case_sensitive {
+                    query.len()
+                } else {
+                    lower_query.len()
+                };
+                (line, col + advance)
+            }
+            None => (self.scroll_offset, 0),
+        };
+
+        // Phase 1: search forward from start to EOF.
+        if let Some(m) =
+            self.search_fwd(&query, &lower_query, case_sensitive, start_line, start_byte)
+        {
+            self.goto_match(m);
+            return true;
+        }
+        // Phase 2: wrap — search from beginning.
+        if start_line > 0 || start_byte > 0 {
+            if let Some(m) = self.search_fwd(&query, &lower_query, case_sensitive, 0, 0) {
+                self.goto_match(m);
+                return true;
+            }
+        }
+        false
+    }
+
+    /// Find the previous match before the current one (wraps around).
+    pub fn find_prev(&mut self) -> bool {
+        let (query, case_sensitive) = match &self.search {
+            Some(s) if !s.query.is_empty() => (s.query.clone(), s.case_sensitive),
+            _ => return false,
+        };
+        let lower_query = query.to_lowercase();
+
+        let (start_line, start_byte) = match self.search.as_ref().unwrap().current_match {
+            Some((line, col)) => (line, col),
+            None => (self.scroll_offset, usize::MAX),
+        };
+
+        // Phase 1: search backward from start to line 0.
+        if let Some(m) =
+            self.search_bwd(&query, &lower_query, case_sensitive, start_line, start_byte)
+        {
+            self.goto_match(m);
+            return true;
+        }
+        // Phase 2: wrap — search backward from end of file.
+        self.scan_to_end();
+        if self.lines_scanned > 0 {
+            if let Some(m) = self.search_bwd(
+                &query,
+                &lower_query,
+                case_sensitive,
+                self.lines_scanned - 1,
+                usize::MAX,
+            ) {
+                self.goto_match(m);
+                return true;
+            }
+        }
+        false
+    }
+
+    fn goto_match(&mut self, m: (usize, usize)) {
+        if let Some(ref mut s) = self.search {
+            s.current_match = Some(m);
+        }
+        if m.0 < self.scroll_offset || m.0 >= self.scroll_offset + self.visible_lines {
+            self.scroll_offset = m.0.saturating_sub(self.visible_lines / 3);
+        }
+        self.ensure_buffer_covers_viewport();
+    }
+
+    fn search_fwd(
+        &mut self,
+        query: &str,
+        lower_query: &str,
+        case_sensitive: bool,
+        from_line: usize,
+        from_byte: usize,
+    ) -> Option<(usize, usize)> {
+        let mut line = from_line;
+        loop {
+            if line >= self.lines_scanned && !self.scan_complete {
+                self.scan_to_line(line + BUFFER_LINES);
+            }
+            if line >= self.lines_scanned {
+                return None;
+            }
+            if line < self.buffer_first_line
+                || self.buffer.is_empty()
+                || line >= self.buffer_first_line + self.buffer.len()
+            {
+                self.load_buffer_at_line(line);
+            }
+            let buf_end = self.buffer_first_line + self.buffer.len();
+            while line < buf_end {
+                let text = &self.buffer[line - self.buffer_first_line];
+                let start = if line == from_line { from_byte } else { 0 };
+                let col = if case_sensitive {
+                    let s = start.min(text.len());
+                    text.get(s..).and_then(|t| t.find(query)).map(|p| s + p)
+                } else {
+                    let lower = text.to_lowercase();
+                    let s = start.min(lower.len());
+                    lower
+                        .get(s..)
+                        .and_then(|t| t.find(lower_query))
+                        .map(|p| s + p)
+                };
+                if let Some(col) = col {
+                    return Some((line, col));
+                }
+                line += 1;
+            }
+        }
+    }
+
+    fn search_bwd(
+        &mut self,
+        query: &str,
+        lower_query: &str,
+        case_sensitive: bool,
+        from_line: usize,
+        from_byte: usize,
+    ) -> Option<(usize, usize)> {
+        let mut line = from_line;
+        loop {
+            if line < self.buffer_first_line
+                || self.buffer.is_empty()
+                || line >= self.buffer_first_line + self.buffer.len()
+            {
+                self.load_buffer_at_line(line.saturating_sub(BUFFER_LINES / 2));
+            }
+            if line >= self.buffer_first_line && line < self.buffer_first_line + self.buffer.len() {
+                let text = &self.buffer[line - self.buffer_first_line];
+                let end = if line == from_line { from_byte } else { usize::MAX };
+                let col = if case_sensitive {
+                    let e = end.min(text.len());
+                    text.get(..e).and_then(|t| t.rfind(query))
+                } else {
+                    let lower = text.to_lowercase();
+                    let e = end.min(lower.len());
+                    lower.get(..e).and_then(|t| t.rfind(lower_query))
+                };
+                if let Some(col) = col {
+                    return Some((line, col));
+                }
+            }
+            if line == 0 {
+                return None;
+            }
+            line -= 1;
+        }
     }
 }
