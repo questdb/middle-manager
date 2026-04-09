@@ -120,6 +120,8 @@ pub struct App {
     pub archive_progress: Option<ArchiveProgress>,
     /// Stashed diff viewer context for F4 editor↔diff toggle.
     pub stashed_diff: Option<StashedDiff>,
+    /// Stashed focus to restore when exiting editor (e.g. back to CI panel).
+    pub stashed_focus: Option<PanelFocus>,
 }
 
 pub struct StashedDiff {
@@ -994,6 +996,7 @@ impl App {
             dialog_content_area: None,
             archive_progress: None,
             stashed_diff: None,
+            stashed_focus: None,
         }
     }
 
@@ -2267,14 +2270,15 @@ impl App {
         }
 
         // Poll CI panels for async results and downloads
-        for ci in self.ci_panels.iter_mut().flatten() {
+        for (side, ci) in self.ci_panels.iter_mut().enumerate() {
+            let Some(ci) = ci else { continue };
             ci.poll();
             if let Some(result) = ci.poll_download() {
                 match result {
                     Ok(path) => {
-                        if matches!(self.focus, PanelFocus::Ci(_)) {
-                            self.focus = PanelFocus::FilePanel;
-                        }
+                        // Remember the CI focus so we can restore it when the editor closes.
+                        self.stashed_focus = Some(PanelFocus::Ci(side));
+                        self.focus = PanelFocus::FilePanel;
                         self.mode =
                             AppMode::Editing(Box::new(crate::editor::EditorState::open(path)));
                         return;
@@ -6110,7 +6114,7 @@ impl App {
             self.mode = AppMode::DiffViewing(Box::new(dv));
         } else {
             self.mode = AppMode::Normal;
-            self.focus = PanelFocus::FilePanel;
+            self.focus = self.stashed_focus.take().unwrap_or(PanelFocus::FilePanel);
         }
         self.needs_clear = true;
     }
