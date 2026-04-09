@@ -2186,6 +2186,8 @@ impl App {
                 KeyCode::Char('c') => Action::CopySelection,
                 KeyCode::Char('a') => Action::SelectAll,
                 KeyCode::Char('f') => Action::SearchPrompt,
+                KeyCode::Char('n') => Action::FindNext,
+                KeyCode::Char('p') => Action::FindPrev,
                 KeyCode::Char('z') if shift => Action::EditorRedo,
                 KeyCode::Char('z') => Action::EditorUndo,
                 KeyCode::Char('g') => Action::GotoLinePrompt,
@@ -2907,7 +2909,8 @@ impl App {
             | Action::EditorUndo
             | Action::EditorRedo
             | Action::SearchPrompt
-            | Action::FindNext => {}
+            | Action::FindNext
+            | Action::FindPrev => {}
 
             // Panel multi-file selection
             Action::ToggleSelect => self.active_panel_mut().toggle_select_current(),
@@ -4164,14 +4167,19 @@ impl App {
                     focused: SearchDialogField::Query,
                 });
             }
-            Action::FindNext => {
+            Action::FindNext | Action::FindPrev => {
                 let params = if let AppMode::Editing(ref e) = self.mode {
                     e.last_search.clone()
                 } else {
                     None
                 };
-                if let Some(params) = params {
-                    self.do_find(params);
+                if let Some(mut params) = params {
+                    params.direction = if action == Action::FindNext {
+                        SearchDirection::Forward
+                    } else {
+                        SearchDirection::Backward
+                    };
+                    self.do_find(params, false);
                 } else if let AppMode::Editing(ref mut e) = self.mode {
                     e.status_msg = Some("No previous search".to_string());
                 }
@@ -4479,13 +4487,17 @@ impl App {
             matches!(params.direction, SearchDirection::Forward);
         self.persisted.search_case_sensitive = params.case_sensitive;
 
-        self.do_find(params);
+        self.do_find(params, true);
     }
 
     /// Run a non-wrapping search. If not found, show the wrap confirmation dialog.
-    fn do_find(&mut self, params: crate::editor::SearchParams) {
+    /// When `save` is true, updates `last_search` (used by the dialog). FindNext/FindPrev
+    /// pass false so they don't overwrite the dialog's direction setting.
+    fn do_find(&mut self, params: crate::editor::SearchParams, save: bool) {
         if let AppMode::Editing(ref mut e) = self.mode {
-            e.last_search = Some(params.clone());
+            if save {
+                e.last_search = Some(params.clone());
+            }
             if !e.find(&params) {
                 // Not found in current direction — offer to wrap
                 self.search_wrap_dialog = Some(SearchWrapDialog {
