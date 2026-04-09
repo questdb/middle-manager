@@ -2098,7 +2098,11 @@ impl App {
     }
 
     fn map_viewer_key(&self, key: KeyEvent) -> Action {
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
+            // Opt+a/e on Mac → top/bottom of file (reliable across all terminals)
+            KeyCode::Char('a') if alt => Action::MoveToTop,
+            KeyCode::Char('e') if alt => Action::MoveToBottom,
             KeyCode::Up => Action::MoveUp,
             KeyCode::Down => Action::MoveDown,
             KeyCode::PageUp => Action::PageUp,
@@ -2151,7 +2155,11 @@ impl App {
     }
 
     fn map_parquet_key(&self, key: KeyEvent) -> Action {
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
+            // Opt+a/e on Mac → top/bottom of file (reliable across all terminals)
+            KeyCode::Char('a') if alt => Action::MoveToTop,
+            KeyCode::Char('e') if alt => Action::MoveToBottom,
             KeyCode::Up => Action::MoveUp,
             KeyCode::Down => Action::MoveDown,
             KeyCode::Left => Action::CursorLeft,
@@ -2201,6 +2209,9 @@ impl App {
             // Opt+Left/Right on Mac → sends Alt+b/Alt+f (readline-style)
             KeyCode::Char('b') if alt => Action::WordLeft,
             KeyCode::Char('f') if alt => Action::WordRight,
+            // Opt+a/e on Mac → top/bottom of file (reliable across all terminals)
+            KeyCode::Char('a') if alt => Action::MoveToTop,
+            KeyCode::Char('e') if alt => Action::MoveToBottom,
             KeyCode::Up if shift => Action::SelectUp,
             KeyCode::Down if shift => Action::SelectDown,
             KeyCode::Left if shift => Action::SelectLeft,
