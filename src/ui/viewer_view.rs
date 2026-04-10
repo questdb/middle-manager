@@ -54,7 +54,13 @@ pub fn render(frame: &mut Frame, area: Rect, viewer: &mut ViewerState) {
 
         let mut spans = vec![num_span];
         if let Some((ref query, case_sensitive)) = search_info {
-            spans.extend(highlight_matches(&display_text, query, case_sensitive, text_style, match_style));
+            spans.extend(highlight_matches(
+                &display_text,
+                query,
+                case_sensitive,
+                text_style,
+                match_style,
+            ));
         } else {
             spans.push(Span::styled(display_text, text_style));
         }

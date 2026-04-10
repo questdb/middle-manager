@@ -453,7 +453,11 @@ impl ViewerState {
             }
             if line >= self.buffer_first_line && line < self.buffer_first_line + self.buffer.len() {
                 let text = &self.buffer[line - self.buffer_first_line];
-                let end = if line == from_line { from_byte } else { usize::MAX };
+                let end = if line == from_line {
+                    from_byte
+                } else {
+                    usize::MAX
+                };
                 let col = if case_sensitive {
                     let e = end.min(text.len());
                     text.get(..e).and_then(|t| t.rfind(query))
