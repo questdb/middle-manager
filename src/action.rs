@@ -29,9 +29,9 @@ pub enum Action {
     Rename,
     CreateDir,
     Delete,
-    ViewFile,
     EditFile,
     Archive,
+    CalcSize,
 
     // Sorting
     CycleSort,

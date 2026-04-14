@@ -2,7 +2,7 @@
 
 A dual-panel file manager for the terminal, inspired by [Far Manager](https://www.farmanager.com/) and Norton Commander. Built in Rust with [ratatui](https://ratatui.rs/).
 
-Designed to handle **very large files** — the viewer, hex viewer, and editor all use sliding buffers and lazy scanning, so opening a 10 GB log file is instant.
+Designed to handle **very large files** — the hex editor and text editor both use sliding buffers and lazy scanning, so opening a 10 GB log file is instant.
 
 <img width="2051" height="1252" alt="image" src="https://github.com/user-attachments/assets/948abfb3-d7b2-49bc-9b4d-fa90397f7b7f" />
 
@@ -12,6 +12,7 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 **File Manager**
 - Dual-panel layout with directory listings (name, size, date, permissions)
 - File operations: copy (F5), move (F6), rename (Shift+F6), mkdir (F7), delete (F8), archive (Shift+F5)
+- Directory size calculation (F3) — async recursive scan with live progress, works on selections
 - Multi-file selection with Shift+Up/Down (toggle) and Insert key for batch operations
 - Far Manager-style dialogs with keyboard navigation (copy, mkdir, delete, rename)
 - Quick search — just start typing to jump to a file, Enter to open
@@ -53,6 +54,8 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Spawns your default `$SHELL` at the bottom of the active panel
 - Full PTY emulation — colors, cursor, scrollback all work
 - Independent per-side (left and right panels can each have their own shell)
+- Text selection: click-drag, double-click (word), triple-click (line)
+- Ctrl+C copies selection to clipboard (sends SIGINT when no selection)
 - Alt+Up/Down to resize split, Alt+Enter to maximize/restore
 - F1 switches focus back to file panel, Ctrl+O closes
 - Auto-closes when the shell exits
@@ -66,11 +69,11 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Symlink-safe traversal, collision resolution, UTF-8 safe naming
 
 **Parquet Viewer**
-- Auto-detected when opening `.parquet` files (F3 / Enter)
+- Auto-detected when opening `.parquet` files (F4 / Enter)
 - Tree view: file metadata, key-value metadata (JSON pretty-printed), schema, row groups with column details
 - Column statistics: null count, distinct count, min/max values formatted with logical types
 - Tabular alignment for schema fields, column info, and metadata keys
-- Table view (Tab / F4): scrollable data grid with row group lazy loading
+- Table view (Tab): scrollable data grid with row group lazy loading
 - Encoding names displayed as `Plain`, `RleDictionary`, `DeltaBinaryPacked`, etc.
 - Handles pre-epoch timestamps correctly
 
@@ -79,6 +82,8 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Full PTY emulation via custom VT terminal emulator — colors, cursor, alternate screen all work
 - All keystrokes (including Tab) forwarded to Claude Code
 - 10,000-line scrollback buffer with trackpad/mouse scroll (like Ghostty/iTerm2)
+- Text selection: click-drag, double-click (word), triple-click (line)
+- Ctrl+C copies selection to clipboard (sends SIGINT when no selection)
 - F5 opens file:line references from terminal output in the built-in editor
 - F1 switches focus back to file panel, F12 closes
 - Restored on restart with `claude -c` (continues last session)
@@ -86,20 +91,25 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Coalescing wakeup mechanism — terminal output renders immediately without flooding the event loop
 - Zero-allocation render loop with direct buffer writes
 
-**Text Viewer (F3 / Enter)**
-- Sliding buffer: only ~10K lines in memory at a time
-- Sparse line index for instant seeking to any position
-- Opens multi-GB files instantly, scrolls smoothly
-- Go-to-line with `g` — supports `line` or `line:col` format
-- Tab expansion and control character sanitization
-
-**Hex Viewer**
-- Auto-detects binary files (null byte check)
+**Hex Editor (F4 / Enter on binary files)**
+- Auto-detects binary files (null byte check in first 8 KB)
 - VS Code-style layout: offset | hex bytes | ASCII decode
 - 256 KB sliding buffer for arbitrarily large binaries
-- Toggle between text and hex with Tab or F4
+- Cursor navigation with arrow keys, Home/End, PgUp/PgDn
+- Edit hex nibbles (0-9, A-F) or ASCII characters (Tab to switch sides)
+- Modifications stored as in-place overlay — only changed bytes in memory
+- Save writes only modified bytes (sorted sequential I/O)
+- Undo/redo (Ctrl+Z / Ctrl+Shift+Z) per-nibble
+- Search hex patterns (F7) with forward/backward, wrap-around
+- Go to offset (g) with hex address input
+- Selection with Shift+arrows, Ctrl+A select all, Ctrl+C copy
+- Data inspector: select 1/2/4/8 bytes to see decimal values in both endiannesses (u/i/float)
+- Cursor tracking: hex and ASCII panes mirror cursor position
+- Mouse click to position cursor in hex or ASCII pane
+- Unsaved changes prompt on close
+- Zero-allocation render loop with pre-computed lookup tables
 
-**Built-in Editor (F4)**
+**Built-in Editor (F4 / Enter on text files)**
 - Line-level piece table — only edited lines live in memory
 - Opens and navigates multi-GB files with no delay
 - Tree-sitter syntax highlighting for Rust, Java, Python, JavaScript/TypeScript, JSON, Go, C, Bash, TOML
@@ -180,7 +190,7 @@ cargo build --release
 | Insert | Toggle selection on current item |
 | Left / Home | Jump to top |
 | Right / End | Jump to bottom |
-| Enter | Open directory / view file |
+| Enter | Open directory / open file (editor / hex / parquet) |
 | Backspace | Go to parent directory |
 | Tab | Switch panel forward (cycles through CI/terminal panels) |
 | Shift+Tab | Switch panel backward |
@@ -191,8 +201,8 @@ cargo build --release
 | Ctrl+O | Toggle shell panel |
 | Ctrl+P | Copy full path to clipboard |
 | F2 | Toggle CI panel |
-| F3 | View file |
-| F4 | Edit file (built-in) |
+| F3 | Calculate directory / selection size |
+| F4 | Open file (editor / hex / parquet) |
 | Shift+F4 | Edit file ($EDITOR) |
 | F5 | Copy (operates on selection if active) |
 | Shift+F5 | Create archive (tar.zst/gz/xz/zip) |
@@ -228,6 +238,9 @@ cargo build --release
 | Key | Action |
 |-----|--------|
 | All keys (incl. Tab) | Forwarded to the shell |
+| Mouse drag | Select text |
+| Double-click / Triple-click | Select word / line |
+| Ctrl+C | Copy selection (or SIGINT if none) |
 | Scroll / Trackpad | Scroll through scrollback buffer |
 | Alt+Up / Alt+Down | Resize panel split |
 | Alt+Enter | Maximize / restore panel |
@@ -240,6 +253,9 @@ cargo build --release
 | Key | Action |
 |-----|--------|
 | All keys (incl. Tab) | Forwarded to Claude Code |
+| Mouse drag | Select text |
+| Double-click / Triple-click | Select word / line |
+| Ctrl+C | Copy selection (or SIGINT if none) |
 | Scroll / Trackpad | Scroll through scrollback buffer |
 | F5 | Open file:line reference in editor |
 | F1 | Switch focus to file panel |
@@ -276,16 +292,27 @@ cargo build --release
 | Delete | Delete forward |
 | Mouse click | Focus input field |
 
-### Viewer / Hex Viewer
+### Hex Editor
 
 | Key | Action |
 |-----|--------|
-| Up / Down | Scroll |
-| PgUp / PgDn | Scroll by page |
-| Home / End | Top / bottom |
-| g | Go to line |
-| Tab / F4 | Toggle text / hex |
-| q / Esc | Close |
+| Arrow keys | Move cursor |
+| Home / End | Start / end of row |
+| Ctrl+Home / Ctrl+End | Start / end of file |
+| PgUp / PgDn | Page through file |
+| 0-9, A-F | Edit hex nibble |
+| Tab | Switch hex / ASCII editing |
+| Shift+arrows | Select bytes |
+| Ctrl+A | Select all |
+| Ctrl+C | Copy selection |
+| g / Ctrl+G | Go to offset (hex) |
+| F7 / Ctrl+F | Search hex pattern |
+| n / N | Find next / previous |
+| Ctrl+S / F2 | Save |
+| Ctrl+Z / Ctrl+Shift+Z | Undo / Redo |
+| Mouse click | Position cursor (hex or ASCII pane) |
+| q / Esc | Close (prompts if unsaved) |
+| F10 | Quit (with confirmation) |
 
 ### Parquet Viewer
 
@@ -296,7 +323,7 @@ cargo build --release
 | Left | Collapse node / jump to parent |
 | PgUp / PgDn | Page through tree or table |
 | Home / End | Jump to top / bottom |
-| Tab / F4 | Toggle tree / table view |
+| Tab | Toggle tree / table view |
 | g | Go to row |
 | q / Esc | Close |
 
@@ -342,8 +369,7 @@ src/
   syntax.rs         Tree-sitter syntax highlighting with hybrid caching
   theme.rs          Centralized color scheme (panel, editor, git, syntax, dialog)
   editor.rs         Built-in editor with line-level piece table and streaming search
-  viewer.rs         Text viewer with sliding buffer
-  hex_viewer.rs     Hex viewer with sliding buffer
+  hex_viewer.rs     Hex editor with sliding buffer, modifications overlay, undo/redo, search
   watcher.rs        Filesystem watcher (kqueue/inotify via notify crate)
   panel/
     mod.rs          Panel state, directory reading, navigation, multi-file selection
@@ -377,8 +403,7 @@ src/
     copy_dialog.rs  Far Manager-style copy/move dialog
     search_dialog.rs  Editor search dialog (query, direction, case sensitivity)
     editor_view.rs  Editor rendering with syntax highlighting and selection
-    viewer_view.rs  Text viewer rendering with tab expansion
-    hex_view.rs     Hex viewer rendering
+    hex_view.rs     Hex editor rendering with zero-allocation lookup tables
     parquet_view.rs Parquet viewer rendering (tree + table modes)
     archive_dialog.rs  Archive format picker dialog
     shadow.rs       Transparent dialog drop shadows
@@ -394,9 +419,8 @@ The CI panel fetches data **asynchronously** — check lists, step details, and 
 
 This project is in early development. Things we're considering:
 
-- [ ] Search in viewer (F3)
-- [ ] Syntax highlighting in viewer
 - [x] Undo/redo in editor
+- [x] Hex editor with search, undo/redo, data inspector
 - [ ] File permissions dialog
 - [ ] Configurable key bindings
 - [ ] Multiple color schemes

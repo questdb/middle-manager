@@ -17,7 +17,6 @@ mod terminal;
 mod text_input;
 mod theme;
 mod ui;
-mod viewer;
 mod vt;
 mod watcher;
 

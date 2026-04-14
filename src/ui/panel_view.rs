@@ -436,7 +436,7 @@ pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool)
             }
 
             cells.push(Cell::from(name_display).style(name_style));
-            cells.push(Cell::from(entry.formatted_size()).style(meta_style));
+            cells.push(Cell::from(panel.display_size(entry)).style(meta_style));
             cells.push(Cell::from(entry.formatted_date()).style(if is_selected {
                 t.selected_style()
             } else {
