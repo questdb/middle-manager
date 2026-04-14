@@ -116,6 +116,13 @@ pub struct Theme {
     pub diff_deleted_bg: Color,
     pub diff_changed_old_bg: Color,
     pub diff_changed_new_bg: Color,
+    // Overwrite dialog
+    pub overwrite_bg: Color,
+    pub overwrite_border_fg: Color,
+    pub overwrite_title_fg: Color,
+    pub overwrite_text_fg: Color,
+    pub overwrite_btn_active_fg: Color,
+    pub overwrite_btn_active_bg: Color,
     // Git
     pub git_modified_fg: Color,
     pub git_added_fg: Color,
@@ -192,6 +199,12 @@ impl Theme {
             syn_property: Color::LightCyan,
             syn_escape: Color::LightRed,
             syn_constructor: Color::Yellow,
+            overwrite_bg: Color::Rgb(110, 0, 0),
+            overwrite_border_fg: Color::White,
+            overwrite_title_fg: Color::White,
+            overwrite_text_fg: Color::White,
+            overwrite_btn_active_fg: Color::Black,
+            overwrite_btn_active_bg: Color::White,
             diff_added_bg: Color::Rgb(0, 50, 0),
             diff_deleted_bg: Color::Rgb(80, 0, 0),
             diff_changed_old_bg: Color::Rgb(80, 40, 0),
@@ -281,6 +294,12 @@ impl Theme {
             syn_constructor: pink_light,
             editor_text_fg: text,
             editor_cursor: SetCursorStyle::BlinkingBar,
+            overwrite_bg: Color::Rgb(80, 0, 30),
+            overwrite_border_fg: rose,
+            overwrite_title_fg: pink_light,
+            overwrite_text_fg: text,
+            overwrite_btn_active_fg: Color::Rgb(26, 21, 32),
+            overwrite_btn_active_bg: pink_light,
             diff_added_bg: Color::Rgb(0, 50, 0),
             diff_deleted_bg: Color::Rgb(50, 0, 0),
             diff_changed_old_bg: Color::Rgb(80, 40, 0),
@@ -374,6 +393,23 @@ impl Theme {
     #[allow(dead_code)]
     pub fn dialog_text_style(&self) -> Style {
         Style::default().fg(self.dialog_text_fg).bg(self.dialog_bg)
+    }
+
+    pub fn overwrite_bg_style(&self) -> Style {
+        Style::default().bg(self.overwrite_bg)
+    }
+
+    pub fn overwrite_border_style(&self) -> Style {
+        Style::default()
+            .fg(self.overwrite_border_fg)
+            .bg(self.overwrite_bg)
+    }
+
+    pub fn overwrite_title_style(&self) -> Style {
+        Style::default()
+            .fg(self.overwrite_title_fg)
+            .bg(self.overwrite_bg)
+            .add_modifier(Modifier::BOLD)
     }
 }
 

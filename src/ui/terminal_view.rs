@@ -47,6 +47,7 @@ pub fn render(frame: &mut Frame, area: Rect, tp: &TerminalPanel, is_active: bool
                 None => continue,
             };
 
+            let selected = tp.is_selected(screen_row, screen_col);
             let vt_cell = row_cells.and_then(|r| r.get(col));
 
             match vt_cell {
@@ -54,20 +55,37 @@ pub fn render(frame: &mut Frame, area: Rect, tp: &TerminalPanel, is_active: bool
                     // ratatui handles wide chars via the first cell's width;
                     // set continuation cell to empty so it doesn't overwrite.
                     buf_cell.set_symbol("");
-                    buf_cell.set_style(cell_style(cell));
+                    let mut style = cell_style(cell);
+                    if selected {
+                        style = style.add_modifier(Modifier::REVERSED);
+                    }
+                    buf_cell.set_style(style);
                 }
                 Some(cell) if cell.has_contents() => {
                     buf_cell.set_symbol(cell.contents());
-                    buf_cell.set_style(cell_style(cell));
+                    let mut style = cell_style(cell);
+                    if selected {
+                        style = style.add_modifier(Modifier::REVERSED);
+                    }
+                    buf_cell.set_style(style);
                 }
                 Some(cell) => {
                     buf_cell.set_symbol(" ");
-                    buf_cell.set_style(cell_style(cell));
+                    let mut style = cell_style(cell);
+                    if selected {
+                        style = style.add_modifier(Modifier::REVERSED);
+                    }
+                    buf_cell.set_style(style);
                 }
                 None => {
                     if col < width {
                         buf_cell.set_symbol(" ");
-                        buf_cell.set_style(Style::default());
+                        let style = if selected {
+                            Style::default().add_modifier(Modifier::REVERSED)
+                        } else {
+                            Style::default()
+                        };
+                        buf_cell.set_style(style);
                     }
                 }
             }

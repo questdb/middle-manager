@@ -3,9 +3,11 @@ pub mod git;
 pub mod github;
 pub mod sort;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 
 use ratatui::widgets::TableState;
 
@@ -36,6 +38,19 @@ impl PanelSource {
     }
 }
 
+/// State of a directory size calculation.
+#[derive(Clone)]
+pub enum DirSizeState {
+    /// Background scan in progress. Accumulator holds bytes counted so far.
+    Calculating {
+        accumulator: Arc<AtomicU64>,
+        finished: Arc<AtomicBool>,
+        cancelled: Arc<AtomicBool>,
+    },
+    /// Scan complete.
+    Done(u64),
+}
+
 pub struct Panel {
     pub current_dir: PathBuf,
     pub entries: Vec<FileEntry>,
@@ -47,6 +62,10 @@ pub struct Panel {
     pub selected_indices: BTreeSet<usize>,
     pub git_info: Option<git::GitInfo>,
     pub source: PanelSource,
+    /// Calculated directory sizes (persists until panel reload).
+    pub dir_sizes: HashMap<PathBuf, DirSizeState>,
+    /// Pending F3 size total: (dir paths to wait for, file bytes already summed, file count, dir count).
+    pub pending_size_total: Option<(Vec<PathBuf>, u64, usize, usize)>,
 }
 
 impl Panel {
@@ -62,6 +81,8 @@ impl Panel {
             selected_indices: BTreeSet::new(),
             git_info: None,
             source: PanelSource::Local,
+            dir_sizes: HashMap::new(),
+            pending_size_total: None,
         };
         panel.reload();
         if !panel.entries.is_empty() {
@@ -101,6 +122,9 @@ impl Panel {
 
         self.entries.clear();
         self.selected_indices.clear();
+        self.cancel_size_calcs();
+        self.dir_sizes.clear();
+        self.pending_size_total = None;
         self.error = None;
 
         // Add parent directory entry
@@ -177,9 +201,19 @@ impl Panel {
             .unwrap_or(false);
 
         if has_parent && self.entries.len() > 1 {
-            sort_entries(&mut self.entries[1..], self.sort_field, self.sort_ascending);
+            sort_entries(
+                &mut self.entries[1..],
+                self.sort_field,
+                self.sort_ascending,
+                &self.dir_sizes,
+            );
         } else {
-            sort_entries(&mut self.entries, self.sort_field, self.sort_ascending);
+            sort_entries(
+                &mut self.entries,
+                self.sort_field,
+                self.sort_ascending,
+                &self.dir_sizes,
+            );
         }
 
         // Rebuild selected indices from paths
@@ -197,6 +231,13 @@ impl Panel {
         self.table_state
             .selected()
             .and_then(|i| self.entries.get(i))
+    }
+
+    /// Move cursor to the entry with the given name, if found.
+    pub fn select_by_name(&mut self, name: &str) {
+        if let Some(idx) = self.entries.iter().position(|e| e.name == name) {
+            self.table_state.select(Some(idx));
+        }
     }
 
     pub fn selected_index(&self) -> usize {
@@ -331,5 +372,258 @@ impl Panel {
         } else {
             Vec::new()
         }
+    }
+
+    // --- Directory size calculation ---
+
+    /// Start an async directory size calculation for the given path.
+    /// Returns false if already calculating or done.
+    pub fn start_size_calc(&mut self, path: PathBuf) -> bool {
+        if self.dir_sizes.contains_key(&path) {
+            return false;
+        }
+        let accumulator = Arc::new(AtomicU64::new(0));
+        let finished = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let acc = accumulator.clone();
+        let fin = finished.clone();
+        let can = cancelled.clone();
+        let p = path.clone();
+        std::thread::spawn(move || {
+            calc_dir_size_recursive(&p, &acc, &can);
+            fin.store(true, Ordering::Release);
+        });
+        self.dir_sizes.insert(
+            path,
+            DirSizeState::Calculating {
+                accumulator,
+                finished,
+                cancelled,
+            },
+        );
+        true
+    }
+
+    /// Signal all in-progress size calculations to stop.
+    fn cancel_size_calcs(&self) {
+        for state in self.dir_sizes.values() {
+            if let DirSizeState::Calculating { cancelled, .. } = state {
+                cancelled.store(true, Ordering::Release);
+            }
+        }
+    }
+
+    /// Poll in-progress calculations and promote finished ones to Done.
+    /// Returns true if any calculation finished this tick.
+    pub fn poll_dir_sizes(&mut self) -> bool {
+        let mut newly_done = Vec::new();
+        for (path, state) in &self.dir_sizes {
+            if let DirSizeState::Calculating {
+                accumulator,
+                finished,
+                ..
+            } = state
+            {
+                if finished.load(Ordering::Acquire) {
+                    newly_done.push((path.clone(), accumulator.load(Ordering::Relaxed)));
+                }
+            }
+        }
+        let changed = !newly_done.is_empty();
+        for (path, size) in newly_done {
+            self.dir_sizes.insert(path, DirSizeState::Done(size));
+        }
+        // Re-sort if sorting by size so newly calculated dirs move to correct position
+        if changed && self.sort_field == SortField::Size {
+            self.apply_sort();
+        }
+        changed
+    }
+
+    /// Get the display size for an entry, checking dir_sizes for overrides.
+    pub fn display_size(&self, entry: &FileEntry) -> String {
+        if entry.is_dir {
+            if let Some(state) = self.dir_sizes.get(&entry.path) {
+                return match state {
+                    DirSizeState::Calculating { accumulator, .. } => {
+                        let bytes = accumulator.load(Ordering::Relaxed);
+                        if bytes == 0 {
+                            "\u{25F7}".to_string() // spinner ◷
+                        } else {
+                            format!("\u{25F7}{}", format_size_short(bytes))
+                        }
+                    }
+                    DirSizeState::Done(size) => format_size_short(*size),
+                };
+            }
+            "<DIR>".to_string()
+        } else {
+            entry.formatted_size()
+        }
+    }
+
+    /// Check if any size calculations are in progress.
+    pub fn has_pending_size_calcs(&self) -> bool {
+        self.dir_sizes
+            .values()
+            .any(|s| matches!(s, DirSizeState::Calculating { .. }))
+    }
+
+    /// Check if all dirs in the pending total are done. Returns the formatted total string.
+    pub fn check_size_total(&mut self) -> Option<String> {
+        let (dir_paths, file_bytes, file_count, dir_count) = self.pending_size_total.as_ref()?;
+        // Check if all dir scans are done
+        let mut dir_total: u64 = 0;
+        for path in dir_paths {
+            match self.dir_sizes.get(path) {
+                Some(DirSizeState::Done(size)) => dir_total += size,
+                _ => return None, // still calculating
+            }
+        }
+        let total = file_bytes + dir_total;
+        let item_count = file_count + dir_count;
+        let msg = format!(
+            "{} item{}: {} ({} file{}, {} dir{})",
+            item_count,
+            if item_count == 1 { "" } else { "s" },
+            format_size_short(total),
+            file_count,
+            if *file_count == 1 { "" } else { "s" },
+            dir_count,
+            if *dir_count == 1 { "" } else { "s" },
+        );
+        self.pending_size_total = None;
+        Some(msg)
+    }
+}
+
+/// Recursively calculate directory size. Runs in a background thread.
+/// Uses symlink_metadata to avoid following symlink cycles.
+/// Checks `cancelled` flag to stop early on panel reload.
+fn calc_dir_size_recursive(path: &std::path::Path, acc: &AtomicU64, cancelled: &AtomicBool) {
+    if cancelled.load(Ordering::Relaxed) {
+        return;
+    }
+    let entries = match std::fs::read_dir(path) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        if cancelled.load(Ordering::Relaxed) {
+            return;
+        }
+        // Use symlink_metadata to avoid following symlinks (prevents cycles)
+        let meta = match std::fs::symlink_metadata(entry.path()) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.is_symlink() {
+            // Count symlink's target size but don't recurse into symlinked dirs
+            if let Ok(target_meta) = entry.metadata() {
+                if !target_meta.is_dir() {
+                    acc.fetch_add(target_meta.len(), Ordering::Relaxed);
+                }
+            }
+        } else if meta.is_dir() {
+            calc_dir_size_recursive(&entry.path(), acc, cancelled);
+        } else {
+            acc.fetch_add(meta.len(), Ordering::Relaxed);
+        }
+    }
+}
+
+/// Format a byte size compactly for the 8-char size column.
+pub fn format_size_short(size: u64) -> String {
+    if size < 1024 {
+        format!("{}", size)
+    } else if size < 1024 * 1024 {
+        format!("{}K", size / 1024)
+    } else if size < 1024 * 1024 * 1024 {
+        format!("{:.1}M", size as f64 / (1024.0 * 1024.0))
+    } else {
+        format!("{:.1}G", size as f64 / (1024.0 * 1024.0 * 1024.0))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    /// Helper: create a Panel rooted at `dir` with a few files.
+    fn panel_with_files(names: &[&str]) -> (tempfile::TempDir, Panel) {
+        let dir = tempdir().expect("failed to create temp dir");
+        for name in names {
+            fs::write(dir.path().join(name), "").expect("failed to create file");
+        }
+        let panel = Panel::new(dir.path().to_path_buf());
+        (dir, panel)
+    }
+
+    #[test]
+    fn select_by_name_finds_existing_entry() {
+        let (_dir, mut panel) = panel_with_files(&["alpha.txt", "beta.txt", "gamma.txt"]);
+
+        // Sanity: panel starts with selection at 0
+        assert_eq!(panel.table_state.selected(), Some(0));
+
+        // Select a file that definitely exists
+        panel.select_by_name("beta.txt");
+
+        let selected = panel
+            .selected_entry()
+            .expect("should have a selected entry");
+        assert_eq!(selected.name, "beta.txt");
+
+        // The underlying index must match the position in entries
+        let expected_idx = panel
+            .entries
+            .iter()
+            .position(|e| e.name == "beta.txt")
+            .unwrap();
+        assert_eq!(panel.table_state.selected(), Some(expected_idx));
+    }
+
+    #[test]
+    fn select_by_name_nonexistent_leaves_selection_unchanged() {
+        let (_dir, mut panel) = panel_with_files(&["alpha.txt", "beta.txt"]);
+
+        // Move to a known position first
+        panel.select_by_name("beta.txt");
+        let before = panel.table_state.selected();
+
+        // Try selecting something that does not exist
+        panel.select_by_name("does_not_exist.txt");
+
+        assert_eq!(
+            panel.table_state.selected(),
+            before,
+            "selection should not change when name is not found"
+        );
+    }
+
+    #[test]
+    fn select_by_name_selects_parent_entry() {
+        let (_dir, mut panel) = panel_with_files(&["file.txt"]);
+
+        // The temp dir has a parent, so ".." should be present
+        assert!(
+            panel.entries.iter().any(|e| e.name == ".."),
+            "panel should contain a '..' parent entry"
+        );
+
+        // Move away from ".." first
+        panel.select_by_name("file.txt");
+        assert_eq!(panel.selected_entry().unwrap().name, "file.txt");
+
+        // Now select the parent entry
+        panel.select_by_name("..");
+
+        let selected = panel
+            .selected_entry()
+            .expect("should have a selected entry");
+        assert_eq!(selected.name, "..");
+        assert!(selected.is_dir);
     }
 }

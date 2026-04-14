@@ -21,7 +21,6 @@ pub mod settings_dialog;
 pub mod ssh_dialog;
 mod shadow;
 pub mod terminal_view;
-pub mod viewer_view;
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
@@ -178,7 +177,6 @@ fn split_panel_column(
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     match &app.mode {
-        AppMode::Viewing(_) => render_viewer(frame, app),
         AppMode::HexViewing(_) => render_hex_viewer(frame, app),
         AppMode::ParquetViewing(_) => render_parquet_viewer(frame, app),
         AppMode::DiffViewing(_) => render_diff_viewer(frame, app),
@@ -188,7 +186,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     // Render goto-line prompt overlay if active
     if let Some(ref input) = app.goto_line_input {
-        render_goto_prompt(frame, input);
+        let title = if matches!(app.mode, AppMode::HexViewing(_)) {
+            " Go to Offset (hex) "
+        } else {
+            " Go to Line[:Col] "
+        };
+        render_goto_prompt(frame, input, title);
     }
 
     // Render quit confirmation overlay
@@ -197,9 +200,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         shadow::render_shadow(frame, area);
     }
 
+    // Render overwrite-ask dialog overlay
+    if let Some(ref state) = app.overwrite_ask {
+        let area = render_overwrite_ask_dialog(frame, state);
+        shadow::render_shadow(frame, area);
+    }
+
     // Render help dialog overlay
-    if let Some(scroll) = app.help_scroll {
-        let area = help_dialog::render(frame, scroll);
+    if let Some(ref state) = app.help_state {
+        let area = help_dialog::render(frame, state.scroll, &state.filter);
         shadow::render_shadow(frame, area);
     }
 }
@@ -349,9 +358,9 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
         session_dialog::render(frame, state);
     }
 
-    // Show status message if set, otherwise show context-appropriate footer
+    // Show status message in footer if set, otherwise show key hints
     if let Some(ref msg) = app.status_message {
-        render_status_message(frame, footer_area, msg);
+        footer::render_status(frame, footer_area, msg);
     } else {
         match app.focus {
             PanelFocus::Search => footer::render_search(frame, footer_area),
@@ -391,25 +400,6 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
     if let Some((ref title, ref msg)) = app.popup {
         render_popup(frame, title, msg);
     }
-}
-
-fn render_status_message(frame: &mut Frame, area: Rect, msg: &str) {
-    let t = crate::theme::theme();
-    let style = Style::default()
-        .fg(t.header_fg)
-        .bg(t.footer_sep_bg)
-        .add_modifier(Modifier::BOLD);
-    let padded = format!(" {} ", msg);
-    let cw = area.width as usize;
-    let display = if padded.len() > cw {
-        truncate_to_width(&padded, cw).to_string()
-    } else {
-        format!("{:<width$}", padded, width = cw)
-    };
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(display, style))),
-        area,
-    );
 }
 
 fn render_popup(frame: &mut Frame, title: &str, msg: &str) {
@@ -462,15 +452,17 @@ fn render_popup(frame: &mut Frame, title: &str, msg: &str) {
     frame.render_widget(Paragraph::new(Line::from(Span::styled(hint, hint_style))), rect);
 }
 
-fn render_viewer(frame: &mut Frame, app: &mut App) {
-    if let AppMode::Viewing(ref mut viewer) = app.mode {
-        viewer_view::render(frame, frame.area(), viewer);
-    }
-}
-
 fn render_hex_viewer(frame: &mut Frame, app: &mut App) {
     if let AppMode::HexViewing(ref mut hex) = app.mode {
         hex_view::render(frame, frame.area(), hex);
+    }
+    if let Some(ref state) = app.search_dialog {
+        let area = search_dialog::render(frame, state);
+        shadow::render_shadow(frame, area);
+    }
+    if let Some(focused) = app.unsaved_dialog {
+        let area = render_unsaved_dialog(frame, focused);
+        shadow::render_shadow(frame, area);
     }
 }
 
@@ -494,10 +486,59 @@ fn render_editor(frame: &mut Frame, app: &mut App) {
         let area = search_dialog::render(frame, state);
         shadow::render_shadow(frame, area);
     }
+    if let Some(ref dlg) = app.search_wrap_dialog {
+        let area = render_search_wrap_dialog(frame, dlg);
+        shadow::render_shadow(frame, area);
+    }
     if let Some(focused) = app.unsaved_dialog {
         let area = render_unsaved_dialog(frame, focused);
         shadow::render_shadow(frame, area);
     }
+}
+
+fn render_search_wrap_dialog(frame: &mut Frame, dlg: &crate::app::SearchWrapDialog) -> Rect {
+    use crate::app::SearchDirection;
+
+    let layout = dialog_helpers::render_dialog_frame(frame, " Search ", 46, 7);
+    let (normal, highlight, _) = dialog_helpers::dialog_styles();
+
+    let direction_label = match dlg.params.direction {
+        SearchDirection::Forward => "end",
+        SearchDirection::Backward => "beginning",
+    };
+    let msg = format!("Reached {} of file. Wrap around?", direction_label);
+
+    dialog_helpers::render_line(
+        frame,
+        layout.content,
+        1,
+        Line::from(Span::styled(
+            format!("{:<width$}", msg, width = layout.cw),
+            normal,
+        )),
+    );
+
+    let t = theme();
+    dialog_helpers::render_separator(
+        frame,
+        layout.area,
+        layout.inner.y + 3,
+        t.dialog_border_style(),
+    );
+
+    dialog_helpers::render_buttons(
+        frame,
+        layout.content,
+        4,
+        &[
+            ("{ Stop }", !dlg.wrap_focused),
+            ("[ Wrap ]", dlg.wrap_focused),
+        ],
+        normal,
+        highlight,
+    );
+
+    layout.outer
 }
 
 fn render_unsaved_dialog(frame: &mut Frame, focused: crate::app::UnsavedDialogField) -> Rect {
@@ -544,6 +585,116 @@ fn render_unsaved_dialog(frame: &mut Frame, focused: crate::app::UnsavedDialogFi
     layout.outer
 }
 
+fn render_overwrite_ask_dialog(frame: &mut Frame, state: &crate::app::OverwriteAskState) -> Rect {
+    use crate::app::OverwriteAskChoice;
+    use ratatui::widgets::{Block, Borders, Clear};
+
+    let t = theme();
+    let dialog_width: u16 = 66;
+    let dialog_height: u16 = 9;
+    let margin: u16 = 2;
+    let margin_v: u16 = 1;
+    let pad: u16 = 2;
+
+    let area = frame.area();
+    let outer_w = (dialog_width + margin * 2).min(area.width.saturating_sub(2));
+    let outer_h = (dialog_height + margin_v * 2).min(area.height.saturating_sub(2));
+    let w = outer_w.min(area.width);
+    let h = outer_h.min(area.height);
+    let outer = Rect::new(
+        area.x + area.width.saturating_sub(w) / 2,
+        area.y + area.height.saturating_sub(h) / 2,
+        w,
+        h,
+    );
+
+    frame.render_widget(Clear, outer);
+    let bg_style = t.overwrite_bg_style();
+    let buf = frame.buffer_mut();
+    for y in outer.top()..outer.bottom() {
+        for x in outer.left()..outer.right() {
+            if let Some(cell) = buf.cell_mut((x, y)) {
+                cell.set_symbol(" ");
+                cell.set_style(bg_style);
+            }
+        }
+    }
+
+    let box_area = Rect::new(
+        outer.x + margin,
+        outer.y + margin_v,
+        outer.width.saturating_sub(margin * 2),
+        outer.height.saturating_sub(margin_v * 2),
+    );
+
+    let block = Block::default()
+        .title(Span::styled(" Overwrite ", t.overwrite_title_style()))
+        .borders(Borders::ALL)
+        .border_style(t.overwrite_border_style())
+        .style(t.overwrite_bg_style());
+
+    let inner = block.inner(box_area);
+    frame.render_widget(block, box_area);
+
+    let content = Rect::new(
+        inner.x + pad,
+        inner.y,
+        inner.width.saturating_sub(pad * 2),
+        inner.height,
+    );
+    let cw = content.width as usize;
+
+    let normal = Style::default().fg(t.overwrite_text_fg).bg(t.overwrite_bg);
+    let highlight = Style::default()
+        .fg(t.overwrite_btn_active_fg)
+        .bg(t.overwrite_btn_active_bg);
+
+    // Show the conflicting filename
+    let name = state
+        .conflict_item
+        .dst
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let msg = format!("\"{}\" already exists.", name);
+    dialog_helpers::render_line(
+        frame,
+        content,
+        1,
+        Line::from(Span::styled(format!("{:<width$}", msg, width = cw), normal)),
+    );
+    dialog_helpers::render_line(
+        frame,
+        content,
+        3,
+        Line::from(Span::styled(
+            format!("{:<width$}", "Overwrite?", width = cw),
+            normal,
+        )),
+    );
+
+    dialog_helpers::render_separator(frame, box_area, inner.y + 5, t.overwrite_border_style());
+
+    dialog_helpers::render_buttons(
+        frame,
+        content,
+        6,
+        &[
+            (
+                "{ Overwrite }",
+                state.focused == OverwriteAskChoice::Overwrite,
+            ),
+            ("[ Skip ]", state.focused == OverwriteAskChoice::Skip),
+            ("[ Skip All ]", state.focused == OverwriteAskChoice::SkipAll),
+            ("[ Cancel ]", state.focused == OverwriteAskChoice::Cancel),
+        ],
+        normal,
+        highlight,
+    );
+
+    outer
+}
+
 fn render_quit_dialog(frame: &mut Frame, quit_focused: bool) -> Rect {
     let layout = dialog_helpers::render_dialog_frame(frame, " Quit ", 40, 7);
     let (normal, highlight, _) = dialog_helpers::dialog_styles();
@@ -578,7 +729,7 @@ fn render_quit_dialog(frame: &mut Frame, quit_focused: bool) -> Rect {
     layout.outer
 }
 
-fn render_goto_prompt(frame: &mut Frame, input: &str) {
+fn render_goto_prompt(frame: &mut Frame, input: &str, title: &str) {
     let t = theme();
     let width: u16 = 36;
     let height: u16 = 3;
@@ -590,7 +741,7 @@ fn render_goto_prompt(frame: &mut Frame, input: &str) {
     frame.render_widget(Clear, rect);
 
     let block = Block::default()
-        .title(Span::styled(" Go to Line[:Col] ", t.dialog_title_style()))
+        .title(Span::styled(title, t.dialog_title_style()))
         .borders(Borders::ALL)
         .border_style(t.dialog_border_style())
         .style(t.dialog_bg_style());

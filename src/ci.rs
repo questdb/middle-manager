@@ -880,7 +880,7 @@ fn get_azure_pat() -> Option<String> {
 fn azure_auth_args() -> Vec<String> {
     if let Some(pat) = get_azure_pat() {
         // Azure DevOps PAT uses Basic auth with empty username
-        let encoded = crate::editor::base64_encode(format!(":{}", pat).as_bytes());
+        let encoded = crate::clipboard::base64_encode(format!(":{}", pat).as_bytes());
         vec!["-H".to_string(), format!("Authorization: Basic {}", encoded)]
     } else {
         vec![]

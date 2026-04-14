@@ -62,7 +62,7 @@ impl TextInput {
     pub fn cut_selection(&mut self) -> bool {
         if let Some(text) = self.selected_text() {
             if !text.is_empty() {
-                crate::editor::osc52_copy(text);
+                crate::clipboard::copy(text);
                 self.save_undo();
                 self.delete_selection();
                 return true;
@@ -232,7 +232,7 @@ impl TextInput {
     pub fn copy_selection(&self) {
         if let Some(text) = self.selected_text() {
             if !text.is_empty() {
-                crate::editor::osc52_copy(text);
+                crate::clipboard::copy(text);
             }
         }
     }

@@ -39,6 +39,30 @@ xz2 = "0.1"
 zstd = "0.13"
 zip = "2"
 quick-xml = "0.37"
+libc = "0.2"
+xattr = "1"
 
 [dev-dependencies]
 tempfile = "3"
+
+[package.metadata.deb]
+maintainer = "QuestDB <hello@questdb.io>"
+copyright = "2024, QuestDB"
+license-file = ["LICENSE", "0"]
+extended-description = """\
+A dual-panel file manager for the terminal, inspired by Far Manager. \
+Handles very large files with sliding buffers and lazy scanning."""
+depends = "$auto"
+section = "utils"
+priority = "optional"
+assets = [
+  ["target/release/middle-manager", "usr/bin/mm", "755"],
+  ["README.md", "usr/share/doc/middle-manager/README", "644"],
+]
+
+[package.metadata.generate-rpm]
+assets = [
+  { source = "target/release/middle-manager", dest = "/usr/bin/mm", mode = "755" },
+  { source = "README.md", dest = "/usr/share/doc/middle-manager/README", mode = "644" },
+  { source = "LICENSE", dest = "/usr/share/licenses/middle-manager/LICENSE", mode = "644" },
+]

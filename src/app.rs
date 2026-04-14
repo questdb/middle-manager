@@ -20,7 +20,7 @@ use crate::editor::EditorState;
 use crate::file_search::SearchState;
 use crate::fs_ops;
 use crate::fs_ops::archive::ArchiveFormat;
-use crate::hex_viewer::HexViewerState;
+use crate::hex_viewer::{HexViewerState, BYTES_PER_ROW};
 use crate::panel::git::GitCache;
 use crate::panel::sort::SortField;
 use crate::panel::Panel;
@@ -46,7 +46,6 @@ fn sort_field_to_u8(f: SortField) -> u8 {
         SortField::Date => 2,
     }
 }
-use crate::viewer::ViewerState;
 
 pub struct App {
     pub panels: [Panel; 2],
@@ -61,7 +60,7 @@ pub struct App {
     pub panel_areas: [Rect; 2],
     pub ci_panel_areas: [Option<Rect>; 2],
     pub shell_panel_areas: [Option<Rect>; 2],
-    last_click: Option<(Instant, u16, u16)>,
+    last_click: Option<(Instant, u16, u16, u8)>,
     /// Go-to-line prompt state. When Some, an input overlay is shown.
     pub goto_line_input: Option<String>,
     /// Set to true when the UI needs a full terminal clear (e.g. leaving full-screen mode).
@@ -70,6 +69,8 @@ pub struct App {
     pub search_dialog: Option<SearchDialogState>,
     /// Unsaved changes confirmation dialog overlay.
     pub unsaved_dialog: Option<UnsavedDialogField>,
+    /// Search wrap-around confirmation dialog.
+    pub search_wrap_dialog: Option<SearchWrapDialog>,
     /// Quit confirmation dialog: true = Quit focused, false = Cancel focused.
     pub quit_confirm: Option<bool>,
     /// Popup overlay: shown centered, dismissed with any key. (title, message)
@@ -92,8 +93,8 @@ pub struct App {
     pub goto_path: [Option<GotoPathState>; 2],
     /// Fuzzy file search per panel side.
     pub fuzzy_search: [Option<FuzzySearchState>; 2],
-    /// Help dialog scroll offset.
-    pub help_scroll: Option<usize>,
+    /// Help dialog state (scroll + optional search filter).
+    pub help_state: Option<HelpState>,
     /// Settings dialog: selected item index, or None when closed.
     pub settings_open: Option<usize>,
     /// Shell panels (one per file panel side, like CI panels).
@@ -122,6 +123,8 @@ pub struct App {
     pub file_search_side: usize,
     /// File content search dialog.
     pub file_search_dialog: Option<FileSearchDialogState>,
+    /// Overwrite confirmation dialog for Ask-mode copy/move.
+    pub overwrite_ask: Option<OverwriteAskState>,
     /// Wakeup sender for the event loop (given to terminal reader threads).
     wakeup_sender: Option<crate::event::WakeupSender>,
     /// Previous frame's cursor position (to detect changes and avoid blink reset).
@@ -155,6 +158,49 @@ pub struct StashedDiff {
     pub file_path: String,
     pub base_branch: String,
     pub cursor: usize,
+}
+
+pub struct HelpState {
+    pub scroll: usize,
+    pub filter: String,
+}
+
+/// Overwrite confirmation dialog shown during Ask-mode copy/move.
+pub struct OverwriteAskState {
+    pub focused: OverwriteAskChoice,
+    /// The copy item that triggered the conflict.
+    pub conflict_item: fs_ops::CopyItem,
+    /// Remaining items to process after this one.
+    pub remaining_items: Vec<fs_ops::CopyItem>,
+    pub is_move: bool,
+    pub copy_opts: fs_ops::CopyOptions,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum OverwriteAskChoice {
+    Overwrite,
+    Skip,
+    SkipAll,
+    Cancel,
+}
+
+impl OverwriteAskChoice {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Overwrite => Self::Skip,
+            Self::Skip => Self::SkipAll,
+            Self::SkipAll => Self::Cancel,
+            Self::Cancel => Self::Overwrite,
+        }
+    }
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Overwrite => Self::Cancel,
+            Self::Skip => Self::Overwrite,
+            Self::SkipAll => Self::Skip,
+            Self::Cancel => Self::SkipAll,
+        }
+    }
 }
 
 pub struct GotoPathState {
@@ -354,7 +400,6 @@ pub enum AppMode {
     MkdirDialog(MkdirDialogState),
     CopyDialog(CopyDialogState),
     ArchiveDialog(ArchiveDialogState),
-    Viewing(Box<ViewerState>),
     HexViewing(Box<HexViewerState>),
     ParquetViewing(Box<ParquetViewerState>),
     DiffViewing(Box<crate::diff_viewer::DiffViewerState>),
@@ -519,6 +564,16 @@ impl SearchDialogField {
     }
 }
 
+// --- Search wrap confirmation dialog ---
+
+/// Shown when search reaches end/beginning without finding a match,
+/// offering to wrap around to the other end.
+pub struct SearchWrapDialog {
+    pub params: crate::editor::SearchParams,
+    /// true = "Wrap" focused (default), false = "Stop" focused
+    pub wrap_focused: bool,
+}
+
 // --- Unsaved changes dialog ---
 
 #[derive(Clone, Copy, PartialEq)]
@@ -585,7 +640,7 @@ impl CopyDialogState {
             copy_access_mode: true,
             copy_extended_attrs: false,
             disable_write_cache: false,
-            produce_sparse: false,
+            produce_sparse: true,
             use_cow: false,
             symlink_mode: SymlinkMode::Smart,
             use_filter: false,
@@ -1199,6 +1254,7 @@ impl App {
             needs_clear: false,
             search_dialog: None,
             unsaved_dialog: None,
+            search_wrap_dialog: None,
             git_cache,
             persisted,
             dir_watcher,
@@ -1210,7 +1266,7 @@ impl App {
             popup_after: None,
             goto_path: [None, None],
             fuzzy_search: [None, None],
-            help_scroll: None,
+            help_state: None,
             settings_open: None,
             shell_panels: [None, None],
             claude_panels: [None, None],
@@ -1225,6 +1281,7 @@ impl App {
             file_search: None,
             file_search_side: 1,
             file_search_dialog: None,
+            overwrite_ask: None,
             wakeup_sender: None,
             last_cursor_pos: None,
             dirty: true,
@@ -1561,18 +1618,33 @@ impl App {
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 let now = Instant::now();
-                if let Some((prev_time, prev_col, prev_row)) = self.last_click {
+                let shift = mouse.modifiers.contains(KeyModifiers::SHIFT);
+
+                // Multi-click detection: double and triple click
+                if let Some((prev_time, prev_col, prev_row, click_count)) = self.last_click {
                     if now.duration_since(prev_time).as_millis() < DOUBLE_CLICK_MS
                         && col == prev_col
                         && row == prev_row
                     {
-                        self.last_click = None;
+                        if click_count >= 2 {
+                            // Third click → triple
+                            self.last_click = None;
+                            return Action::MouseTripleClick(col, row);
+                        }
+                        // Second click → double
+                        self.last_click = Some((now, col, row, 2));
                         return Action::MouseDoubleClick(col, row);
                     }
                 }
-                self.last_click = Some((now, col, row));
-                Action::MouseClick(col, row)
+
+                self.last_click = Some((now, col, row, 1));
+                if shift {
+                    Action::MouseShiftClick(col, row)
+                } else {
+                    Action::MouseClick(col, row)
+                }
             }
+            MouseEventKind::Drag(MouseButton::Left) => Action::MouseDrag(col, row),
             MouseEventKind::ScrollUp => Action::MouseScrollUp(col, row),
             MouseEventKind::ScrollDown => Action::MouseScrollDown(col, row),
             _ => Action::None,
@@ -1581,15 +1653,17 @@ impl App {
 
     pub fn map_key_to_action(&self, key: KeyEvent) -> Action {
         // Help dialog intercepts keys
-        if self.help_scroll.is_some() {
+        if self.help_state.is_some() {
             return match key.code {
-                KeyCode::Esc | KeyCode::F(1) | KeyCode::Char('q') => Action::DialogCancel,
+                KeyCode::Esc | KeyCode::F(1) => Action::DialogCancel,
                 KeyCode::Up => Action::MoveUp,
                 KeyCode::Down => Action::MoveDown,
                 KeyCode::PageUp => Action::PageUp,
                 KeyCode::PageDown => Action::PageDown,
                 KeyCode::Home => Action::MoveToTop,
                 KeyCode::End => Action::MoveToBottom,
+                KeyCode::Backspace => Action::DialogBackspace,
+                KeyCode::Char(c) => Action::DialogInput(c),
                 _ => Action::None,
             };
         }
@@ -1797,11 +1871,31 @@ impl App {
             };
         }
 
+        // Overwrite-ask dialog intercepts keys when active
+        if self.overwrite_ask.is_some() {
+            return match key.code {
+                KeyCode::Esc => Action::DialogCancel,
+                KeyCode::Enter => Action::DialogConfirm,
+                KeyCode::Tab | KeyCode::Right | KeyCode::Down => Action::MoveDown,
+                KeyCode::BackTab | KeyCode::Left | KeyCode::Up => Action::MoveUp,
+                _ => Action::None,
+            };
+        }
+
         // Bottom panel focus intercepts only in normal/quick-search modes
         // (full-screen modes like DiffViewing/Editing map their own keys via AppMode match below)
         if matches!(self.mode, AppMode::Normal | AppMode::QuickSearch) {
             // Claude panel intercepts keys when focused
-            if matches!(self.focus, PanelFocus::Claude(_)) {
+            if let PanelFocus::Claude(side) = self.focus {
+                // Ctrl+C copies selection if any, otherwise sends SIGINT
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    let has_sel = self.claude_panels[side]
+                        .as_ref()
+                        .is_some_and(|tp| tp.selection_range().is_some());
+                    if has_sel {
+                        return Action::CopySelection;
+                    }
+                }
                 return match key.code {
                     KeyCode::F(5) => Action::TerminalOpenFile,
                     KeyCode::F(12) => Action::ToggleClaude,
@@ -1832,7 +1926,16 @@ impl App {
             }
 
             // Shell panel intercepts keys when focused
-            if matches!(self.focus, PanelFocus::Shell(_)) {
+            if let PanelFocus::Shell(side) = self.focus {
+                // Ctrl+C copies selection if any, otherwise sends SIGINT
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    let has_sel = self.shell_panels[side]
+                        .as_ref()
+                        .is_some_and(|sp| sp.selection_range().is_some());
+                    if has_sel {
+                        return Action::CopySelection;
+                    }
+                }
                 return match key.code {
                     KeyCode::F(1) => Action::SwitchPanel,
                     KeyCode::F(10) => Action::Quit,
@@ -2020,6 +2123,18 @@ impl App {
             };
         }
 
+        // Search wrap dialog intercepts keys when active
+        if self.search_wrap_dialog.is_some() {
+            return match key.code {
+                KeyCode::Enter => Action::DialogConfirm,
+                KeyCode::Esc => Action::DialogCancel,
+                KeyCode::Tab | KeyCode::Left | KeyCode::Right | KeyCode::BackTab => {
+                    Action::SwitchPanel
+                }
+                _ => Action::None,
+            };
+        }
+
         // Search dialog intercepts keys when active
         if let Some(ref state) = self.search_dialog {
             return Self::map_search_dialog_key(key, state.focused);
@@ -2032,7 +2147,7 @@ impl App {
             AppMode::MkdirDialog(state) => Self::map_mkdir_dialog_key(key, state.focused),
             AppMode::CopyDialog(state) => Self::map_copy_dialog_key(key, state.focused),
             AppMode::ArchiveDialog(state) => Self::map_archive_dialog_key(key, state.focused),
-            AppMode::Viewing(_) | AppMode::HexViewing(_) => self.map_viewer_key(key),
+            AppMode::HexViewing(_) => Self::map_hex_editor_key(key),
             AppMode::ParquetViewing(_) => self.map_parquet_key(key),
             AppMode::DiffViewing(ref d) => {
                 if d.search_input.is_some() {
@@ -2072,7 +2187,13 @@ impl App {
                     Action::ShowHelp
                 }
             }
-            KeyCode::F(3) => Action::ViewFile,
+            KeyCode::F(3) => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    Action::ViewFile
+                } else {
+                    Action::CalcSize
+                }
+            }
             KeyCode::F(4) => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     Action::EditFile // external $EDITOR
@@ -2545,17 +2666,49 @@ impl App {
         }
     }
 
-    fn map_viewer_key(&self, key: KeyEvent) -> Action {
+    fn map_hex_editor_key(key: KeyEvent) -> Action {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        if ctrl {
+            return match key.code {
+                KeyCode::Char('s') => Action::EditorSave,
+                KeyCode::Char('c') => Action::CopySelection,
+                KeyCode::Char('a') => Action::SelectAll,
+                KeyCode::Char('f') => Action::SearchPrompt,
+                KeyCode::Char('g') => Action::GotoLinePrompt,
+                KeyCode::Char('z') if shift => Action::EditorRedo,
+                KeyCode::Char('z') => Action::EditorUndo,
+                KeyCode::Char('q') => Action::DialogCancel,
+                KeyCode::Home | KeyCode::Up => Action::MoveToTop,
+                KeyCode::End | KeyCode::Down => Action::MoveToBottom,
+                _ => Action::None,
+            };
+        }
         match key.code {
+            KeyCode::Up if shift => Action::SelectUp,
+            KeyCode::Down if shift => Action::SelectDown,
+            KeyCode::Left if shift => Action::SelectLeft,
+            KeyCode::Right if shift => Action::SelectRight,
+            KeyCode::PageUp if shift => Action::SelectPageUp,
+            KeyCode::PageDown if shift => Action::SelectPageDown,
             KeyCode::Up => Action::MoveUp,
             KeyCode::Down => Action::MoveDown,
+            KeyCode::Left => Action::CursorLeft,
+            KeyCode::Right => Action::CursorRight,
+            KeyCode::Home => Action::CursorLineStart,
+            KeyCode::End => Action::CursorLineEnd,
             KeyCode::PageUp => Action::PageUp,
             KeyCode::PageDown => Action::PageDown,
-            KeyCode::Home => Action::MoveToTop,
-            KeyCode::End => Action::MoveToBottom,
-            KeyCode::Tab | KeyCode::F(4) => Action::Toggle, // switch text <-> hex
+            KeyCode::Tab => Action::Toggle,
+            KeyCode::F(2) => Action::EditorSave,
+            KeyCode::F(7) if shift => Action::FindNext,
+            KeyCode::F(7) => Action::SearchPrompt,
+            KeyCode::F(10) => Action::Quit,
             KeyCode::Char('g') => Action::GotoLinePrompt,
-            KeyCode::Char('q') | KeyCode::Esc => Action::DialogCancel,
+            KeyCode::Char('n') => Action::FindNext,
+            KeyCode::Char('N') => Action::WordLeft, // reuse for find-prev
+            KeyCode::Esc | KeyCode::Char('q') => Action::DialogCancel,
+            KeyCode::Char(c) => Action::DialogInput(c),
             _ => Action::None,
         }
     }
@@ -2609,7 +2762,7 @@ impl App {
             KeyCode::PageDown => Action::PageDown,
             KeyCode::Home => Action::MoveToTop,
             KeyCode::End => Action::MoveToBottom,
-            KeyCode::Tab | KeyCode::F(4) => Action::Toggle,
+            KeyCode::Tab => Action::Toggle,
             KeyCode::Char('g') => Action::GotoLinePrompt,
             KeyCode::Char('q') | KeyCode::Esc => Action::DialogCancel,
             _ => Action::None,
@@ -2703,10 +2856,26 @@ impl App {
                 .unwrap_or(false)
             || self.git_cache.has_pending()
             || self.archive_progress.is_some()
-            || self.pending_remote.is_some();
+            || self.pending_remote.is_some()
+            || self.panels[0].has_pending_size_calcs()
+            || self.panels[1].has_pending_size_calcs();
         if has_active_async {
             self.dirty = true;
         }
+
+        // Poll directory size calculations
+        for panel in &mut self.panels {
+            panel.poll_dir_sizes();
+            if let Some(msg) = panel.check_size_total() {
+                self.status_message = Some(msg);
+            }
+        }
+        if let Some(ref w) = self.dir_watcher {
+            if w.has_changes() {
+                self.dirty = true;
+            }
+        }
+
         // Poll CI panels for async results, downloads, and failure extraction
         for ci in self.ci_panels.iter_mut().flatten() {
             ci.poll();
@@ -2787,6 +2956,7 @@ impl App {
                     if self.focus == PanelFocus::Claude(side) {
                         self.focus = PanelFocus::FilePanel;
                     }
+                    self.dirty = true;
                 }
             }
         }
@@ -2799,6 +2969,7 @@ impl App {
                     if self.focus == PanelFocus::Shell(side) {
                         self.focus = PanelFocus::FilePanel;
                     }
+                    self.dirty = true;
                 }
             }
         }
@@ -2892,6 +3063,10 @@ impl App {
         // Mark dirty for any action that changes state (not idle ticks)
         if !matches!(action, Action::Tick | Action::None) {
             self.dirty = true;
+            // Clear status message on any user action
+            if !matches!(action, Action::Resize(_, _)) {
+                self.status_message = None;
+            }
         }
 
         // Global tick: poll all async sources regardless of focus
@@ -2917,31 +3092,51 @@ impl App {
         }
 
         // Help dialog intercepts when active
-        if self.help_scroll.is_some() {
+        if self.help_state.is_some() {
             match action {
-                Action::DialogCancel => self.help_scroll = None,
+                Action::DialogCancel => self.help_state = None,
                 Action::MoveUp => {
-                    if let Some(ref mut s) = self.help_scroll {
-                        *s = s.saturating_sub(1);
+                    if let Some(ref mut h) = self.help_state {
+                        h.scroll = h.scroll.saturating_sub(1);
                     }
                 }
                 Action::MoveDown => {
-                    if let Some(ref mut s) = self.help_scroll {
-                        *s += 1;
+                    if let Some(ref mut h) = self.help_state {
+                        h.scroll += 1;
                     }
                 }
                 Action::PageUp => {
-                    if let Some(ref mut s) = self.help_scroll {
-                        *s = s.saturating_sub(20);
+                    if let Some(ref mut h) = self.help_state {
+                        h.scroll = h.scroll.saturating_sub(20);
                     }
                 }
                 Action::PageDown => {
-                    if let Some(ref mut s) = self.help_scroll {
-                        *s += 20;
+                    if let Some(ref mut h) = self.help_state {
+                        h.scroll += 20;
                     }
                 }
-                Action::MoveToTop => self.help_scroll = Some(0),
-                Action::MoveToBottom => self.help_scroll = Some(usize::MAX),
+                Action::MoveToTop => {
+                    if let Some(ref mut h) = self.help_state {
+                        h.scroll = 0;
+                    }
+                }
+                Action::MoveToBottom => {
+                    if let Some(ref mut h) = self.help_state {
+                        h.scroll = usize::MAX;
+                    }
+                }
+                Action::DialogInput(c) => {
+                    if let Some(ref mut h) = self.help_state {
+                        h.filter.push(c);
+                        h.scroll = 0;
+                    }
+                }
+                Action::DialogBackspace => {
+                    if let Some(ref mut h) = self.help_state {
+                        h.filter.pop();
+                        h.scroll = 0;
+                    }
+                }
                 _ => {}
             }
             return;
@@ -3007,7 +3202,8 @@ impl App {
             && self.unsaved_dialog.is_none()
             && self.quit_confirm.is_none()
         {
-            let has_unsaved = matches!(self.mode, AppMode::Editing(ref e) if e.modified);
+            let has_unsaved = matches!(self.mode, AppMode::Editing(ref e) if e.modified)
+                || matches!(self.mode, AppMode::HexViewing(ref h) if h.modified);
             if has_unsaved {
                 self.unsaved_dialog = Some(UnsavedDialogField::Save);
             } else {
@@ -3055,13 +3251,20 @@ impl App {
                                     }
                                 }
                             }
+                            if let AppMode::HexViewing(ref mut h) = self.mode {
+                                if let Err(err) = h.save() {
+                                    h.status_msg = Some(format!("Save failed: {}", err));
+                                    self.unsaved_dialog = None;
+                                    return;
+                                }
+                            }
                             self.unsaved_dialog = None;
-                            self.restore_or_close_editor();
+                            self.close_hex_or_editor();
                             self.reload_panels();
                         }
                         UnsavedDialogField::Discard => {
                             self.unsaved_dialog = None;
-                            self.restore_or_close_editor();
+                            self.close_hex_or_editor();
                         }
                         UnsavedDialogField::Cancel => {
                             self.unsaved_dialog = None;
@@ -3084,6 +3287,76 @@ impl App {
                 }
                 _ => {}
             }
+            return;
+        }
+
+        // Overwrite-ask dialog intercepts when active
+        if self.overwrite_ask.is_some() {
+            match action {
+                Action::DialogConfirm => {
+                    let state = self.overwrite_ask.take().unwrap();
+                    let mut overwrite_opts = state.copy_opts.clone();
+                    overwrite_opts.conflict = fs_ops::ConflictPolicy::Overwrite;
+                    match state.focused {
+                        OverwriteAskChoice::Overwrite => {
+                            if let Err(e) =
+                                fs_ops::exec_copy_item(&state.conflict_item, &overwrite_opts)
+                            {
+                                self.status_message = Some(format!("Error: {}", e));
+                                self.reload_panels();
+                            } else {
+                                self.continue_copy_ask(
+                                    state.remaining_items,
+                                    state.is_move,
+                                    state.copy_opts,
+                                );
+                            }
+                        }
+                        OverwriteAskChoice::Skip => {
+                            self.continue_copy_ask(
+                                state.remaining_items,
+                                state.is_move,
+                                state.copy_opts,
+                            );
+                        }
+                        OverwriteAskChoice::SkipAll => {
+                            let mut skip_opts = state.copy_opts.clone();
+                            skip_opts.conflict = fs_ops::ConflictPolicy::Skip;
+                            for item in &state.remaining_items {
+                                if let Err(e) = fs_ops::exec_copy_item(item, &skip_opts) {
+                                    self.status_message = Some(format!("Error: {}", e));
+                                    break;
+                                }
+                            }
+                            self.reload_panels();
+                        }
+                        OverwriteAskChoice::Cancel => {
+                            self.reload_panels();
+                        }
+                    }
+                }
+                Action::DialogCancel => {
+                    self.overwrite_ask = None;
+                    self.reload_panels();
+                }
+                Action::MoveDown => {
+                    if let Some(ref mut s) = self.overwrite_ask {
+                        s.focused = s.focused.next();
+                    }
+                }
+                Action::MoveUp => {
+                    if let Some(ref mut s) = self.overwrite_ask {
+                        s.focused = s.focused.prev();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Search wrap confirmation dialog intercepts when active
+        if self.search_wrap_dialog.is_some() {
+            self.handle_search_wrap_dialog_action(action);
             return;
         }
 
@@ -3154,6 +3427,10 @@ impl App {
         }
         if matches!(self.mode, AppMode::ArchiveDialog(_)) {
             self.handle_archive_dialog_action(action);
+            return;
+        }
+        if matches!(self.mode, AppMode::HexViewing(_)) {
+            self.handle_hex_editor_action(action);
             return;
         }
         if matches!(self.mode, AppMode::Editing(_)) {
@@ -3385,14 +3662,8 @@ impl App {
             Action::Quit => self.should_quit = true,
             Action::Toggle => self.handle_toggle_viewer(),
             Action::GotoLinePrompt => {
-                // Only works in viewer/hex/editor/parquet modes
-                if matches!(
-                    self.mode,
-                    AppMode::Viewing(_)
-                        | AppMode::HexViewing(_)
-                        | AppMode::ParquetViewing(_)
-                        | AppMode::Editing(_)
-                ) {
+                // Only works in hex/editor/parquet modes
+                if matches!(self.mode, AppMode::ParquetViewing(_) | AppMode::Editing(_)) {
                     self.goto_line_input = Some(String::new());
                 }
             }
@@ -3455,6 +3726,7 @@ impl App {
             Action::CreateDir => self.handle_create_dir(),
             Action::CreateFile => self.handle_create_file(),
             Action::Delete => self.handle_delete(),
+            Action::CalcSize => self.handle_calc_size(),
             Action::ViewFile => self.handle_view_file(),
             Action::EditFile => self.handle_edit_file(),
 
@@ -3462,14 +3734,14 @@ impl App {
             Action::CopyName => {
                 if let Some(entry) = self.active_panel().selected_entry() {
                     let name = entry.name.clone();
-                    crate::editor::osc52_copy(&name);
+                    crate::clipboard::copy(&name);
                     self.status_message = Some(format!("Copied: {}", name));
                 }
             }
             Action::CopyPath => {
                 if let Some(entry) = self.active_panel().selected_entry() {
                     let path = entry.path.display().to_string();
-                    crate::editor::osc52_copy(&path);
+                    crate::clipboard::copy(&path);
                     self.status_message = Some(format!("Copied: {}", path));
                 }
             }
@@ -3493,7 +3765,10 @@ impl App {
 
             // Help
             Action::ShowHelp => {
-                self.help_scroll = Some(0);
+                self.help_state = Some(HelpState {
+                    scroll: 0,
+                    filter: String::new(),
+                });
             }
 
             Action::ToggleSettings => {
@@ -3651,7 +3926,10 @@ impl App {
 
             // Mouse
             Action::MouseClick(col, row) => self.handle_mouse_click(col, row),
+            Action::MouseShiftClick(col, row) => self.handle_mouse_click(col, row),
             Action::MouseDoubleClick(col, row) => self.handle_mouse_double_click(col, row),
+            Action::MouseTripleClick(col, row) => self.handle_mouse_click(col, row),
+            Action::MouseDrag(_, _) => {}
             Action::MouseScrollUp(col, row) => self.handle_mouse_scroll(col, row, -3),
             Action::MouseScrollDown(col, row) => self.handle_mouse_scroll(col, row, 3),
 
@@ -3671,8 +3949,6 @@ impl App {
 
     fn handle_move_up(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => v.scroll_up(1),
-            AppMode::HexViewing(h) => h.scroll_up(1),
             AppMode::ParquetViewing(p) => p.move_up(1),
             AppMode::DiffViewing(d) => d.scroll_up(1),
             _ => self.active_panel_mut().move_selection(-1),
@@ -3681,8 +3957,6 @@ impl App {
 
     fn handle_move_down(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => v.scroll_down(1),
-            AppMode::HexViewing(h) => h.scroll_down(1),
             AppMode::ParquetViewing(p) => p.move_down(1),
             AppMode::DiffViewing(d) => d.scroll_down(1),
             _ => self.active_panel_mut().move_selection(1),
@@ -3691,8 +3965,6 @@ impl App {
 
     fn handle_move_to_top(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => v.scroll_to_top(),
-            AppMode::HexViewing(h) => h.scroll_to_top(),
             AppMode::ParquetViewing(p) => p.move_to_top(),
             AppMode::DiffViewing(d) => d.scroll_to_top(),
             _ => self.active_panel_mut().move_to_top(),
@@ -3701,8 +3973,6 @@ impl App {
 
     fn handle_move_to_bottom(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => v.scroll_to_bottom(),
-            AppMode::HexViewing(h) => h.scroll_to_bottom(),
             AppMode::ParquetViewing(p) => p.move_to_bottom(),
             AppMode::DiffViewing(d) => d.scroll_to_bottom(),
             _ => self.active_panel_mut().move_to_bottom(),
@@ -3711,14 +3981,6 @@ impl App {
 
     fn handle_page_up(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => {
-                let page = v.visible_lines.max(1);
-                v.scroll_up(page);
-            }
-            AppMode::HexViewing(h) => {
-                let page = h.visible_rows.max(1);
-                h.scroll_up(page);
-            }
             AppMode::ParquetViewing(p) => p.page_up(),
             AppMode::DiffViewing(d) => d.page_up(),
             _ => self.active_panel_mut().move_selection(-20),
@@ -3727,14 +3989,6 @@ impl App {
 
     fn handle_page_down(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => {
-                let page = v.visible_lines.max(1);
-                v.scroll_down(page);
-            }
-            AppMode::HexViewing(h) => {
-                let page = h.visible_rows.max(1);
-                h.scroll_down(page);
-            }
             AppMode::ParquetViewing(p) => p.page_down(),
             AppMode::DiffViewing(d) => d.page_down(),
             _ => self.active_panel_mut().move_selection(20),
@@ -3762,7 +4016,7 @@ impl App {
                 self.update_watched_dirs();
                 self.check_ci_panels();
             } else {
-                self.open_file(entry.path);
+                self.open_file_for_edit(entry.path);
             }
         }
     }
@@ -3914,18 +4168,34 @@ impl App {
     }
 
     fn handle_goto_line_action(&mut self, action: Action) {
+        let is_hex = matches!(self.mode, AppMode::HexViewing(_));
         match action {
             Action::DialogCancel => {
                 self.goto_line_input = None;
             }
             Action::DialogConfirm | Action::EditorNewline | Action::Enter => {
                 if let Some(input) = self.goto_line_input.take() {
-                    self.goto_line_col(&input);
+                    if is_hex {
+                        if let AppMode::HexViewing(ref mut h) = self.mode {
+                            if let Err(e) = h.goto_offset(&input) {
+                                h.status_msg = Some(e);
+                            }
+                        }
+                    } else {
+                        self.goto_line_col(&input);
+                    }
                 }
             }
-            Action::DialogInput(c) if c.is_ascii_digit() || c == ':' => {
-                if let Some(ref mut input) = self.goto_line_input {
-                    input.push(c);
+            Action::DialogInput(c) => {
+                let valid = if is_hex {
+                    c.is_ascii_hexdigit() || c == 'x' || c == 'X'
+                } else {
+                    c.is_ascii_digit() || c == ':'
+                };
+                if valid {
+                    if let Some(ref mut input) = self.goto_line_input {
+                        input.push(c);
+                    }
                 }
             }
             Action::DialogBackspace => {
@@ -4155,9 +4425,7 @@ impl App {
                         let full_path = self.panels[side].current_dir.join(rel_path);
                         if full_path.is_file() {
                             self.fuzzy_search[side] = None;
-                            self.mode = AppMode::Editing(Box::new(
-                                crate::editor::EditorState::open(full_path),
-                            ));
+                            self.open_file_for_edit(full_path);
                             return;
                         }
                     }
@@ -4429,16 +4697,6 @@ impl App {
         };
 
         match &mut self.mode {
-            AppMode::Viewing(v) => {
-                // Scan ahead if needed
-                v.scroll_offset = line;
-                v.scroll_down(0); // clamps and loads buffer
-            }
-            AppMode::HexViewing(h) => {
-                // Each row = 16 bytes, interpret line as a row number
-                h.scroll_offset = line;
-                h.scroll_down(0);
-            }
             AppMode::ParquetViewing(p) => {
                 p.goto_row(line);
             }
@@ -4485,7 +4743,318 @@ impl App {
                     }
                 }
             } else {
-                self.mode = AppMode::Editing(Box::new(EditorState::open(entry.path)));
+                self.open_file_for_edit(entry.path);
+            }
+        }
+    }
+
+    /// Open a file with the appropriate mode: parquet viewer, hex viewer, or text editor.
+    fn open_file_for_edit(&mut self, path: PathBuf) {
+        // Parquet files → read-only parquet viewer
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
+        {
+            if let Ok(pq) = ParquetViewerState::open(path.clone()) {
+                self.mode = AppMode::ParquetViewing(Box::new(pq));
+                return;
+            }
+            // Fall through to binary/text on parse failure
+        }
+
+        // Binary files → read-only hex viewer
+        if HexViewerState::is_binary(&path) {
+            self.mode = AppMode::HexViewing(Box::new(HexViewerState::open(path)));
+            return;
+        }
+
+        // Text files → editor
+        self.mode = AppMode::Editing(Box::new(EditorState::open(path)));
+    }
+
+    fn handle_hex_editor_action(&mut self, action: Action) {
+        // Clear selection on non-selection movement and editing actions
+        let clears_selection = matches!(
+            action,
+            Action::MoveUp
+                | Action::MoveDown
+                | Action::CursorLeft
+                | Action::CursorRight
+                | Action::CursorLineStart
+                | Action::CursorLineEnd
+                | Action::MoveToTop
+                | Action::MoveToBottom
+                | Action::PageUp
+                | Action::PageDown
+                | Action::DialogInput(_)
+        );
+        if clears_selection {
+            if let AppMode::HexViewing(ref mut h) = self.mode {
+                h.clear_selection();
+            }
+        }
+
+        match action {
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
+            Action::Quit => {
+                let modified = matches!(self.mode, AppMode::HexViewing(ref h) if h.modified);
+                if modified {
+                    self.unsaved_dialog = Some(UnsavedDialogField::Save);
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            Action::DialogCancel => {
+                let modified = matches!(self.mode, AppMode::HexViewing(ref h) if h.modified);
+                if modified {
+                    self.unsaved_dialog = Some(UnsavedDialogField::Save);
+                } else {
+                    self.mode = AppMode::Normal;
+                    self.focus = PanelFocus::FilePanel;
+                    self.needs_clear = true;
+                }
+            }
+            Action::MoveUp => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.cursor_up();
+                }
+            }
+            Action::MoveDown => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.cursor_down();
+                }
+            }
+            Action::CursorLeft => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.cursor_left();
+                }
+            }
+            Action::CursorRight => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.cursor_right();
+                }
+            }
+            Action::CursorLineStart => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.cursor_row_start();
+                }
+            }
+            Action::CursorLineEnd => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.cursor_row_end();
+                }
+            }
+            Action::MoveToTop => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.scroll_to_top();
+                }
+            }
+            Action::MoveToBottom => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.scroll_to_bottom();
+                }
+            }
+            Action::PageUp => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.page_up();
+                }
+            }
+            Action::PageDown => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.page_down();
+                }
+            }
+            Action::Toggle => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.toggle_ascii();
+                }
+            }
+            // Selection
+            Action::SelectUp => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.select_up();
+                }
+            }
+            Action::SelectDown => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.select_down();
+                }
+            }
+            Action::SelectLeft => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.select_left();
+                }
+            }
+            Action::SelectRight => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.select_right();
+                }
+            }
+            Action::SelectPageUp => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.select_page_up();
+                }
+            }
+            Action::SelectPageDown => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.select_page_down();
+                }
+            }
+            Action::SelectAll => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.select_all();
+                }
+            }
+            Action::CopySelection => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    if let Some(len) = h.copy_to_clipboard() {
+                        h.status_msg = Some(format!("Copied {} chars", len));
+                    }
+                }
+            }
+            Action::EditorSave => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    if let Err(e) = h.save() {
+                        h.status_msg = Some(e);
+                    }
+                    self.reload_panels();
+                }
+            }
+            Action::EditorUndo => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.undo();
+                }
+            }
+            Action::EditorRedo => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.redo();
+                }
+            }
+            Action::GotoLinePrompt => {
+                self.goto_line_input = Some(String::new());
+            }
+            Action::SearchPrompt => {
+                // Open search dialog with last hex search pre-filled
+                let query = if let AppMode::HexViewing(ref h) = self.mode {
+                    h.last_search_pattern
+                        .as_ref()
+                        .map(|p| {
+                            p.iter()
+                                .map(|b| format!("{:02X}", b))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let mut q = TextInput::new(query);
+                q.select_all();
+                self.search_dialog = Some(SearchDialogState {
+                    query: q,
+                    direction: SearchDirection::Forward,
+                    case_sensitive: false,
+                    focused: SearchDialogField::Query,
+                });
+            }
+            Action::FindNext => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    if let Some(pat) = h.last_search_pattern.clone() {
+                        h.find_next(&pat);
+                    }
+                }
+            }
+            Action::WordLeft => {
+                // Reused as find-prev
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    if let Some(pat) = h.last_search_pattern.clone() {
+                        h.find_prev(&pat);
+                    }
+                }
+            }
+            Action::DialogInput(c) => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    if h.editing_ascii {
+                        if c.is_ascii() && !c.is_control() {
+                            h.input_ascii(c as u8);
+                        }
+                    } else if let Some(nibble) = c.to_digit(16) {
+                        h.input_hex_nibble(nibble as u8);
+                    }
+                }
+            }
+            Action::MouseClick(col, row) => {
+                self.handle_hex_click(col, row);
+            }
+            Action::MouseScrollUp(_, _) => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.scroll_up(3);
+                }
+            }
+            Action::MouseScrollDown(_, _) => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.scroll_down(3);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle mouse click in hex editor — position cursor at clicked byte.
+    fn handle_hex_click(&mut self, col: u16, row: u16) {
+        let AppMode::HexViewing(ref mut h) = self.mode else {
+            return;
+        };
+        // Layout: border(1) + header(1) = data starts at row offset 2 from area top.
+        // Full-screen hex editor: area.y=0, inner starts at y=1, header at y=1, data at y=2
+        let data_start_row: u16 = 2;
+        let data_start_col: u16 = 1; // left border
+
+        if row < data_start_row || row >= data_start_row + h.visible_rows as u16 {
+            return;
+        }
+        let screen_row = (row - data_start_row) as usize;
+        let file_row = h.scroll_offset + screen_row;
+        // The col within the inner area
+        let inner_col = col.saturating_sub(data_start_col) as usize;
+
+        // Layout per row: " XXXXXXXX  " (11 chars for offset) then hex bytes then "  " then ASCII
+        let offset_width = 11; // " {:08X}  "
+        let hex_region_start = offset_width;
+        // Each byte is "XX " (3 chars), with an extra " " separator after byte 8
+        // Total hex region = 16*3 + 1 = 49 chars
+        let hex_region_end = hex_region_start + 49;
+        let ascii_region_start = hex_region_end + 2; // "  " separator
+
+        if inner_col >= hex_region_start && inner_col < hex_region_end {
+            // Clicked in hex region — figure out which byte
+            let rel = inner_col - hex_region_start;
+            // rel 0..24: bytes 0-7 (each "XX " = 3 chars), rel 24 = separator
+            // rel 25..49: bytes 8-15
+            if rel == 24 {
+                return; // clicked on the separator between byte groups
+            }
+            let byte_idx = if rel > 24 { (rel - 1) / 3 } else { rel / 3 };
+            if byte_idx < BYTES_PER_ROW {
+                let offset = (file_row * BYTES_PER_ROW + byte_idx) as u64;
+                if offset < h.file_size {
+                    h.cursor_offset = offset;
+                    h.cursor_nibble = 0;
+                    h.editing_ascii = false;
+                    h.scroll_to_cursor();
+                }
+            }
+        } else if inner_col >= ascii_region_start {
+            // Clicked in ASCII region
+            let byte_idx = inner_col - ascii_region_start;
+            if byte_idx < BYTES_PER_ROW {
+                let offset = (file_row * BYTES_PER_ROW + byte_idx) as u64;
+                if offset < h.file_size {
+                    h.cursor_offset = offset;
+                    h.cursor_nibble = 0;
+                    h.editing_ascii = true;
+                    h.scroll_to_cursor();
+                }
             }
         }
     }
@@ -4776,14 +5345,15 @@ impl App {
                 });
             }
             Action::FindNext => {
-                if let AppMode::Editing(ref mut e) = self.mode {
-                    if let Some(params) = e.last_search.clone() {
-                        if !e.find(&params) {
-                            e.status_msg = Some(format!("'{}' not found", params.query));
-                        }
-                    } else {
-                        e.status_msg = Some("No previous search".to_string());
-                    }
+                let params = if let AppMode::Editing(ref e) = self.mode {
+                    e.last_search.clone()
+                } else {
+                    None
+                };
+                if let Some(params) = params {
+                    self.do_find(params);
+                } else if let AppMode::Editing(ref mut e) = self.mode {
+                    e.status_msg = Some("No previous search".to_string());
                 }
             }
 
@@ -4791,6 +5361,26 @@ impl App {
             Action::MouseClick(col, row) => {
                 if let AppMode::Editing(ref mut e) = self.mode {
                     e.click_at(col, row);
+                }
+            }
+            Action::MouseShiftClick(col, row) => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.shift_click_at(col, row);
+                }
+            }
+            Action::MouseDoubleClick(col, row) => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.double_click_at(col, row);
+                }
+            }
+            Action::MouseTripleClick(col, row) => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.triple_click_at(col, row);
+                }
+            }
+            Action::MouseDrag(col, row) => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.drag_to(col, row);
                 }
             }
             Action::MouseScrollUp(_, _) => {
@@ -4813,39 +5403,8 @@ impl App {
     }
 
     fn handle_toggle_viewer(&mut self) {
-        match &mut self.mode {
-            AppMode::Viewing(v) => {
-                let path = v.path.clone();
-                self.mode = AppMode::HexViewing(Box::new(HexViewerState::open(path)));
-            }
-            AppMode::HexViewing(h) => {
-                let path = h.path.clone();
-                self.mode = AppMode::Viewing(Box::new(ViewerState::open(path)));
-            }
-            AppMode::ParquetViewing(p) => {
-                p.switch_view();
-            }
-            _ => {}
-        }
-    }
-
-    fn open_file(&mut self, path: PathBuf) {
-        // Try parquet viewer for .parquet files
-        if path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
-        {
-            if let Ok(pq) = ParquetViewerState::open(path.clone()) {
-                self.mode = AppMode::ParquetViewing(Box::new(pq));
-                return;
-            }
-            // Fall through to binary/text viewer on parse failure
-        }
-
-        if HexViewerState::is_binary(&path) {
-            self.mode = AppMode::HexViewing(Box::new(HexViewerState::open(path)));
-        } else {
-            self.mode = AppMode::Viewing(Box::new(ViewerState::open(path)));
+        if let AppMode::ParquetViewing(p) = &mut self.mode {
+            p.switch_view();
         }
     }
 
@@ -4972,15 +5531,74 @@ impl App {
             if !entry.is_dir {
                 if self.active_panel().source.is_remote() {
                     match self.download_for_edit(&entry.path) {
-                        Ok(tmp_path) => self.open_file(tmp_path),
+                        Ok(tmp_path) => self.open_file_for_edit(tmp_path),
                         Err(e) => {
                             self.popup = Some(("Error".to_string(), format!("Failed to download:\n\n{}", e)));
                         }
                     }
                 } else {
-                    self.open_file(entry.path);
+                    self.open_file_for_edit(entry.path);
                 }
             }
+        }
+    }
+
+    fn handle_calc_size(&mut self) {
+        let panel = &self.panels[self.active_panel];
+
+        // Gather entries to calculate: multi-selection or cursor item
+        let entries: Vec<(PathBuf, bool, u64)> = if !panel.selected_indices.is_empty() {
+            panel
+                .selected_indices
+                .iter()
+                .filter_map(|&i| panel.entries.get(i))
+                .filter(|e| e.name != "..")
+                .map(|e| (e.path.clone(), e.is_dir, e.size))
+                .collect()
+        } else if let Some(entry) = panel.selected_entry() {
+            vec![(entry.path.clone(), entry.is_dir, entry.size)]
+        } else {
+            return;
+        };
+
+        let panel = &mut self.panels[self.active_panel];
+        let mut file_total: u64 = 0;
+        let mut dir_count = 0usize;
+        let mut file_count = 0usize;
+
+        for (path, is_dir, size) in &entries {
+            if *is_dir {
+                // Cancel and remove existing calculation (allows re-scan on repeated F3)
+                if let Some(crate::panel::DirSizeState::Calculating { cancelled, .. }) =
+                    panel.dir_sizes.get(path)
+                {
+                    cancelled.store(true, std::sync::atomic::Ordering::Release);
+                }
+                panel.dir_sizes.remove(path);
+                panel.start_size_calc(path.clone());
+                dir_count += 1;
+            } else {
+                file_total += size;
+                file_count += 1;
+            }
+        }
+
+        // Show immediate status for file-only selections
+        if dir_count == 0 && file_count > 0 {
+            self.status_message = Some(format!(
+                "{} file{}: {}",
+                file_count,
+                if file_count == 1 { "" } else { "s" },
+                crate::panel::format_size_short(file_total),
+            ));
+        } else if dir_count > 0 {
+            // Track pending total for when all dir scans finish
+            let dir_paths: Vec<PathBuf> = entries
+                .iter()
+                .filter(|(_, is_dir, _)| *is_dir)
+                .map(|(p, _, _)| p.clone())
+                .collect();
+            panel.pending_size_total = Some((dir_paths, file_total, file_count, dir_count));
         }
     }
 
@@ -5080,6 +5698,24 @@ impl App {
             return;
         }
 
+        // Hex editor: parse as hex pattern and search
+        if let AppMode::HexViewing(ref mut h) = self.mode {
+            match HexViewerState::parse_hex_pattern(&state.query.text) {
+                Ok(pattern) => {
+                    let reverse = matches!(state.direction, SearchDirection::Backward);
+                    if reverse {
+                        h.find_prev(&pattern);
+                    } else {
+                        h.find_next(&pattern);
+                    }
+                }
+                Err(e) => {
+                    h.status_msg = Some(e);
+                }
+            }
+            return;
+        }
+
         use crate::editor::SearchParams;
         let params = SearchParams {
             query: state.query.text,
@@ -5093,11 +5729,52 @@ impl App {
             matches!(params.direction, SearchDirection::Forward);
         self.persisted.search_case_sensitive = params.case_sensitive;
 
+        self.do_find(params);
+    }
+
+    /// Run a non-wrapping search. If not found, show the wrap confirmation dialog.
+    fn do_find(&mut self, params: crate::editor::SearchParams) {
         if let AppMode::Editing(ref mut e) = self.mode {
             e.last_search = Some(params.clone());
             if !e.find(&params) {
-                e.status_msg = Some(format!("'{}' not found", params.query));
+                // Not found in current direction — offer to wrap
+                self.search_wrap_dialog = Some(SearchWrapDialog {
+                    params,
+                    wrap_focused: false,
+                });
             }
+        }
+    }
+
+    fn handle_search_wrap_dialog_action(&mut self, action: Action) {
+        match action {
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
+            Action::Quit => self.should_quit = true,
+            Action::DialogCancel | Action::QuickSearchClear => {
+                self.search_wrap_dialog = None;
+            }
+            Action::DialogConfirm => {
+                if let Some(dlg) = self.search_wrap_dialog.take() {
+                    if dlg.wrap_focused {
+                        // User chose to wrap around
+                        if let AppMode::Editing(ref mut e) = self.mode {
+                            if !e.find_wrapped(&dlg.params) {
+                                e.status_msg = Some(format!("'{}' not found", dlg.params.query));
+                            }
+                        }
+                    }
+                    // else: Stop was focused (default), just dismiss
+                }
+            }
+            Action::SwitchPanel
+            | Action::SwitchPanelReverse
+            | Action::CursorLeft
+            | Action::CursorRight => {
+                if let Some(ref mut dlg) = self.search_wrap_dialog {
+                    dlg.wrap_focused = !dlg.wrap_focused;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -5306,10 +5983,10 @@ impl App {
                 }
             }
             Action::EditBuiltin => {
-                // F4: open file in editor
+                // F4: open file in editor/hex/parquet
                 let file_path = self.diff_panels[side].as_mut().and_then(|d| d.enter());
                 if let Some(path) = file_path {
-                    self.mode = AppMode::Editing(Box::new(crate::editor::EditorState::open(path)));
+                    self.open_file_for_edit(path);
                 }
             }
             Action::CursorRight => {
@@ -5376,9 +6053,16 @@ impl App {
             Action::None | Action::Tick | Action::Resize(_, _) => {}
             Action::TerminalInput(bytes) => {
                 if let Some(ref mut tp) = self.claude_panels[side] {
-                    // Auto-scroll to bottom when user types
+                    tp.clear_selection();
                     tp.scroll_to_bottom();
                     tp.write_bytes(&bytes);
+                }
+            }
+            Action::CopySelection => {
+                if let Some(ref tp) = self.claude_panels[side] {
+                    if let Some(len) = tp.copy_selection() {
+                        self.status_message = Some(format!("Copied {} chars", len));
+                    }
                 }
             }
             Action::SwitchPanel => self.handle_switch_panel(),
@@ -5394,7 +6078,18 @@ impl App {
             }
             Action::MouseClick(col, row) => {
                 if self.click_in_claude(col, row) {
-                    // Click inside Claude panel — stay focused
+                    // Copy any existing drag selection before starting new one
+                    if let Some(ref tp) = self.claude_panels[side] {
+                        if tp.selection_range().is_some() {
+                            tp.copy_selection();
+                        }
+                    }
+                    let coords = self.claude_screen_coords(side, col, row);
+                    if let Some(ref mut tp) = self.claude_panels[side] {
+                        if let Some((sr, sc)) = coords {
+                            tp.click_select(sr, sc);
+                        }
+                    }
                 } else {
                     self.focus = PanelFocus::FilePanel;
                     self.handle_mouse_click(col, row);
@@ -5402,26 +6097,101 @@ impl App {
             }
             Action::MouseDoubleClick(col, row) => {
                 if self.click_in_claude(col, row) {
-                    // Double-click inside Claude panel — absorb
+                    let coords = self.claude_screen_coords(side, col, row);
+                    if let Some(ref mut tp) = self.claude_panels[side] {
+                        if let Some((sr, sc)) = coords {
+                            tp.select_word_at(sr, sc);
+                            tp.copy_selection();
+                        }
+                    }
                 } else {
                     self.focus = PanelFocus::FilePanel;
                     self.handle_mouse_double_click(col, row);
                 }
             }
+            Action::MouseTripleClick(col, row) => {
+                if self.click_in_claude(col, row) {
+                    let coords = self.claude_screen_coords(side, col, row);
+                    if let Some(ref mut tp) = self.claude_panels[side] {
+                        if let Some((sr, _)) = coords {
+                            tp.select_line_at(sr);
+                            tp.copy_selection();
+                        }
+                    }
+                } else {
+                    self.focus = PanelFocus::FilePanel;
+                    self.handle_mouse_click(col, row);
+                }
+            }
+            Action::MouseDrag(col, row) => {
+                let coords = self.claude_screen_coords_clamped(side, col, row);
+                if let Some(ref mut tp) = self.claude_panels[side] {
+                    if let Some((sr, sc)) = coords {
+                        tp.drag_select(sr, sc);
+                    }
+                }
+            }
+            Action::MouseShiftClick(col, row) => {
+                if self.click_in_claude(col, row) {
+                    let coords = self.claude_screen_coords(side, col, row);
+                    if let Some(ref mut tp) = self.claude_panels[side] {
+                        if let Some((sr, sc)) = coords {
+                            tp.drag_select(sr, sc);
+                        }
+                    }
+                }
+            }
             Action::MouseScrollUp(_, _) | Action::PageUp => {
                 if let Some(ref mut tp) = self.claude_panels[side] {
+                    tp.clear_selection();
                     let lines = if matches!(action, Action::PageUp) { 20 } else { 3 };
                     tp.scroll_up(lines);
                 }
             }
             Action::MouseScrollDown(_, _) | Action::PageDown => {
                 if let Some(ref mut tp) = self.claude_panels[side] {
+                    tp.clear_selection();
                     let lines = if matches!(action, Action::PageDown) { 20 } else { 3 };
                     tp.scroll_down(lines);
                 }
             }
             _ => {}
         }
+    }
+
+    /// Convert global screen coordinates to Claude panel inner (screen) coordinates.
+    /// Returns None if the position is outside the panel's inner area.
+    fn claude_screen_coords(&self, side: usize, col: u16, row: u16) -> Option<(u16, u16)> {
+        let area = self.claude_panel_areas[side]?;
+        let inner_x = area.x + 1;
+        let inner_y = area.y + 1;
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = area.height.saturating_sub(2);
+        if col < inner_x || row < inner_y {
+            return None;
+        }
+        let screen_col = col - inner_x;
+        let screen_row = row - inner_y;
+        if screen_col >= inner_w || screen_row >= inner_h {
+            return None;
+        }
+        Some((screen_row, screen_col))
+    }
+
+    /// Convert global screen coordinates to Claude panel inner coordinates, clamped to bounds.
+    /// Used for drag selection so the mouse can extend beyond the panel edge.
+    fn claude_screen_coords_clamped(&self, side: usize, col: u16, row: u16) -> Option<(u16, u16)> {
+        let area = self.claude_panel_areas[side]?;
+        let inner_x = area.x + 1;
+        let inner_y = area.y + 1;
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = area.height.saturating_sub(2);
+        if inner_w == 0 || inner_h == 0 {
+            return None;
+        }
+        let screen_col = col.saturating_sub(inner_x).min(inner_w - 1);
+        let screen_row = row.saturating_sub(inner_y).min(inner_h - 1);
+        Some((screen_row, screen_col))
     }
 
     fn click_in_claude(&self, col: u16, row: u16) -> bool {
@@ -5525,6 +6295,7 @@ impl App {
             Action::None | Action::Tick | Action::Resize(_, _) => {}
             Action::TerminalInput(bytes) => {
                 if let Some(ref mut sp) = self.shell_panels[side] {
+                    sp.clear_selection();
                     sp.scroll_to_bottom();
                     sp.write_bytes(&bytes);
                 }
@@ -5547,20 +6318,138 @@ impl App {
             Action::BottomMaximize => {
                 self.bottom_maximized[side] = !self.bottom_maximized[side];
             }
-            Action::MouseClick(col, row) => self.handle_mouse_click(col, row),
-            Action::MouseDoubleClick(col, row) => self.handle_mouse_double_click(col, row),
+            Action::CopySelection => {
+                if let Some(ref sp) = self.shell_panels[side] {
+                    if let Some(len) = sp.copy_selection() {
+                        self.status_message = Some(format!("Copied {} chars", len));
+                    }
+                }
+            }
+            Action::MouseClick(col, row) => {
+                if self.click_in_shell(col, row) {
+                    // Copy any existing drag selection before starting new one
+                    if let Some(ref sp) = self.shell_panels[side] {
+                        if sp.selection_range().is_some() {
+                            sp.copy_selection();
+                        }
+                    }
+                    let coords = self.shell_screen_coords(side, col, row);
+                    if let Some(ref mut sp) = self.shell_panels[side] {
+                        if let Some((sr, sc)) = coords {
+                            sp.click_select(sr, sc);
+                        }
+                    }
+                } else {
+                    self.focus = PanelFocus::FilePanel;
+                    self.handle_mouse_click(col, row);
+                }
+            }
+            Action::MouseDoubleClick(col, row) => {
+                if self.click_in_shell(col, row) {
+                    let coords = self.shell_screen_coords(side, col, row);
+                    if let Some(ref mut sp) = self.shell_panels[side] {
+                        if let Some((sr, sc)) = coords {
+                            sp.select_word_at(sr, sc);
+                            sp.copy_selection();
+                        }
+                    }
+                } else {
+                    self.focus = PanelFocus::FilePanel;
+                    self.handle_mouse_double_click(col, row);
+                }
+            }
+            Action::MouseTripleClick(col, row) => {
+                if self.click_in_shell(col, row) {
+                    let coords = self.shell_screen_coords(side, col, row);
+                    if let Some(ref mut sp) = self.shell_panels[side] {
+                        if let Some((sr, _)) = coords {
+                            sp.select_line_at(sr);
+                            sp.copy_selection();
+                        }
+                    }
+                } else {
+                    self.focus = PanelFocus::FilePanel;
+                    self.handle_mouse_click(col, row);
+                }
+            }
+            Action::MouseDrag(col, row) => {
+                let coords = self.shell_screen_coords_clamped(side, col, row);
+                if let Some(ref mut sp) = self.shell_panels[side] {
+                    if let Some((sr, sc)) = coords {
+                        sp.drag_select(sr, sc);
+                    }
+                }
+            }
+            Action::MouseShiftClick(col, row) => {
+                if self.click_in_shell(col, row) {
+                    let coords = self.shell_screen_coords(side, col, row);
+                    if let Some(ref mut sp) = self.shell_panels[side] {
+                        if let Some((sr, sc)) = coords {
+                            sp.drag_select(sr, sc);
+                        }
+                    }
+                }
+            }
             Action::MouseScrollUp(_, _) => {
                 if let Some(ref mut sp) = self.shell_panels[side] {
+                    sp.clear_selection();
                     sp.scroll_up(3);
                 }
             }
             Action::MouseScrollDown(_, _) => {
                 if let Some(ref mut sp) = self.shell_panels[side] {
+                    sp.clear_selection();
                     sp.scroll_down(3);
                 }
             }
             _ => {}
         }
+    }
+
+    fn shell_screen_coords(&self, side: usize, col: u16, row: u16) -> Option<(u16, u16)> {
+        let area = self.shell_panel_areas[side]?;
+        let inner_x = area.x + 1;
+        let inner_y = area.y + 1;
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = area.height.saturating_sub(2);
+        if col < inner_x || row < inner_y {
+            return None;
+        }
+        let screen_col = col - inner_x;
+        let screen_row = row - inner_y;
+        if screen_col >= inner_w || screen_row >= inner_h {
+            return None;
+        }
+        Some((screen_row, screen_col))
+    }
+
+    fn shell_screen_coords_clamped(&self, side: usize, col: u16, row: u16) -> Option<(u16, u16)> {
+        let area = self.shell_panel_areas[side]?;
+        let inner_x = area.x + 1;
+        let inner_y = area.y + 1;
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = area.height.saturating_sub(2);
+        if inner_w == 0 || inner_h == 0 {
+            return None;
+        }
+        let screen_col = col.saturating_sub(inner_x).min(inner_w - 1);
+        let screen_row = row.saturating_sub(inner_y).min(inner_h - 1);
+        Some((screen_row, screen_col))
+    }
+
+    fn click_in_shell(&self, col: u16, row: u16) -> bool {
+        for side in 0..2 {
+            if let Some(area) = self.shell_panel_areas[side] {
+                if col >= area.x
+                    && col < area.x + area.width
+                    && row >= area.y
+                    && row < area.y + area.height
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn resize_shells(&mut self) {
@@ -6614,7 +7503,7 @@ impl App {
         };
 
         let mut first_err: Option<anyhow::Error> = None;
-        for name in names {
+        for name in &names {
             let result = self.remote_mkdir(&dir.join(name));
             if let Err(e) = result {
                 first_err = Some(e);
@@ -6629,6 +7518,13 @@ impl App {
 
         self.mode = AppMode::Normal;
         self.reload_panels();
+
+        // Position cursor on the first created directory
+        if let Some(name) = names.first() {
+            // For nested paths like "a/b/c", select the top-level component
+            let top = name.split('/').next().unwrap_or(name);
+            self.active_panel_mut().select_by_name(top);
+        }
     }
 
     // --- Copy dialog handler ---
@@ -6696,8 +7592,35 @@ impl App {
         }
     }
 
+    fn build_copy_options(state: &CopyDialogState) -> (fs_ops::CopyOptions, bool) {
+        let is_ask = state.overwrite_mode == OverwriteMode::Ask;
+        let conflict = match state.overwrite_mode {
+            OverwriteMode::Ask | OverwriteMode::Overwrite => fs_ops::ConflictPolicy::Overwrite,
+            OverwriteMode::Skip => fs_ops::ConflictPolicy::Skip,
+            OverwriteMode::Rename => fs_ops::ConflictPolicy::Rename,
+            OverwriteMode::Append => fs_ops::ConflictPolicy::Append,
+        };
+        let symlink_mode = match state.symlink_mode {
+            SymlinkMode::Smart => fs_ops::SymlinkCopyMode::Smart,
+            SymlinkMode::CopyContents => fs_ops::SymlinkCopyMode::Follow,
+            SymlinkMode::CopyAsLink => fs_ops::SymlinkCopyMode::Preserve,
+        };
+        (
+            fs_ops::CopyOptions {
+                sparse: state.produce_sparse,
+                conflict,
+                copy_permissions: state.copy_access_mode,
+                copy_xattrs: state.copy_extended_attrs,
+                disable_write_cache: state.disable_write_cache,
+                use_cow: state.use_cow,
+                symlink_mode,
+            },
+            is_ask,
+        )
+    }
+
     fn confirm_copy_dialog(&mut self) {
-        let (source_paths, dest, is_move, source_panel) = {
+        let (source_paths, dests, is_move, source_panel, opts, is_ask) = {
             let state = match &self.mode {
                 AppMode::CopyDialog(s) => s,
                 _ => return,
@@ -6706,11 +7629,25 @@ impl App {
                 self.mode = AppMode::Normal;
                 return;
             }
+            let (opts, is_ask) = Self::build_copy_options(state);
+            let dests: Vec<PathBuf> = if state.process_multiple {
+                state
+                    .destination
+                    .text
+                    .split(';')
+                    .map(|s| PathBuf::from(s.trim()))
+                    .filter(|p| !p.as_os_str().is_empty())
+                    .collect()
+            } else {
+                vec![PathBuf::from(state.destination.text.trim())]
+            };
             (
                 state.source_paths.clone(),
-                PathBuf::from(&state.destination.text),
+                dests,
                 state.is_move,
                 state.source_panel,
+                opts,
+                is_ask,
             )
         };
 
@@ -6721,94 +7658,148 @@ impl App {
         let src_side = source_panel;
         let dst_side = 1 - source_panel;
 
-        let mut first_err: Option<anyhow::Error> = None;
-        let total_files = source_paths.len();
-        for (i, source_path) in source_paths.iter().enumerate() {
-            let file_name = source_path
-                .file_name()
-                .map(|n| n.to_string_lossy().into_owned())
-                .unwrap_or_default();
-            let dest_path = dest.join(&file_name);
+        self.mode = AppMode::Normal;
 
-            // Show progress for remote operations
-            if src_remote || dst_remote {
-                let op = if is_move { "Moving" } else { "Copying" };
-                self.status_message = Some(format!(
-                    "{} {}/{}: {}",
-                    op, i + 1, total_files, file_name
-                ));
-                self.dirty = true;
-            }
+        // Remote operations use a simpler path (no copy options / ask mode)
+        if src_remote || dst_remote {
+            let mut first_err: Option<anyhow::Error> = None;
+            let total_files = source_paths.len();
+            for dest in &dests {
+                for (i, source_path) in source_paths.iter().enumerate() {
+                    let file_name = source_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let dest_path = dest.join(&file_name);
 
-            let result = match (src_remote, dst_remote) {
-                (false, false) => {
-                    // Local -> Local
-                    if is_move {
-                        fs_ops::move_entry(source_path, &dest)
-                    } else {
-                        fs_ops::copy_entry(source_path, &dest)
+                    let op = if is_move { "Moving" } else { "Copying" };
+                    self.status_message = Some(format!(
+                        "{} {}/{}: {}",
+                        op, i + 1, total_files, file_name
+                    ));
+                    self.dirty = true;
+
+                    let result = match (src_remote, dst_remote) {
+                        (true, false) => {
+                            let is_dir = self.panels[src_side]
+                                .entries
+                                .iter()
+                                .find(|e| e.path == *source_path)
+                                .map(|e| e.is_dir)
+                                .unwrap_or(false);
+                            self.remote_download(src_side, source_path, &dest_path, is_dir)
+                                .map(|_| ())
+                        }
+                        (false, true) => {
+                            let is_dir = source_path.is_dir();
+                            self.remote_upload(dst_side, source_path, &dest_path, is_dir)
+                                .map(|_| ())
+                        }
+                        (true, true) => {
+                            Err(anyhow::anyhow!("Remote-to-remote copy not yet supported"))
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Err(e) = result {
+                        first_err = Some(e);
+                        break;
                     }
                 }
-                (true, false) => {
-                    // Remote -> Local (download)
-                    // Determine if source is a dir from entries
-                    let is_dir = self.panels[src_side]
-                        .entries
-                        .iter()
-                        .find(|e| e.path == *source_path)
-                        .map(|e| e.is_dir)
-                        .unwrap_or(false);
-                    self.remote_download(src_side, source_path, &dest_path, is_dir)
-                        .map(|_| ())
-                }
-                (false, true) => {
-                    // Local -> Remote (upload)
-                    let is_dir = source_path.is_dir();
-                    self.remote_upload(dst_side, source_path, &dest_path, is_dir)
-                        .map(|_| ())
-                }
-                (true, true) => {
-                    // Remote -> Remote: not supported yet
-                    Err(anyhow::anyhow!("Remote-to-remote copy not yet supported"))
-                }
-            };
-            if let Err(e) = result {
-                first_err = Some(e);
-                break;
-            }
-        }
-
-        // For move operations from remote, delete source after copy.
-        // Use src_side (snapshotted at dialog-open time) instead of
-        // self.active_panel, which may have changed while the dialog was open.
-        if is_move && first_err.is_none() && src_remote {
-            for source_path in &source_paths {
-                let del_result = match &self.panels[src_side].source {
-                    crate::panel::PanelSource::Local => fs_ops::delete_entry(source_path),
-                    crate::panel::PanelSource::Remote { connection } => {
-                        connection.remove_recursive(source_path)
-                    }
-                };
-                if let Err(e) = del_result {
-                    first_err = Some(e);
+                if first_err.is_some() {
                     break;
                 }
             }
-        }
 
-        match first_err {
-            None => {
-                if src_remote || dst_remote {
-                    let op = if is_move { "Moved" } else { "Copied" };
-                    self.status_message = Some(format!("{} {} file(s)", op, total_files));
-                } else {
-                    self.status_message = None;
+            if is_move && first_err.is_none() && src_remote {
+                for source_path in &source_paths {
+                    let del_result = match &self.panels[src_side].source {
+                        crate::panel::PanelSource::Local => fs_ops::delete_entry(source_path),
+                        crate::panel::PanelSource::Remote { connection } => {
+                            connection.remove_recursive(source_path)
+                        }
+                    };
+                    if let Err(e) = del_result {
+                        first_err = Some(e);
+                        break;
+                    }
                 }
             }
-            Some(e) => self.status_message = Some(format!("Error: {}", e)),
+
+            match first_err {
+                None => {
+                    let op = if is_move { "Moved" } else { "Copied" };
+                    self.status_message = Some(format!("{} {} file(s)", op, total_files));
+                }
+                Some(e) => self.status_message = Some(format!("Error: {}", e)),
+            }
+            self.reload_panels();
+            return;
         }
 
-        self.mode = AppMode::Normal;
+        // Local → Local: use full copy options
+        if is_ask {
+            let mut items = Vec::new();
+            for dest in &dests {
+                for source in &source_paths {
+                    match fs_ops::plan_copy(source, dest, opts.symlink_mode) {
+                        Ok(plan) => items.extend(plan),
+                        Err(e) => {
+                            self.status_message = Some(format!("Error: {}", e));
+                            self.reload_panels();
+                            return;
+                        }
+                    }
+                }
+            }
+            self.continue_copy_ask(items, is_move, opts);
+        } else {
+            for dest in &dests {
+                for source_path in &source_paths {
+                    let result = if is_move {
+                        fs_ops::move_entry(source_path, dest, &opts)
+                    } else {
+                        fs_ops::copy_entry(source_path, dest, &opts)
+                    };
+                    if let Err(e) = result {
+                        self.status_message = Some(format!("Error: {}", e));
+                        self.reload_panels();
+                        return;
+                    }
+                }
+            }
+            self.reload_panels();
+        }
+    }
+
+    /// Process a flat list of copy items in Ask mode. For each file item,
+    /// check if dest exists; if so, show the overwrite dialog and pause.
+    fn continue_copy_ask(
+        &mut self,
+        items: Vec<fs_ops::CopyItem>,
+        is_move: bool,
+        opts: fs_ops::CopyOptions,
+    ) {
+        let mut exec_opts = opts.clone();
+        exec_opts.conflict = fs_ops::ConflictPolicy::Overwrite;
+
+        for (i, item) in items.iter().enumerate() {
+            // Only ask about file conflicts, not directories or symlinks
+            if !item.is_dir && !item.is_symlink && item.dst.exists() {
+                self.overwrite_ask = Some(OverwriteAskState {
+                    focused: OverwriteAskChoice::Overwrite,
+                    conflict_item: item.clone(),
+                    remaining_items: items[i + 1..].to_vec(),
+                    is_move,
+                    copy_opts: opts,
+                });
+                return;
+            }
+
+            if let Err(e) = fs_ops::exec_copy_item(item, &exec_opts) {
+                self.status_message = Some(format!("Error: {}", e));
+                return;
+            }
+        }
         self.reload_panels();
     }
 
@@ -7101,10 +8092,7 @@ impl App {
             e.click_at(col, row);
             return;
         }
-        if matches!(
-            self.mode,
-            AppMode::Viewing(_) | AppMode::HexViewing(_) | AppMode::ParquetViewing(_)
-        ) {
+        if matches!(self.mode, AppMode::ParquetViewing(_)) {
             return;
         }
         // Diff viewer: click positions cursor on left or right side
@@ -7307,22 +8295,6 @@ impl App {
 
     fn handle_mouse_scroll(&mut self, col: u16, row: u16, delta: i32) {
         match &mut self.mode {
-            AppMode::Viewing(v) => {
-                if delta < 0 {
-                    v.scroll_up((-delta) as usize);
-                } else {
-                    v.scroll_down(delta as usize);
-                }
-                return;
-            }
-            AppMode::HexViewing(h) => {
-                if delta < 0 {
-                    h.scroll_up((-delta) as usize);
-                } else {
-                    h.scroll_down(delta as usize);
-                }
-                return;
-            }
             AppMode::ParquetViewing(p) => {
                 if delta < 0 {
                     p.move_up((-delta) as usize);
@@ -7489,6 +8461,17 @@ impl App {
         self.reload_panels();
     }
 
+    /// Close hex editor or text editor, returning to normal or stashed diff.
+    fn close_hex_or_editor(&mut self) {
+        if matches!(self.mode, AppMode::HexViewing(_)) {
+            self.mode = AppMode::Normal;
+            self.focus = PanelFocus::FilePanel;
+            self.needs_clear = true;
+        } else {
+            self.restore_or_close_editor();
+        }
+    }
+
     /// Close editor: if we came from a diff viewer, re-open it; otherwise go to Normal.
     fn restore_or_close_editor(&mut self) {
         if let Some(stash) = self.stashed_diff.take() {
@@ -7516,10 +8499,7 @@ impl App {
 
     fn handle_dialog_cancel(&mut self) {
         match &self.mode {
-            AppMode::Viewing(_)
-            | AppMode::HexViewing(_)
-            | AppMode::ParquetViewing(_)
-            | AppMode::DiffViewing(_) => {
+            AppMode::ParquetViewing(_) | AppMode::DiffViewing(_) => {
                 self.mode = AppMode::Normal;
                 self.needs_clear = true;
             }
