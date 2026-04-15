@@ -64,9 +64,16 @@ pub fn render_with_overlays(
     }
 }
 
-fn render_goto_path_input(frame: &mut Frame, area: Rect, state: &GotoPathState) {
+/// Shared scrollable text-input bar with prompt, selection, and cursor positioning.
+/// `suffix_spans` are appended after the input text (e.g. result count).
+fn render_input_bar(
+    frame: &mut Frame,
+    area: Rect,
+    input: &crate::text_input::TextInput,
+    prompt: &str,
+    suffix_spans: Vec<Span<'_>>,
+) {
     let t = theme();
-
     let prompt_style = Style::default()
         .fg(t.dialog_title_fg)
         .bg(t.dialog_input_bg)
@@ -76,14 +83,12 @@ fn render_goto_path_input(frame: &mut Frame, area: Rect, state: &GotoPathState) 
         .bg(t.dialog_input_bg);
     let sel_style = t.input_selection_style();
 
-    let text = &state.input.text;
-    let cursor = state.input.cursor;
+    let text = &input.text;
+    let cursor = input.cursor;
     let before = &text[..cursor];
     let after = &text[cursor..];
 
-    // Scroll the input so the cursor is visible
-    let prompt_prefix = " Go: ";
-    let available = area.width as usize - prompt_prefix.len();
+    let available = area.width as usize - prompt.len();
     let before_chars = before.chars().count();
     let scroll_offset = if before_chars > available {
         before_chars - available + 1
@@ -100,35 +105,37 @@ fn render_goto_path_input(frame: &mut Frame, area: Rect, state: &GotoPathState) 
         0
     };
 
-    let mut spans = vec![Span::styled(prompt_prefix, prompt_style)];
+    let mut spans = vec![Span::styled(prompt, prompt_style)];
 
-    if let Some((sel_start, sel_end)) = state.input.selection_range() {
+    if let Some((sel_start, sel_end)) = input.selection_range() {
         if sel_start != sel_end {
-            // Render with selection highlighting, accounting for scroll
             let vis_text = &text[visible_start..];
-            let vis_sel_start = sel_start.saturating_sub(visible_start);
-            let vis_sel_end = sel_end.saturating_sub(visible_start);
-            let vis_sel_start = vis_sel_start.min(vis_text.len());
-            let vis_sel_end = vis_sel_end.min(vis_text.len());
+            let vis_sel_start = sel_start.saturating_sub(visible_start).min(vis_text.len());
+            let vis_sel_end = sel_end.saturating_sub(visible_start).min(vis_text.len());
 
-            let pre = &vis_text[..vis_sel_start];
-            let sel = &vis_text[vis_sel_start..vis_sel_end];
-            let post = &vis_text[vis_sel_end..];
+            spans.push(Span::styled(
+                vis_text[..vis_sel_start].to_string(),
+                input_style,
+            ));
+            spans.push(Span::styled(
+                vis_text[vis_sel_start..vis_sel_end].to_string(),
+                sel_style,
+            ));
+            spans.push(Span::styled(
+                vis_text[vis_sel_end..].to_string(),
+                input_style,
+            ));
+            spans.extend(suffix_spans);
 
-            spans.push(Span::styled(pre.to_string(), input_style));
-            spans.push(Span::styled(sel.to_string(), sel_style));
-            spans.push(Span::styled(post.to_string(), input_style));
-
-            let line = Line::from(spans);
             frame.render_widget(Clear, area);
             frame.render_widget(
-                ratatui::widgets::Paragraph::new(line)
+                ratatui::widgets::Paragraph::new(Line::from(spans))
                     .style(Style::default().bg(t.dialog_input_bg)),
                 area,
             );
 
             let visible_before_cursor = &text[visible_start..cursor];
-            let cursor_x = area.x + prompt_prefix.len() as u16 + visible_before_cursor.len() as u16;
+            let cursor_x = area.x + prompt.len() as u16 + visible_before_cursor.len() as u16;
             crate::ui::set_cursor(cursor_x, area.y);
             return;
         }
@@ -139,18 +146,82 @@ fn render_goto_path_input(frame: &mut Frame, area: Rect, state: &GotoPathState) 
     if !after.is_empty() {
         spans.push(Span::styled(after.to_string(), input_style));
     }
+    spans.extend(suffix_spans);
 
-    let line = Line::from(spans);
     frame.render_widget(Clear, area);
     frame.render_widget(
-        ratatui::widgets::Paragraph::new(line).style(Style::default().bg(t.dialog_input_bg)),
+        ratatui::widgets::Paragraph::new(Line::from(spans))
+            .style(Style::default().bg(t.dialog_input_bg)),
         area,
     );
 
-    // Hardware cursor at the input position
-    let cursor_x = area.x + prompt_prefix.len() as u16 + visible_before.len() as u16;
-    let cursor_y = area.y;
-    crate::ui::set_cursor(cursor_x, cursor_y);
+    let cursor_x = area.x + prompt.len() as u16 + visible_before.len() as u16;
+    crate::ui::set_cursor(cursor_x, area.y);
+}
+
+fn render_goto_path_input(frame: &mut Frame, area: Rect, state: &GotoPathState) {
+    render_input_bar(frame, area, &state.input, " Go: ", vec![]);
+}
+
+fn render_fuzzy_input(frame: &mut Frame, area: Rect, state: &FuzzySearchState) {
+    let suffix = if !state.input.text.is_empty() {
+        let t = theme();
+        vec![Span::styled(
+            format!(" {}", state.results.len()),
+            Style::default().fg(t.dialog_title_fg).bg(t.dialog_input_bg),
+        )]
+    } else {
+        vec![]
+    };
+    render_input_bar(frame, area, &state.input, " Find: ", suffix);
+}
+
+/// Shared dropdown-list rendering (bordered, scrollable, highlighted selection).
+fn render_dropdown_list<F>(
+    frame: &mut Frame,
+    area: Rect,
+    total: usize,
+    selected: usize,
+    scroll_offset: usize,
+    render_item: F,
+) where
+    F: Fn(usize) -> Option<(String, Style)>,
+{
+    let t = theme();
+    let border_style = Style::default().fg(t.dialog_border_fg).bg(t.dialog_bg);
+
+    frame.render_widget(Clear, area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(border_style)
+        .style(Style::default().bg(t.dialog_bg));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let max_visible = inner.height as usize;
+    let scroll = if selected >= scroll_offset + max_visible {
+        selected - max_visible + 1
+    } else {
+        scroll_offset
+    };
+
+    for i in 0..max_visible {
+        let idx = scroll + i;
+        let y = inner.y + i as u16;
+        if y >= inner.y + inner.height || idx >= total {
+            break;
+        }
+        let row_area = Rect::new(inner.x, y, inner.width, 1);
+        if let Some((text, style)) = render_item(idx) {
+            let line = Line::from(Span::styled(text, style));
+            frame.render_widget(
+                ratatui::widgets::Paragraph::new(line).style(style),
+                row_area,
+            );
+        }
+    }
 }
 
 fn render_completions(frame: &mut Frame, area: Rect, state: &GotoPathState) {
@@ -160,141 +231,24 @@ fn render_completions(frame: &mut Frame, area: Rect, state: &GotoPathState) {
         .fg(t.dialog_input_fg_focused)
         .bg(t.dialog_input_bg)
         .add_modifier(Modifier::BOLD);
-    let border_style = Style::default().fg(t.dialog_border_fg).bg(t.dialog_bg);
-
-    frame.render_widget(Clear, area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .style(Style::default().bg(t.dialog_bg));
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    // Scroll the list so the selected item is visible
-    let max_visible = inner.height as usize;
     let selected = state.comp_index.unwrap_or(0);
-    let scroll = if selected >= max_visible {
-        selected - max_visible + 1
-    } else {
-        0
-    };
+    let scroll = if selected >= 8 { selected - 7 } else { 0 };
 
-    for i in 0..max_visible {
-        let idx = scroll + i;
-        let y = inner.y + i as u16;
-        if y >= inner.y + inner.height {
-            break;
-        }
-        let row_area = Rect::new(inner.x, y, inner.width, 1);
-
-        if idx < state.completions.len() {
-            let name = &state.completions[idx];
+    render_dropdown_list(
+        frame,
+        area,
+        state.completions.len(),
+        selected,
+        scroll,
+        |idx| {
             let style = if state.comp_index == Some(idx) {
                 highlight
             } else {
                 normal
             };
-            let display = format!(" /{}", name);
-            let line = Line::from(Span::styled(display, style));
-            let p = ratatui::widgets::Paragraph::new(line).style(style);
-            frame.render_widget(p, row_area);
-        }
-    }
-}
-
-fn render_fuzzy_input(frame: &mut Frame, area: Rect, state: &FuzzySearchState) {
-    let t = theme();
-    let prompt_style = Style::default()
-        .fg(t.dialog_title_fg)
-        .bg(t.dialog_input_bg)
-        .add_modifier(Modifier::BOLD);
-    let input_style = Style::default()
-        .fg(t.dialog_input_fg_focused)
-        .bg(t.dialog_input_bg);
-    let sel_style = t.input_selection_style();
-
-    let text = &state.input.text;
-    let cursor = state.input.cursor;
-    let before = &text[..cursor];
-    let after = &text[cursor..];
-
-    let prompt_prefix = " Find: ";
-    let available = area.width as usize - prompt_prefix.len();
-    let before_chars = before.chars().count();
-    let scroll_offset = if before_chars > available {
-        before_chars - available + 1
-    } else {
-        0
-    };
-    let visible_start = if scroll_offset > 0 {
-        before
-            .char_indices()
-            .nth(scroll_offset)
-            .map(|(i, _)| i)
-            .unwrap_or(0)
-    } else {
-        0
-    };
-
-    let count_span = if !state.input.text.is_empty() {
-        Span::styled(
-            format!(" {}", state.results.len()),
-            Style::default().fg(t.dialog_title_fg).bg(t.dialog_input_bg),
-        )
-    } else {
-        Span::styled("", Style::default())
-    };
-
-    let mut spans = vec![Span::styled(prompt_prefix, prompt_style)];
-
-    if let Some((sel_start, sel_end)) = state.input.selection_range() {
-        if sel_start != sel_end {
-            let vis_text = &text[visible_start..];
-            let vis_sel_start = sel_start.saturating_sub(visible_start);
-            let vis_sel_end = sel_end.saturating_sub(visible_start);
-            let vis_sel_start = vis_sel_start.min(vis_text.len());
-            let vis_sel_end = vis_sel_end.min(vis_text.len());
-
-            let pre = &vis_text[..vis_sel_start];
-            let sel = &vis_text[vis_sel_start..vis_sel_end];
-            let post = &vis_text[vis_sel_end..];
-
-            spans.push(Span::styled(pre.to_string(), input_style));
-            spans.push(Span::styled(sel.to_string(), sel_style));
-            spans.push(Span::styled(post.to_string(), input_style));
-            spans.push(count_span);
-
-            frame.render_widget(Clear, area);
-            frame.render_widget(
-                ratatui::widgets::Paragraph::new(Line::from(spans))
-                    .style(Style::default().bg(t.dialog_input_bg)),
-                area,
-            );
-
-            let visible_before_cursor = &text[visible_start..cursor];
-            let cursor_x = area.x + prompt_prefix.len() as u16 + visible_before_cursor.len() as u16;
-            crate::ui::set_cursor(cursor_x, area.y);
-            return;
-        }
-    }
-
-    let visible_before = &before[visible_start..];
-    spans.push(Span::styled(visible_before.to_string(), input_style));
-    spans.push(Span::styled(after.to_string(), input_style));
-    spans.push(count_span);
-
-    frame.render_widget(Clear, area);
-    frame.render_widget(
-        ratatui::widgets::Paragraph::new(Line::from(spans))
-            .style(Style::default().bg(t.dialog_input_bg)),
-        area,
+            Some((format!(" /{}", state.completions[idx]), style))
+        },
     );
-
-    // Hardware cursor
-    let cursor_x = area.x + prompt_prefix.len() as u16 + visible_before.len() as u16;
-    crate::ui::set_cursor(cursor_x, area.y);
 }
 
 fn render_fuzzy_results(frame: &mut Frame, area: Rect, state: &FuzzySearchState) {
@@ -304,46 +258,22 @@ fn render_fuzzy_results(frame: &mut Frame, area: Rect, state: &FuzzySearchState)
         .fg(t.dialog_input_fg_focused)
         .bg(t.dialog_input_bg)
         .add_modifier(Modifier::BOLD);
-    let border_style = Style::default().fg(t.dialog_border_fg).bg(t.dialog_bg);
 
-    frame.render_widget(Clear, area);
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border_style)
-        .style(Style::default().bg(t.dialog_bg));
-
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let max_visible = inner.height as usize;
-
-    for i in 0..max_visible {
-        let y = inner.y + i as u16;
-        if y >= inner.y + inner.height {
-            break;
-        }
-        let row_area = Rect::new(inner.x, y, inner.width, 1);
-
-        if let Some(&(path_idx, _score)) = state.results.get(i) {
-            let path = &state.all_paths[path_idx];
-            let style = if state.selected == i {
-                highlight
-            } else {
-                normal
-            };
-            let display = format!(" {}", path);
-            let line = Line::from(Span::styled(display, style));
-            let p = ratatui::widgets::Paragraph::new(line).style(style);
-            frame.render_widget(p, row_area);
-        }
-    }
+    render_dropdown_list(frame, area, state.results.len(), state.selected, 0, |idx| {
+        let &(path_idx, _score) = state.results.get(idx)?;
+        let style = if state.selected == idx {
+            highlight
+        } else {
+            normal
+        };
+        Some((format!(" {}", state.all_paths[path_idx]), style))
+    });
 }
 
 pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool) {
     let t = theme();
 
-    let title_spans = build_panel_title(panel, t, is_active, area.width as usize);
+    let title_spans = build_panel_title(panel, &t, is_active, area.width as usize);
     let block = Block::default()
         .title(Line::from(title_spans))
         .borders(Borders::ALL)
@@ -547,16 +477,32 @@ fn build_panel_title(
     } else {
         Style::default().fg(t.path_inactive_fg).bg(t.bg)
     };
+    // SFTP prefix if this is a remote panel
+    let sftp_prefix = panel.source.label();
+    let sftp_prefix_len = sftp_prefix.as_ref().map(|s| s.len() + 2).unwrap_or(0); // " SFTP: user@host | "
+
     // Build the git suffix first to know how much space the path gets
-    let git_suffix = build_git_suffix(panel, t);
+    let git_suffix = if panel.source.is_remote() {
+        vec![] // No git info for SFTP panels
+    } else {
+        build_git_suffix(panel, t)
+    };
     let git_len: usize = git_suffix.iter().map(|s| s.width()).sum();
     // 4 = " " prefix + " " suffix + 2 border chars
-    let path_budget = panel_width.saturating_sub(git_len + 4);
+    let path_budget = panel_width.saturating_sub(git_len + sftp_prefix_len + 4);
 
     // Shorten path: replace home dir with ~, then truncate from left
     let path = shorten_path(&panel.current_dir.to_string_lossy(), path_budget);
 
     spans.push(Span::styled(" ", title_style));
+    if let Some(label) = sftp_prefix {
+        let sftp_style = Style::default()
+            .fg(t.git_branch_fg)
+            .bg(t.bg)
+            .add_modifier(Modifier::BOLD);
+        spans.push(Span::styled(label, sftp_style));
+        spans.push(Span::styled(" ", title_style));
+    }
     spans.push(Span::styled(path, title_style));
 
     spans.extend(git_suffix);

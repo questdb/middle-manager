@@ -37,7 +37,7 @@ pub struct TerminalPanel {
 impl TerminalPanel {
     /// Spawn a command in a PTY with the given working directory and dimensions.
     #[allow(clippy::too_many_arguments)]
-    fn spawn_cmd(
+    pub fn spawn_cmd(
         command: &str,
         args: &[&str],
         dir: &Path,
@@ -141,6 +141,30 @@ impl TerminalPanel {
             rows,
             format!(" Claude -c — {} ", dir.display()),
             false,
+            wakeup,
+        )
+    }
+
+    /// Spawn an SSH connection in a PTY.
+    pub fn spawn_ssh(
+        host: &crate::ssh::SshHost,
+        cols: u16,
+        rows: u16,
+        wakeup: WakeupSender,
+    ) -> anyhow::Result<Self> {
+        let args = host.ssh_args();
+        let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let dir = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        Self::spawn_cmd(
+            "ssh",
+            &args_refs,
+            &dir,
+            cols,
+            rows,
+            format!(" SSH: {} ", host.name),
+            true, // SSH sessions need hardware cursor
             wakeup,
         )
     }

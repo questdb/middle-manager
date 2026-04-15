@@ -32,6 +32,9 @@ pub enum Action {
     EditFile,
     Archive,
     CalcSize,
+    ViewFile,
+
+    CreateFile,
 
     // Sorting
     CycleSort,
@@ -48,6 +51,7 @@ pub enum Action {
 
     // Toggle checkbox / cycle dropdown in copy dialog
     Toggle,
+    ToggleReverse,
 
     // Go to line (all viewer/editor modes)
     GotoLinePrompt,
@@ -99,11 +103,14 @@ pub enum Action {
     // GitHub / CI
     OpenPr,
     ToggleCi,
+    ExtractCiFailures,
     ToggleDiff,
 
-    // Terminal / Shell
+    // Terminal / Shell / SSH / Sessions
     ToggleClaude,
     ToggleShell,
+    ToggleSsh,
+    ToggleSessions,
     TerminalInput(Vec<u8>),
     TerminalOpenFile,
     BottomResizeUp,
@@ -115,6 +122,9 @@ pub enum Action {
 
     // Help
     ShowHelp,
+
+    // Settings
+    ToggleSettings,
 
     // Application
     Quit,

@@ -69,6 +69,7 @@ pub struct GitInfo {
 
 /// Cached git state per repository root.
 /// Shared between panels that are in the same repo.
+#[derive(Default)]
 pub struct GitCache {
     /// Repo root path → cached data.
     cache: HashMap<PathBuf, CacheEntry>,
@@ -97,11 +98,7 @@ const REFRESH_INTERVAL_MS: u128 = 30_000;
 
 impl GitCache {
     pub fn new() -> Self {
-        Self {
-            cache: HashMap::new(),
-            pr_receivers: HashMap::new(),
-            git_receivers: HashMap::new(),
-        }
+        Self::default()
     }
 
     /// Get git info for a directory view. Uses cached data if fresh enough.

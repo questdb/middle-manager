@@ -39,6 +39,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("F6", "Move file/selection"),
             ("Shift+F6", "Rename"),
             ("F7", "Create directory"),
+            ("Shift+F7", "Create (touch) file"),
             ("Shift+F5", "Create archive (tar.zst/gz/xz/zip)"),
             ("F8", "Delete file/selection"),
             ("F9", "Cycle sort (name/size/date)"),
@@ -55,6 +56,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Left", "Collapse check / jump to parent"),
             ("Enter", "Expand/collapse or download step log"),
             ("o", "Open check in browser"),
+            ("Ctrl+E", "Extract all failures to file"),
             ("Alt+Up / Alt+Down", "Resize panel split"),
             ("Alt+Enter", "Maximize / restore panel"),
         ],
@@ -123,6 +125,28 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Ctrl+C", "Copy selection (or SIGINT if none)"),
             ("Scroll / Trackpad", "Scroll through output history"),
             ("All other keys", "Forwarded to Claude Code"),
+        ],
+    ),
+    (
+        "Connectivity (Ctrl+T / Shift+F2) [experimental]",
+        &[
+            (
+                "Ctrl+T / Shift+F2",
+                "Open remote dialog / close panel / disconnect",
+            ),
+            (
+                "Alt+Left/Right",
+                "Switch protocol (SSH/SFTP/SMB/WebDAV/S3/GCS/Azure/NFS)",
+            ),
+            ("Tab/BackTab", "Next/previous field"),
+            ("F2", "Save current connection for quick access"),
+            ("Enter", "Connect to selected / typed host"),
+            ("Del", "Remove saved connection"),
+            ("F1", "Switch focus to file panel"),
+            ("Scroll / Trackpad", "Scroll through output history"),
+            ("Alt+Up / Alt+Down", "Resize panel split"),
+            ("Alt+Enter", "Maximize / restore panel"),
+            ("All other keys", "Forwarded to SSH session"),
         ],
     ),
     (
@@ -203,9 +227,21 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         ],
     ),
     (
+        "Connectivity: Sessions (Ctrl+Y) [experimental]",
+        &[
+            ("Ctrl+Y", "Open / close session manager"),
+            ("Up / Down", "Navigate sessions"),
+            ("Enter", "Attach to selected session"),
+            ("n", "Create new persistent session"),
+            ("d / Delete", "Kill selected session"),
+            ("Esc", "Close dialog"),
+        ],
+    ),
+    (
         "Application",
         &[
             ("F1", "This help screen"),
+            ("Shift+F1", "Settings (theme, etc.)"),
             ("F10 / Ctrl+Q", "Quit (with confirmation)"),
             ("F11", "Open PR in browser"),
         ],
