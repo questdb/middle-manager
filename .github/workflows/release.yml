@@ -13,6 +13,7 @@ on:
   push:
     tags:
       - "v[0-9]+.[0-9]+.[0-9]+"
+      - "[0-9]+.[0-9]+.[0-9]+"
   workflow_dispatch:
     inputs:
       tag:
@@ -44,6 +45,12 @@ jobs:
             use_cross: true
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set Cargo.toml version from release tag
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          sed -i.bak "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
+          rm -f Cargo.toml.bak
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -98,6 +105,11 @@ jobs:
     needs: build
     steps:
       - uses: actions/checkout@v4
+
+      - name: Set Cargo.toml version from release tag
+        run: |
+          VERSION="${RELEASE_TAG#v}"
+          sed -i "s/^version = \".*\"/version = \"$VERSION\"/" Cargo.toml
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -205,6 +217,7 @@ jobs:
           VERSION="${RELEASE_TAG#v}"
           sed \
             -e "s/{{VERSION}}/$VERSION/g" \
+            -e "s|{{RELEASE_TAG}}|$RELEASE_TAG|g" \
             -e "s/{{SHA256_ARM64_MAC}}/${{ needs.release.outputs.sha256_arm64 }}/g" \
             -e "s/{{SHA256_X86_MAC}}/${{ needs.release.outputs.sha256_x86 }}/g" \
             source/dist/homebrew/middle-manager.rb.template \
