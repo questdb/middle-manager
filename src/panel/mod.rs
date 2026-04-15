@@ -375,7 +375,13 @@ impl Panel {
     /// Start an async directory size calculation for the given path.
     /// Returns false if already calculating or done.
     pub fn start_size_calc(&mut self, path: PathBuf) -> bool {
-        if self.dir_sizes.contains_key(&path) {
+        self.start_size_calc_at(path.clone(), path)
+    }
+
+    /// Start an async size calculation that scans `scan_path` but stores
+    /// the result under `key` in `dir_sizes`.
+    pub fn start_size_calc_at(&mut self, key: PathBuf, scan_path: PathBuf) -> bool {
+        if self.dir_sizes.contains_key(&key) {
             return false;
         }
         let accumulator = Arc::new(AtomicU64::new(0));
@@ -384,13 +390,12 @@ impl Panel {
         let acc = accumulator.clone();
         let fin = finished.clone();
         let can = cancelled.clone();
-        let p = path.clone();
         std::thread::spawn(move || {
-            calc_dir_size_recursive(&p, &acc, &can);
+            calc_dir_size_recursive(&scan_path, &acc, &can);
             fin.store(true, Ordering::Release);
         });
         self.dir_sizes.insert(
-            path,
+            key,
             DirSizeState::Calculating {
                 accumulator,
                 finished,
