@@ -18,8 +18,8 @@ pub mod search_dialog;
 pub mod search_results_view;
 pub mod session_dialog;
 pub mod settings_dialog;
-pub mod ssh_dialog;
 mod shadow;
+pub mod ssh_dialog;
 pub mod terminal_view;
 
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -44,19 +44,6 @@ pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> &str {
         end = i + c.len_utf8();
     }
     &s[..end]
-}
-
-/// Find the nearest valid char boundary at or after `byte_pos` in `s`.
-/// Returns `s.len()` if no valid boundary exists before the end.
-pub(crate) fn ceil_char_boundary(s: &str, byte_pos: usize) -> usize {
-    if byte_pos >= s.len() {
-        return s.len();
-    }
-    let mut pos = byte_pos;
-    while pos < s.len() && !s.is_char_boundary(pos) {
-        pos += 1;
-    }
-    pos
 }
 
 use std::cell::Cell;
@@ -91,6 +78,16 @@ pub fn take_dialog_content() -> Option<Rect> {
     DIALOG_CONTENT.replace(None)
 }
 
+/// Layout result for a panel column: (file, ci, diff, shell, claude, ssh).
+type PanelColumnLayout = (
+    Rect,
+    Option<Rect>,
+    Option<Rect>,
+    Option<Rect>,
+    Option<Rect>,
+    Option<Rect>,
+);
+
 /// Split a panel column into file area + optional bottom panels (CI, diff, shell, Claude, SSH).
 ///
 /// When `maximized` is true, the file panel gets 0 height and the bottom panels fill the column.
@@ -105,15 +102,18 @@ fn split_panel_column(
     has_ssh: bool,
     split_pct: u16,
     maximized: bool,
-) -> (Rect, Option<Rect>, Option<Rect>, Option<Rect>, Option<Rect>, Option<Rect>) {
+) -> PanelColumnLayout {
     // When Claude is maximized, it takes the entire column
     if maximized && has_claude {
         let zero = Rect::new(col.x, col.y, col.width, 0);
         return (zero, None, None, None, Some(col), None);
     }
 
-    let bottom_count =
-        has_ci as usize + has_diff as usize + has_shell as usize + has_claude as usize + has_ssh as usize;
+    let bottom_count = has_ci as usize
+        + has_diff as usize
+        + has_shell as usize
+        + has_claude as usize
+        + has_ssh as usize;
     if bottom_count == 0 {
         return (col, None, None, None, None, None);
     }
@@ -172,7 +172,14 @@ fn split_panel_column(
         None
     };
 
-    (file_area, ci_area, diff_area, shell_area, claude_area, ssh_area)
+    (
+        file_area,
+        ci_area,
+        diff_area,
+        shell_area,
+        claude_area,
+        ssh_area,
+    )
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {
@@ -236,17 +243,23 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
             app.bottom_split_pct[0],
             app.bottom_maximized[0],
         );
-    let (right_area, right_ci_area, right_diff_area, right_shell_area, right_claude_area, right_ssh_area) =
-        split_panel_column(
-            right_col,
-            app.ci_panels[1].is_some(),
-            app.diff_panels[1].is_some(),
-            app.shell_panels[1].is_some(),
-            app.claude_panels[1].is_some(),
-            app.ssh_panels[1].is_some(),
-            app.bottom_split_pct[1],
-            app.bottom_maximized[1],
-        );
+    let (
+        right_area,
+        right_ci_area,
+        right_diff_area,
+        right_shell_area,
+        right_claude_area,
+        right_ssh_area,
+    ) = split_panel_column(
+        right_col,
+        app.ci_panels[1].is_some(),
+        app.diff_panels[1].is_some(),
+        app.shell_panels[1].is_some(),
+        app.claude_panels[1].is_some(),
+        app.ssh_panels[1].is_some(),
+        app.bottom_split_pct[1],
+        app.bottom_maximized[1],
+    );
 
     app.panel_areas = [left_area, right_area];
     app.ci_panel_areas = [left_ci_area, right_ci_area];
@@ -406,8 +419,12 @@ fn render_popup(frame: &mut Frame, title: &str, msg: &str) {
     let t = crate::theme::theme();
     let lines: Vec<&str> = msg.lines().collect();
     let max_line_width = lines.iter().map(|l| l.len()).max().unwrap_or(20);
-    let width = (max_line_width as u16 + 6).min(frame.area().width.saturating_sub(4)).max(30);
-    let height = (lines.len() as u16 + 4).min(frame.area().height.saturating_sub(4)).max(5);
+    let width = (max_line_width as u16 + 6)
+        .min(frame.area().width.saturating_sub(4))
+        .max(30);
+    let height = (lines.len() as u16 + 4)
+        .min(frame.area().height.saturating_sub(4))
+        .max(5);
 
     let x = (frame.area().width.saturating_sub(width)) / 2;
     let y = (frame.area().height.saturating_sub(height)) / 2;
@@ -415,15 +432,20 @@ fn render_popup(frame: &mut Frame, title: &str, msg: &str) {
 
     frame.render_widget(Clear, area);
 
-    let is_error = title.to_lowercase().contains("error");
+    let is_error = title.contains("Error") || title.contains("error");
     let border_color = if is_error {
-        ratatui::style::Color::Red
+        t.popup_error_border
     } else {
-        ratatui::style::Color::Green
+        t.popup_success_border
     };
 
     let block = Block::default()
-        .title(Span::styled(format!(" {} ", title), Style::default().fg(border_color).add_modifier(Modifier::BOLD)))
+        .title(Span::styled(
+            format!(" {} ", title),
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        ))
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
         .style(Style::default().bg(t.dialog_bg));
@@ -437,8 +459,16 @@ fn render_popup(frame: &mut Frame, title: &str, msg: &str) {
         if i as u16 >= inner.height.saturating_sub(1) {
             break;
         }
-        let rect = Rect::new(inner.x + 1, inner.y + i as u16, inner.width.saturating_sub(2), 1);
-        frame.render_widget(Paragraph::new(Line::from(Span::styled(*line, text_style))), rect);
+        let rect = Rect::new(
+            inner.x + 1,
+            inner.y + i as u16,
+            inner.width.saturating_sub(2),
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(*line, text_style))),
+            rect,
+        );
     }
 
     // "Press any key" hint at bottom
@@ -449,7 +479,10 @@ fn render_popup(frame: &mut Frame, title: &str, msg: &str) {
         .bg(t.dialog_bg)
         .add_modifier(Modifier::DIM);
     let rect = Rect::new(inner.x + 1, hint_y, inner.width.saturating_sub(2), 1);
-    frame.render_widget(Paragraph::new(Line::from(Span::styled(hint, hint_style))), rect);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(hint, hint_style))),
+        rect,
+    );
 }
 
 fn render_hex_viewer(frame: &mut Frame, app: &mut App) {
@@ -824,47 +857,5 @@ mod tests {
         assert_eq!(truncate_to_width("a🎉b", 3), "a🎉");
         // max_width 4 → "a🎉b"
         assert_eq!(truncate_to_width("a🎉b", 4), "a🎉b");
-    }
-
-    // ── ceil_char_boundary ──
-
-    #[test]
-    fn ceil_boundary_at_valid_boundary() {
-        let s = "hello";
-        // Every position in an ASCII string is a valid boundary.
-        assert_eq!(ceil_char_boundary(s, 3), 3);
-    }
-
-    #[test]
-    fn ceil_boundary_mid_multibyte() {
-        // 'é' in UTF-8 is 2 bytes (0xC3 0xA9). In "café", 'é' starts at byte 3.
-        let s = "café";
-        // Byte 4 is in the middle of 'é' — should round up to 5 (end of é).
-        assert_eq!(ceil_char_boundary(s, 4), 5);
-    }
-
-    #[test]
-    fn ceil_boundary_at_zero() {
-        assert_eq!(ceil_char_boundary("hello", 0), 0);
-    }
-
-    #[test]
-    fn ceil_boundary_past_end() {
-        let s = "hi";
-        assert_eq!(ceil_char_boundary(s, 100), s.len());
-    }
-
-    #[test]
-    fn ceil_boundary_at_end() {
-        let s = "hi";
-        assert_eq!(ceil_char_boundary(s, s.len()), s.len());
-    }
-
-    #[test]
-    fn ceil_boundary_ascii_every_position() {
-        let s = "abcde";
-        for i in 0..=s.len() {
-            assert_eq!(ceil_char_boundary(s, i), i, "position {i}");
-        }
     }
 }

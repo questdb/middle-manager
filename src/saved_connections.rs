@@ -1,4 +1,6 @@
-use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::path::Path;
+use std::path::PathBuf;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -123,18 +125,7 @@ pub fn save_connections(connections: &[SavedConnection]) {
 }
 
 fn connections_path() -> PathBuf {
-    if let Some(config_dir) = std::env::var_os("XDG_CONFIG_HOME") {
-        Path::new(&config_dir)
-            .join("middle-manager")
-            .join("connections.json")
-    } else if let Some(home) = std::env::var_os("HOME") {
-        Path::new(&home)
-            .join(".config")
-            .join("middle-manager")
-            .join("connections.json")
-    } else {
-        PathBuf::from("connections.json")
-    }
+    crate::remote_fs::config_dir().join("connections.json")
 }
 
 #[cfg(test)]
@@ -180,12 +171,25 @@ mod tests {
         SavedConnection {
             name: String::new(),
             protocol: String::new(),
-            host: None, port: None, user: None, password: None,
-            share: None, url: None, bucket: None, profile: None,
-            endpoint_url: None, region: None, project: None,
-            account: None, container: None, sas_token: None,
-            connection_string: None, export: None, mount_options: None,
-            identity_file: None, jump_host: None,
+            host: None,
+            port: None,
+            user: None,
+            password: None,
+            share: None,
+            url: None,
+            bucket: None,
+            profile: None,
+            endpoint_url: None,
+            region: None,
+            project: None,
+            account: None,
+            container: None,
+            sas_token: None,
+            connection_string: None,
+            export: None,
+            mount_options: None,
+            identity_file: None,
+            jump_host: None,
         }
     }
 

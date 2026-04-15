@@ -63,12 +63,17 @@ impl WebDavConnection {
         crate::debug_log::log(&format!("WebDAV {} {}", method, url));
         let mut cmd = Command::new("curl");
         cmd.arg("-s") // silent
-            .arg("-w").arg("\n%{http_code}") // append status code
-            .arg("-X").arg(method)
-            .arg("--connect-timeout").arg("15")
-            .arg("--max-time").arg("300") // 5 min max for large transfers
+            .arg("-w")
+            .arg("\n%{http_code}") // append status code
+            .arg("-X")
+            .arg(method)
+            .arg("--connect-timeout")
+            .arg("15")
+            .arg("--max-time")
+            .arg("300") // 5 min max for large transfers
             // Read credentials from stdin config to avoid leaking in process table
-            .arg("-K").arg("-");
+            .arg("-K")
+            .arg("-");
 
         if self.insecure {
             cmd.arg("-k"); // only disable TLS verification when explicitly opted-in
@@ -140,9 +145,12 @@ impl WebDavConnection {
             "PROPFIND",
             &url,
             &[
-                "-H", &format!("Depth: {}", depth_str),
-                "-H", "Content-Type: application/xml",
-                "-d", body,
+                "-H",
+                &format!("Depth: {}", depth_str),
+                "-H",
+                "Content-Type: application/xml",
+                "-d",
+                body,
             ],
         )?;
 
@@ -168,7 +176,7 @@ impl WebDavConnection {
     pub fn mkdir(&self, path: &Path) -> Result<()> {
         let url = self.url_for(path);
         let (status, _) = self.curl("MKCOL", &url, &[])?;
-        if (status >= 200 && status < 300) || status == 405 {
+        if ((200..300).contains(&status)) || status == 405 {
             // 405 = already exists, that's ok
             Ok(())
         } else {
@@ -180,7 +188,7 @@ impl WebDavConnection {
     pub fn remove_recursive(&self, path: &Path) -> Result<()> {
         let url = self.url_for(path);
         let (status, _) = self.curl("DELETE", &url, &[])?;
-        if (status >= 200 && status < 300) || status == 404 {
+        if ((200..300).contains(&status)) || status == 404 {
             Ok(())
         } else {
             anyhow::bail!("DELETE failed with status {}", status)
@@ -196,7 +204,7 @@ impl WebDavConnection {
             &src_url,
             &["-H", &format!("Destination: {}", dst_url)],
         )?;
-        if status >= 200 && status < 300 {
+        if (200..300).contains(&status) {
             Ok(())
         } else {
             anyhow::bail!("MOVE failed with status {}", status)
@@ -208,7 +216,7 @@ impl WebDavConnection {
         let url = self.url_for(remote);
         let local_str = local.to_string_lossy();
         let (status, _) = self.curl("GET", &url, &["-o", &local_str])?;
-        if status >= 200 && status < 300 {
+        if (200..300).contains(&status) {
             let meta = std::fs::metadata(local)?;
             Ok(meta.len())
         } else {
@@ -221,47 +229,12 @@ impl WebDavConnection {
         let url = self.url_for(remote);
         let local_str = local.to_string_lossy();
         let (status, _) = self.curl("PUT", &url, &["-T", &local_str])?;
-        if status >= 200 && status < 300 {
+        if (200..300).contains(&status) {
             let meta = std::fs::metadata(local)?;
             Ok(meta.len())
         } else {
             anyhow::bail!("PUT failed with status {}", status)
         }
-    }
-
-    /// Download a directory recursively.
-    pub fn download_dir(&self, remote: &Path, local: &Path) -> Result<u64> {
-        std::fs::create_dir_all(local)?;
-        let entries = self.read_dir(remote)?;
-        let mut total = 0u64;
-        for entry in entries {
-            if entry.name == ".." {
-                continue;
-            }
-            let local_dest = local.join(&entry.name);
-            if entry.is_dir {
-                total += self.download_dir(&entry.path, &local_dest)?;
-            } else {
-                total += self.download(&entry.path, &local_dest)?;
-            }
-        }
-        Ok(total)
-    }
-
-    /// Upload a directory recursively.
-    pub fn upload_dir(&self, local: &Path, remote: &Path) -> Result<u64> {
-        let _ = self.mkdir(remote);
-        let mut total = 0u64;
-        for entry in std::fs::read_dir(local)? {
-            let entry = entry?;
-            let remote_dest = remote.join(entry.file_name());
-            if entry.file_type()?.is_dir() {
-                total += self.upload_dir(&entry.path(), &remote_dest)?;
-            } else {
-                total += self.upload(&entry.path(), &remote_dest)?;
-            }
-        }
-        Ok(total)
     }
 
     /// Home directory (root).
@@ -271,16 +244,30 @@ impl WebDavConnection {
 }
 
 impl crate::remote_fs::RemoteFs for WebDavConnection {
-    fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> { self.read_dir(path) }
-    fn mkdir(&self, path: &Path) -> Result<()> { self.mkdir(path) }
-    fn remove_recursive(&self, path: &Path) -> Result<()> { self.remove_recursive(path) }
-    fn rename(&self, src: &Path, dst: &Path) -> Result<()> { self.rename(src, dst) }
-    fn download(&self, remote: &Path, local: &Path) -> Result<u64> { self.download(remote, local) }
-    fn upload(&self, local: &Path, remote: &Path) -> Result<u64> { self.upload(local, remote) }
-    fn download_dir(&self, remote: &Path, local: &Path) -> Result<u64> { self.download_dir(remote, local) }
-    fn upload_dir(&self, local: &Path, remote: &Path) -> Result<u64> { self.upload_dir(local, remote) }
-    fn home_dir(&self) -> PathBuf { self.home_dir() }
-    fn display_label(&self) -> String { self.display_label() }
+    fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> {
+        self.read_dir(path)
+    }
+    fn mkdir(&self, path: &Path) -> Result<()> {
+        self.mkdir(path)
+    }
+    fn remove_recursive(&self, path: &Path) -> Result<()> {
+        self.remove_recursive(path)
+    }
+    fn rename(&self, src: &Path, dst: &Path) -> Result<()> {
+        self.rename(src, dst)
+    }
+    fn download(&self, remote: &Path, local: &Path) -> Result<u64> {
+        self.download(remote, local)
+    }
+    fn upload(&self, local: &Path, remote: &Path) -> Result<u64> {
+        self.upload(local, remote)
+    }
+    fn home_dir(&self) -> PathBuf {
+        self.home_dir()
+    }
+    fn display_label(&self) -> String {
+        self.display_label()
+    }
 }
 
 /// Minimal URL encoding for path segments (spaces, special chars).
@@ -300,11 +287,7 @@ fn url_encode_path(path: &str) -> String {
 }
 
 /// Parse a WebDAV PROPFIND 207 Multi-Status XML response into FileEntry items.
-pub fn parse_propfind_response(
-    xml: &str,
-    parent: &Path,
-    base_url: &str,
-) -> Result<Vec<FileEntry>> {
+pub fn parse_propfind_response(xml: &str, parent: &Path, base_url: &str) -> Result<Vec<FileEntry>> {
     use quick_xml::events::Event;
     use quick_xml::Reader;
 
@@ -400,9 +383,7 @@ pub fn parse_propfind_response(
                             // Extract name from href
                             current_href.as_ref().and_then(|href| {
                                 let clean = href.trim_end_matches('/');
-                                clean.rsplit('/').next().map(|s| {
-                                    percent_decode(s)
-                                })
+                                clean.rsplit('/').next().map(percent_decode)
                             })
                         })
                         .unwrap_or_default();
@@ -558,9 +539,12 @@ mod tests {
   </d:response>
 </d:multistatus>"#;
 
-        let entries =
-            parse_propfind_response(xml, Path::new("/"), "https://cloud.example.com/remote.php/dav/files/user")
-                .unwrap();
+        let entries = parse_propfind_response(
+            xml,
+            Path::new("/"),
+            "https://cloud.example.com/remote.php/dav/files/user",
+        )
+        .unwrap();
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].name, "Documents");
         assert!(entries[0].is_dir);
@@ -586,7 +570,10 @@ mod tests {
     #[test]
     fn url_encode_path_works() {
         assert_eq!(url_encode_path("path/to/file"), "path/to/file");
-        assert_eq!(url_encode_path("my docs/file name"), "my%20docs/file%20name");
+        assert_eq!(
+            url_encode_path("my docs/file name"),
+            "my%20docs/file%20name"
+        );
     }
 
     #[test]

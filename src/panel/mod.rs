@@ -134,31 +134,27 @@ impl Panel {
         }
 
         match &self.source {
-            PanelSource::Local => {
-                match std::fs::read_dir(&self.current_dir) {
-                    Ok(read_dir) => {
-                        for entry in read_dir.flatten() {
-                            match FileEntry::from_dir_entry(&entry) {
-                                Ok(fe) => self.entries.push(fe),
-                                Err(_) => continue,
-                            }
+            PanelSource::Local => match std::fs::read_dir(&self.current_dir) {
+                Ok(read_dir) => {
+                    for entry in read_dir.flatten() {
+                        match FileEntry::from_dir_entry(&entry) {
+                            Ok(fe) => self.entries.push(fe),
+                            Err(_) => continue,
                         }
                     }
-                    Err(e) => {
-                        self.error = Some(format!("Cannot read directory: {}", e));
-                        return;
-                    }
                 }
-            }
-            PanelSource::Remote { connection } => {
-                match connection.read_dir(&self.current_dir) {
-                    Ok(entries) => self.entries.extend(entries),
-                    Err(e) => {
-                        self.error = Some(format!("Remote error: {}", e));
-                        return;
-                    }
+                Err(e) => {
+                    self.error = Some(format!("Cannot read directory: {}", e));
+                    return;
                 }
-            }
+            },
+            PanelSource::Remote { connection } => match connection.read_dir(&self.current_dir) {
+                Ok(entries) => self.entries.extend(entries),
+                Err(e) => {
+                    self.error = Some(format!("Remote error: {}", e));
+                    return;
+                }
+            },
         }
 
         self.apply_sort();

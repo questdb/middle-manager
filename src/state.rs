@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 fn default_true() -> bool {
     true
@@ -131,16 +131,5 @@ impl AppState {
 }
 
 fn state_file_path() -> PathBuf {
-    if let Some(config_dir) = std::env::var_os("XDG_CONFIG_HOME") {
-        Path::new(&config_dir)
-            .join("middle-manager")
-            .join("state.json")
-    } else if let Some(home) = std::env::var_os("HOME") {
-        Path::new(&home)
-            .join(".config")
-            .join("middle-manager")
-            .join("state.json")
-    } else {
-        PathBuf::from(".middle-manager-state.json")
-    }
+    crate::remote_fs::config_dir().join("state.json")
 }

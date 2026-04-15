@@ -145,9 +145,7 @@ pub fn load_all_hosts() -> Vec<SshHost> {
         .collect();
 
     for mut host in config_hosts {
-        if !saved_hostnames.contains(&host.hostname)
-            && !saved_hostnames.contains(&host.name)
-        {
+        if !saved_hostnames.contains(&host.hostname) && !saved_hostnames.contains(&host.name) {
             host.source = HostSource::SshConfig;
             hosts.push(host);
         }
@@ -246,18 +244,7 @@ fn parse_ssh_config(content: &str) -> Vec<SshHost> {
 }
 
 fn ssh_hosts_path() -> PathBuf {
-    if let Some(config_dir) = std::env::var_os("XDG_CONFIG_HOME") {
-        Path::new(&config_dir)
-            .join("middle-manager")
-            .join("ssh_hosts.json")
-    } else if let Some(home) = std::env::var_os("HOME") {
-        Path::new(&home)
-            .join(".config")
-            .join("middle-manager")
-            .join("ssh_hosts.json")
-    } else {
-        PathBuf::from("ssh_hosts.json")
-    }
+    crate::remote_fs::config_dir().join("ssh_hosts.json")
 }
 
 fn ssh_config_path() -> PathBuf {
@@ -346,10 +333,7 @@ Host myhost
         let hosts = parse_ssh_config(config);
         assert_eq!(hosts.len(), 1);
         // Should keep the first identity file
-        assert_eq!(
-            hosts[0].identity_file.as_deref(),
-            Some("~/.ssh/id_ed25519")
-        );
+        assert_eq!(hosts[0].identity_file.as_deref(), Some("~/.ssh/id_ed25519"));
     }
 
     #[test]

@@ -854,6 +854,8 @@ pub struct SshDialogState {
     pub input: crate::text_input::TextInput,
     /// SSH host list (for SSH/SFTP modes).
     pub hosts: Vec<crate::ssh::SshHost>,
+    /// Pre-lowercased searchable text per host (avoids per-keystroke allocations).
+    hosts_lower: Vec<String>,
     pub filtered: Vec<usize>,
     pub selected: usize,
     /// Saved connections (all protocols). Shown at the top of the dialog.
@@ -867,7 +869,10 @@ pub struct SshDialogState {
     /// WebDAV-specific fields.
     pub webdav_user: crate::text_input::TextInput,
     pub webdav_pass: crate::text_input::TextInput,
-    /// Which field is focused in SMB/WebDAV mode (0=host/url, 1=share/user, 2=user/pass, 3=pass).
+    /// Focus zone: 0 = protocol selector bar, 1.. = form fields (1-indexed).
+    /// For SSH/SFTP: 1 = input, 2 = host list.
+    /// For SMB: 1 = host, 2 = share, 3 = user, 4 = pass.
+    /// etc.
     pub field_focus: usize,
     // S3 fields
     pub s3_bucket: crate::text_input::TextInput,
@@ -891,6 +896,30 @@ pub struct SshDialogState {
 impl SshDialogState {
     pub fn new() -> Self {
         let hosts = crate::ssh::load_all_hosts();
+        let hosts_lower: Vec<String> = hosts
+            .iter()
+            .map(|h| {
+                let mut s = String::with_capacity(
+                    h.name.len()
+                        + h.hostname.len()
+                        + h.user.as_ref().map(|u| u.len()).unwrap_or(0)
+                        + h.group.as_ref().map(|g| g.len()).unwrap_or(0)
+                        + 3, // separators
+                );
+                s.push_str(&h.name.to_lowercase());
+                s.push(' ');
+                s.push_str(&h.hostname.to_lowercase());
+                if let Some(ref u) = h.user {
+                    s.push(' ');
+                    s.push_str(&u.to_lowercase());
+                }
+                if let Some(ref g) = h.group {
+                    s.push(' ');
+                    s.push_str(&g.to_lowercase());
+                }
+                s
+            })
+            .collect();
         let filtered: Vec<usize> = (0..hosts.len()).collect();
         let saved_connections = crate::saved_connections::load_connections();
         let has_saved = !saved_connections.is_empty();
@@ -898,6 +927,7 @@ impl SshDialogState {
             protocol: RemoteProtocol::Ssh,
             input: crate::text_input::TextInput::new(String::new()),
             hosts,
+            hosts_lower,
             filtered,
             selected: 0,
             saved_connections,
@@ -907,7 +937,7 @@ impl SshDialogState {
             smb_pass: crate::text_input::TextInput::new(String::new()),
             webdav_user: crate::text_input::TextInput::new(String::new()),
             webdav_pass: crate::text_input::TextInput::new(String::new()),
-            field_focus: 0,
+            field_focus: 1, // Start on first form field (0 = protocol bar)
             s3_bucket: crate::text_input::TextInput::new(String::new()),
             s3_profile: crate::text_input::TextInput::new(String::new()),
             s3_endpoint: crate::text_input::TextInput::new(String::new()),
@@ -930,21 +960,10 @@ impl SshDialogState {
             self.filtered = (0..self.hosts.len()).collect();
         } else {
             self.filtered = self
-                .hosts
+                .hosts_lower
                 .iter()
                 .enumerate()
-                .filter(|(_, h)| {
-                    h.name.to_lowercase().contains(&query)
-                        || h.hostname.to_lowercase().contains(&query)
-                        || h.user
-                            .as_deref()
-                            .map(|u| u.to_lowercase().contains(&query))
-                            .unwrap_or(false)
-                        || h.group
-                            .as_deref()
-                            .map(|g| g.to_lowercase().contains(&query))
-                            .unwrap_or(false)
-                })
+                .filter(|(_, lower)| lower.contains(&*query))
                 .map(|(i, _)| i)
                 .collect();
         }
@@ -957,38 +976,40 @@ impl SshDialogState {
             .and_then(|&i| self.hosts.get(i))
     }
 
-    /// Get the active text input for the current protocol/field.
+    /// Get the active text input for the current protocol/field (mutable).
+    /// When field_focus == 0 (protocol bar), returns the first form field.
     pub fn active_input_mut(&mut self) -> &mut crate::text_input::TextInput {
+        let f = self.field_focus.saturating_sub(1); // 0-based form field index
         match self.protocol {
             RemoteProtocol::Ssh | RemoteProtocol::Sftp => &mut self.input,
-            RemoteProtocol::Smb => match self.field_focus {
+            RemoteProtocol::Smb => match f {
                 0 => &mut self.input,
                 1 => &mut self.smb_share,
                 2 => &mut self.smb_user,
                 _ => &mut self.smb_pass,
             },
-            RemoteProtocol::WebDav => match self.field_focus {
+            RemoteProtocol::WebDav => match f {
                 0 => &mut self.input,
                 1 => &mut self.webdav_user,
                 _ => &mut self.webdav_pass,
             },
-            RemoteProtocol::S3 => match self.field_focus {
+            RemoteProtocol::S3 => match f {
                 0 => &mut self.s3_bucket,
                 1 => &mut self.s3_profile,
                 2 => &mut self.s3_endpoint,
                 _ => &mut self.s3_region,
             },
-            RemoteProtocol::Gcs => match self.field_focus {
+            RemoteProtocol::Gcs => match f {
                 0 => &mut self.gcs_bucket,
                 _ => &mut self.gcs_project,
             },
-            RemoteProtocol::AzureBlob => match self.field_focus {
+            RemoteProtocol::AzureBlob => match f {
                 0 => &mut self.azure_account,
                 1 => &mut self.azure_container,
                 2 => &mut self.azure_sas,
                 _ => &mut self.azure_conn_str,
             },
-            RemoteProtocol::Nfs => match self.field_focus {
+            RemoteProtocol::Nfs => match f {
                 0 => &mut self.nfs_host,
                 1 => &mut self.nfs_export,
                 _ => &mut self.nfs_options,
@@ -996,15 +1017,26 @@ impl SshDialogState {
         }
     }
 
+    /// Total number of focus zones: 1 (protocol bar) + N (form fields).
     pub fn max_fields(&self) -> usize {
-        match self.protocol {
-            RemoteProtocol::Ssh | RemoteProtocol::Sftp => 1,
-            RemoteProtocol::Smb => 4,
+        1 + match self.protocol {
+            RemoteProtocol::Ssh | RemoteProtocol::Sftp => {
+                // input + host list (skip host list if empty)
+                if self.filtered.is_empty() {
+                    1
+                } else {
+                    2
+                }
+            }
+            RemoteProtocol::Smb | RemoteProtocol::AzureBlob | RemoteProtocol::S3 => 4,
             RemoteProtocol::WebDav | RemoteProtocol::Nfs => 3,
-            RemoteProtocol::AzureBlob => 4,
-            RemoteProtocol::S3 => 4,
             RemoteProtocol::Gcs => 2,
         }
+    }
+
+    /// Whether the protocol selector bar has focus.
+    pub fn on_protocol_bar(&self) -> bool {
+        self.field_focus == 0
     }
 }
 
@@ -1570,8 +1602,11 @@ impl App {
     ) -> anyhow::Result<u64> {
         match &self.panels[side].source {
             crate::panel::PanelSource::Remote { connection } => {
-                if is_dir { connection.download_dir(remote, local) }
-                else { connection.download(remote, local) }
+                if is_dir {
+                    connection.download_dir(remote, local)
+                } else {
+                    connection.download(remote, local)
+                }
             }
             _ => anyhow::bail!("Not a remote panel"),
         }
@@ -1587,8 +1622,11 @@ impl App {
     ) -> anyhow::Result<u64> {
         match &self.panels[side].source {
             crate::panel::PanelSource::Remote { connection } => {
-                if is_dir { connection.upload_dir(local, remote) }
-                else { connection.upload(local, remote) }
+                if is_dir {
+                    connection.upload_dir(local, remote)
+                } else {
+                    connection.upload(local, remote)
+                }
             }
             _ => anyhow::bail!("Not a remote panel"),
         }
@@ -2001,7 +2039,9 @@ impl App {
                     KeyCode::Right => Action::CursorRight,
                     KeyCode::Left => Action::GoUp,
                     KeyCode::Char('o') => Action::OpenPr,
-                    KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::ExtractCiFailures,
+                    KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Action::ExtractCiFailures
+                    }
                     KeyCode::Tab => Action::SwitchPanel,
                     KeyCode::BackTab => Action::SwitchPanelReverse,
                     KeyCode::F(2) => {
@@ -2105,15 +2145,63 @@ impl App {
                 };
             }
 
+            let on_bar = dialog.on_protocol_bar();
+
+            let in_form = !on_bar;
             return match key.code {
                 KeyCode::Esc => Action::DialogCancel,
                 KeyCode::Enter => Action::DialogConfirm,
-                // Alt+Left/Right cycle protocol
-                KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => Action::SwitchPanelReverse,
+                // On protocol bar: Left/Right switch protocol
+                KeyCode::Left if on_bar => Action::SwitchPanelReverse,
+                KeyCode::Right if on_bar => Action::SwitchPanel,
+                // Alt+Left/Right always switch protocol
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                    Action::SwitchPanelReverse
+                }
                 KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => Action::SwitchPanel,
-                // Tab/BackTab cycle fields (host list for SSH/SFTP, form fields for others)
-                KeyCode::Tab => Action::MoveDown,
-                KeyCode::BackTab => Action::MoveUp,
+                // Text editing: undo/redo, cut, select-all, copy
+                KeyCode::Char('z')
+                    if in_form
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    Action::EditorRedo
+                }
+                KeyCode::Char('z') if in_form && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::EditorUndo
+                }
+                KeyCode::Char('x') if in_form && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::EditorDeleteLine
+                }
+                KeyCode::Char('a') if in_form && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::SelectAll
+                }
+                KeyCode::Char('c') if in_form && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::CopySelection
+                }
+                // Selection: Shift+arrow/Home/End
+                KeyCode::Left if in_form && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Action::SelectLeft
+                }
+                KeyCode::Right if in_form && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Action::SelectRight
+                }
+                KeyCode::Home if in_form && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Action::SelectLineStart
+                }
+                KeyCode::End if in_form && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Action::SelectLineEnd
+                }
+                // Cursor movement
+                KeyCode::Left => Action::CursorLeft,
+                KeyCode::Right => Action::CursorRight,
+                KeyCode::Home if in_form => Action::CursorLineStart,
+                KeyCode::End if in_form => Action::CursorLineEnd,
+                KeyCode::Delete if in_form => Action::EditorDeleteForward,
+                // Tab/BackTab cycle focus zones: protocol bar → form fields → back to bar
+                KeyCode::Tab => Action::Toggle,
+                KeyCode::BackTab => Action::ToggleReverse,
+                // Up/Down: navigate within current zone (host list for SSH/SFTP)
                 KeyCode::Up => Action::MoveUp,
                 KeyCode::Down => Action::MoveDown,
                 KeyCode::Backspace => Action::DialogBackspace,
@@ -2835,7 +2923,10 @@ impl App {
         // Auto-clear status messages after 5 seconds of no update.
         // Reset timer when message content changes (for progress updates).
         if self.status_message != self.status_message_prev {
-            self.status_message_at = self.status_message.as_ref().map(|_| std::time::Instant::now());
+            self.status_message_at = self
+                .status_message
+                .as_ref()
+                .map(|_| std::time::Instant::now());
             self.status_message_prev = self.status_message.clone();
         }
         if let Some(at) = self.status_message_at {
@@ -2902,15 +2993,20 @@ impl App {
                     ci.failure_extraction = None;
                     match result {
                         Ok(failures) => {
-                            let output_path = std::env::temp_dir().join(format!(
-                                "mm-ci-failures-{}.md",
-                                std::process::id()
-                            ));
-                            match crate::ci::write_failures_file(&output_path, &failures, &repo, pr_number) {
+                            let output_path = std::env::temp_dir()
+                                .join(format!("mm-ci-failures-{}.md", std::process::id()));
+                            match crate::ci::write_failures_file(
+                                &output_path,
+                                &failures,
+                                &repo,
+                                pr_number,
+                            ) {
                                 Ok(()) => {
                                     // Build a summary for the popup
-                                    let unique: std::collections::HashSet<&str> = failures.iter().map(|f| f.test_name.as_str()).collect();
-                                    let mut by_check: std::collections::BTreeMap<&str, usize> = std::collections::BTreeMap::new();
+                                    let unique: std::collections::HashSet<&str> =
+                                        failures.iter().map(|f| f.test_name.as_str()).collect();
+                                    let mut by_check: std::collections::BTreeMap<&str, usize> =
+                                        std::collections::BTreeMap::new();
                                     for f in &failures {
                                         *by_check.entry(&f.check_name).or_default() += 1;
                                     }
@@ -2918,13 +3014,23 @@ impl App {
                                     if failures.is_empty() {
                                         summary.push_str("No test failures found in the logs.\n\nThe failed checks may not contain\nrecognizable test output.");
                                     } else {
-                                        summary.push_str(&format!("{} unique failure(s) across {} check(s):\n", unique.len(), by_check.len()));
+                                        summary.push_str(&format!(
+                                            "{} unique failure(s) across {} check(s):\n",
+                                            unique.len(),
+                                            by_check.len()
+                                        ));
                                         for (check, count) in &by_check {
-                                            summary.push_str(&format!("\n  {} ({} failure{})", check, count, if *count == 1 { "" } else { "s" }));
+                                            summary.push_str(&format!(
+                                                "\n  {} ({} failure{})",
+                                                check,
+                                                count,
+                                                if *count == 1 { "" } else { "s" }
+                                            ));
                                         }
                                         summary.push_str("\n\nPress any key to view full report.");
                                     }
-                                    self.popup = Some(("CI Failure Extraction".to_string(), summary));
+                                    self.popup =
+                                        Some(("CI Failure Extraction".to_string(), summary));
                                     self.popup_after = Some(output_path);
                                     return;
                                 }
@@ -3023,7 +3129,8 @@ impl App {
                     }
                     Err(e) => {
                         crate::debug_log::log_error("connect_result", &format!("{}", e));
-                        self.popup = Some(("Error".to_string(), format!("Connection failed:\n\n{}", e)));
+                        self.popup =
+                            Some(("Error".to_string(), format!("Connection failed:\n\n{}", e)));
                     }
                 }
                 self.pending_remote = None;
@@ -3084,9 +3191,7 @@ impl App {
             // Execute deferred action (e.g. open editor after extraction summary)
             if let Some(path) = self.popup_after.take() {
                 self.focus = PanelFocus::FilePanel;
-                self.mode = AppMode::Editing(Box::new(
-                    crate::editor::EditorState::open(path),
-                ));
+                self.mode = AppMode::Editing(Box::new(crate::editor::EditorState::open(path)));
             }
             return;
         }
@@ -3941,7 +4046,7 @@ impl App {
             Action::DialogCancel => self.handle_dialog_cancel(),
             Action::DialogBackspace => self.handle_dialog_backspace(),
             Action::DialogConfirm | Action::DialogInput(_) => {}
-            Action::TerminalInput(_) | Action::TerminalOpenFile => {} // handled by intercepts above
+            Action::TerminalInput(_) | Action::TerminalOpenFile | Action::ToggleReverse => {} // handled by intercepts above
         }
     }
 
@@ -4732,14 +4837,14 @@ impl App {
                     Ok(tmp_path) => {
                         let mut editor = EditorState::open(tmp_path.clone());
                         // Store the remote path for upload-on-save
-                        editor.remote_source = Some((
-                            entry.path.clone(),
-                            self.active_panel,
-                        ));
+                        editor.remote_source = Some((entry.path.clone(), self.active_panel));
                         self.mode = AppMode::Editing(Box::new(editor));
                     }
                     Err(e) => {
-                        self.popup = Some(("Error".to_string(), format!("Failed to download file:\n\n{}", e)));
+                        self.popup = Some((
+                            "Error".to_string(),
+                            format!("Failed to download file:\n\n{}", e),
+                        ));
                     }
                 }
             } else {
@@ -5060,7 +5165,8 @@ impl App {
     }
 
     fn download_for_edit(&self, remote_path: &std::path::Path) -> anyhow::Result<PathBuf> {
-        let filename = remote_path.file_name()
+        let filename = remote_path
+            .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_else(|| "untitled".to_string());
         let tmp_dir = std::env::temp_dir().join("middle-manager-edit");
@@ -5289,18 +5395,20 @@ impl App {
                             if let Some((ref remote_path, panel_side)) = e.remote_source {
                                 let local_path = e.path.clone();
                                 let remote_path = remote_path.clone();
-                                match &self.panels[panel_side].source {
-                                    crate::panel::PanelSource::Remote { connection } => {
-                                        match connection.upload(&local_path, &remote_path) {
-                                            Ok(_) => {
-                                                e.status_msg = Some("Saved and uploaded".to_string());
-                                            }
-                                            Err(err) => {
-                                                e.status_msg = Some(format!("Saved locally, upload failed: {}", err));
-                                            }
+                                if let crate::panel::PanelSource::Remote { connection } =
+                                    &self.panels[panel_side].source
+                                {
+                                    match connection.upload(&local_path, &remote_path) {
+                                        Ok(_) => {
+                                            e.status_msg = Some("Saved and uploaded".to_string());
+                                        }
+                                        Err(err) => {
+                                            e.status_msg = Some(format!(
+                                                "Saved locally, upload failed: {}",
+                                                err
+                                            ));
                                         }
                                     }
-                                    _ => {}
                                 }
                             }
                         }
@@ -5533,7 +5641,10 @@ impl App {
                     match self.download_for_edit(&entry.path) {
                         Ok(tmp_path) => self.open_file_for_edit(tmp_path),
                         Err(e) => {
-                            self.popup = Some(("Error".to_string(), format!("Failed to download:\n\n{}", e)));
+                            self.popup = Some((
+                                "Error".to_string(),
+                                format!("Failed to download:\n\n{}", e),
+                            ));
                         }
                     }
                 } else {
@@ -6144,14 +6255,22 @@ impl App {
             Action::MouseScrollUp(_, _) | Action::PageUp => {
                 if let Some(ref mut tp) = self.claude_panels[side] {
                     tp.clear_selection();
-                    let lines = if matches!(action, Action::PageUp) { 20 } else { 3 };
+                    let lines = if matches!(action, Action::PageUp) {
+                        20
+                    } else {
+                        3
+                    };
                     tp.scroll_up(lines);
                 }
             }
             Action::MouseScrollDown(_, _) | Action::PageDown => {
                 if let Some(ref mut tp) = self.claude_panels[side] {
                     tp.clear_selection();
-                    let lines = if matches!(action, Action::PageDown) { 20 } else { 3 };
+                    let lines = if matches!(action, Action::PageDown) {
+                        20
+                    } else {
+                        3
+                    };
                     tp.scroll_down(lines);
                 }
             }
@@ -6510,8 +6629,7 @@ impl App {
         match action {
             Action::None | Action::Tick | Action::Resize(_, _) => {}
             Action::TerminalInput(ref bytes) => {
-                let is_exited = self
-                    .ssh_panels[side]
+                let is_exited = self.ssh_panels[side]
                     .as_ref()
                     .map(|sp| sp.exited)
                     .unwrap_or(false);
@@ -6601,7 +6719,10 @@ impl App {
         if let Some(ref d) = self.ssh_dialog {
             if d.saved_selected.is_some() {
                 match action {
-                    Action::DialogCancel => { self.ssh_dialog = None; return; }
+                    Action::DialogCancel => {
+                        self.ssh_dialog = None;
+                        return;
+                    }
                     Action::MoveUp => {
                         if let Some(ref mut d) = self.ssh_dialog {
                             if let Some(ref mut sel) = d.saved_selected {
@@ -6619,7 +6740,7 @@ impl App {
                         }
                         return;
                     }
-                    Action::Toggle => {
+                    Action::Toggle | Action::ToggleReverse => {
                         // Switch from saved mode to protocol input mode
                         if let Some(ref mut d) = self.ssh_dialog {
                             d.saved_selected = None;
@@ -6632,7 +6753,9 @@ impl App {
                             if let Some(sel) = d.saved_selected {
                                 if sel < d.saved_connections.len() {
                                     d.saved_connections.remove(sel);
-                                    crate::saved_connections::save_connections(&d.saved_connections);
+                                    crate::saved_connections::save_connections(
+                                        &d.saved_connections,
+                                    );
                                     if d.saved_connections.is_empty() {
                                         d.saved_selected = None;
                                     } else if sel >= d.saved_connections.len() {
@@ -6646,9 +6769,17 @@ impl App {
                     }
                     Action::DialogConfirm => {
                         // Connect using saved connection
-                        let conn = self.ssh_dialog.as_ref()
+                        let conn = self
+                            .ssh_dialog
+                            .as_ref()
                             .and_then(|d| d.saved_selected)
-                            .and_then(|sel| self.ssh_dialog.as_ref()?.saved_connections.get(sel).cloned());
+                            .and_then(|sel| {
+                                self.ssh_dialog
+                                    .as_ref()?
+                                    .saved_connections
+                                    .get(sel)
+                                    .cloned()
+                            });
                         self.ssh_dialog = None;
                         if let Some(c) = conn {
                             self.connect_saved(&c);
@@ -6684,7 +6815,18 @@ impl App {
                 }
             }
             Action::Toggle => {
-                // Only used from saved connections mode (Tab to switch to input)
+                // Tab cycles focus zones forward
+                if let Some(ref mut d) = self.ssh_dialog {
+                    let max = d.max_fields();
+                    d.field_focus = (d.field_focus + 1) % max;
+                }
+            }
+            Action::ToggleReverse => {
+                // BackTab cycles focus zones backward
+                if let Some(ref mut d) = self.ssh_dialog {
+                    let max = d.max_fields();
+                    d.field_focus = (d.field_focus + max - 1) % max;
+                }
             }
             Action::DialogConfirm | Action::Enter => {
                 let protocol = self.ssh_dialog.as_ref().map(|d| d.protocol);
@@ -6692,13 +6834,16 @@ impl App {
                 match protocol {
                     Some(RemoteProtocol::Ssh) | Some(RemoteProtocol::Sftp) => {
                         let (host, is_sftp) = if let Some(ref dialog) = self.ssh_dialog {
-                            let h = dialog.selected_host().cloned()
-                                .or_else(|| crate::ssh::SshHost::from_quick_connect(&dialog.input.text));
+                            let h = dialog.selected_host().cloned().or_else(|| {
+                                crate::ssh::SshHost::from_quick_connect(&dialog.input.text)
+                            });
                             (h, dialog.protocol == RemoteProtocol::Sftp)
                         } else {
                             (None, false)
                         };
-                        let had_input = self.ssh_dialog.as_ref()
+                        let had_input = self
+                            .ssh_dialog
+                            .as_ref()
                             .map(|d| !d.input.text.trim().is_empty())
                             .unwrap_or(false);
                         self.ssh_dialog = None;
@@ -6709,27 +6854,36 @@ impl App {
                                 self.connect_ssh(host);
                             }
                         } else if had_input {
-                            self.status_message = Some("Invalid host format. Use: user@host[:port]".to_string());
+                            self.status_message =
+                                Some("Invalid host format. Use: user@host[:port]".to_string());
                         }
                     }
                     Some(RemoteProtocol::Smb) => {
                         let (host, share, user, pass) = if let Some(ref d) = self.ssh_dialog {
-                            (d.input.text.clone(), d.smb_share.text.clone(),
-                             d.smb_user.text.clone(), d.smb_pass.text.clone())
+                            (
+                                d.input.text.clone(),
+                                d.smb_share.text.clone(),
+                                d.smb_user.text.clone(),
+                                d.smb_pass.text.clone(),
+                            )
                         } else {
                             (String::new(), String::new(), String::new(), String::new())
                         };
                         self.ssh_dialog = None;
                         if host.is_empty() || share.is_empty() {
-                            self.status_message = Some("Host and share name are required".to_string());
+                            self.status_message =
+                                Some("Host and share name are required".to_string());
                         } else {
                             self.connect_smb(&host, &share, &user, &pass);
                         }
                     }
                     Some(RemoteProtocol::WebDav) => {
                         let (url, user, pass) = if let Some(ref d) = self.ssh_dialog {
-                            (d.input.text.clone(), d.webdav_user.text.clone(),
-                             d.webdav_pass.text.clone())
+                            (
+                                d.input.text.clone(),
+                                d.webdav_user.text.clone(),
+                                d.webdav_pass.text.clone(),
+                            )
                         } else {
                             (String::new(), String::new(), String::new())
                         };
@@ -6741,12 +6895,17 @@ impl App {
                         }
                     }
                     Some(RemoteProtocol::S3) => {
-                        let (bucket, profile, endpoint, region) = if let Some(ref d) = self.ssh_dialog {
-                            (d.s3_bucket.text.clone(), d.s3_profile.text.clone(),
-                             d.s3_endpoint.text.clone(), d.s3_region.text.clone())
-                        } else {
-                            (String::new(), String::new(), String::new(), String::new())
-                        };
+                        let (bucket, profile, endpoint, region) =
+                            if let Some(ref d) = self.ssh_dialog {
+                                (
+                                    d.s3_bucket.text.clone(),
+                                    d.s3_profile.text.clone(),
+                                    d.s3_endpoint.text.clone(),
+                                    d.s3_region.text.clone(),
+                                )
+                            } else {
+                                (String::new(), String::new(), String::new(), String::new())
+                            };
                         self.ssh_dialog = None;
                         if bucket.is_empty() {
                             self.status_message = Some("Bucket name is required".to_string());
@@ -6768,18 +6927,32 @@ impl App {
                         }
                     }
                     Some(RemoteProtocol::AzureBlob) => {
-                        let (account, container, sas, conn_str) = if let Some(ref d) = self.ssh_dialog {
-                            crate::debug_log::log(&format!(
-                                "Azure fields: account={:?} container={:?} sas={} conn_str={}",
-                                d.azure_account.text, d.azure_container.text,
-                                if d.azure_sas.text.is_empty() { "(empty)" } else { "(set)" },
-                                if d.azure_conn_str.text.is_empty() { "(empty)" } else { "(set)" },
-                            ));
-                            (d.azure_account.text.clone(), d.azure_container.text.clone(),
-                             d.azure_sas.text.clone(), d.azure_conn_str.text.clone())
-                        } else {
-                            (String::new(), String::new(), String::new(), String::new())
-                        };
+                        let (account, container, sas, conn_str) =
+                            if let Some(ref d) = self.ssh_dialog {
+                                crate::debug_log::log(&format!(
+                                    "Azure fields: account={:?} container={:?} sas={} conn_str={}",
+                                    d.azure_account.text,
+                                    d.azure_container.text,
+                                    if d.azure_sas.text.is_empty() {
+                                        "(empty)"
+                                    } else {
+                                        "(set)"
+                                    },
+                                    if d.azure_conn_str.text.is_empty() {
+                                        "(empty)"
+                                    } else {
+                                        "(set)"
+                                    },
+                                ));
+                                (
+                                    d.azure_account.text.clone(),
+                                    d.azure_container.text.clone(),
+                                    d.azure_sas.text.clone(),
+                                    d.azure_conn_str.text.clone(),
+                                )
+                            } else {
+                                (String::new(), String::new(), String::new(), String::new())
+                            };
                         self.ssh_dialog = None;
                         // Extract account name from connection string if account field is empty
                         let account = if account.is_empty() && !conn_str.is_empty() {
@@ -6795,70 +6968,62 @@ impl App {
                         if !conn_str.is_empty() || !account.is_empty() {
                             self.connect_azure_blob(&account, &container, &sas, &conn_str);
                         } else {
-                            self.status_message = Some("Account name or connection string is required".to_string());
+                            self.status_message =
+                                Some("Account name or connection string is required".to_string());
                             self.dirty = true;
                         }
                     }
                     Some(RemoteProtocol::Nfs) => {
                         let (host, export, options) = if let Some(ref d) = self.ssh_dialog {
-                            (d.nfs_host.text.clone(), d.nfs_export.text.clone(),
-                             d.nfs_options.text.clone())
+                            (
+                                d.nfs_host.text.clone(),
+                                d.nfs_export.text.clone(),
+                                d.nfs_options.text.clone(),
+                            )
                         } else {
                             (String::new(), String::new(), String::new())
                         };
                         self.ssh_dialog = None;
                         if host.is_empty() || export.is_empty() {
-                            self.status_message = Some("Host and export path are required".to_string());
+                            self.status_message =
+                                Some("Host and export path are required".to_string());
                         } else {
                             self.connect_nfs(&host, &export, &options);
                         }
                     }
-                    None => { self.ssh_dialog = None; }
+                    None => {
+                        self.ssh_dialog = None;
+                    }
                 }
             }
             Action::MoveUp => {
+                // Up arrow: navigate within the current focus zone
                 if let Some(ref mut d) = self.ssh_dialog {
                     let is_ssh = matches!(d.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp);
-                    if is_ssh {
+                    if is_ssh && d.field_focus >= 1 {
+                        // SSH/SFTP: navigate host list (field_focus 1=input, 2=host list)
                         d.selected = d.selected.saturating_sub(1);
-                    } else {
-                        // Tab/BackTab cycles fields in SMB/WebDAV
-                        d.field_focus = d.field_focus.saturating_sub(1);
                     }
                 }
             }
             Action::MoveDown => {
                 if let Some(ref mut d) = self.ssh_dialog {
                     let is_ssh = matches!(d.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp);
-                    if is_ssh {
-                        if !d.filtered.is_empty() {
-                            d.selected = (d.selected + 1).min(d.filtered.len() - 1);
-                        }
-                    } else {
-                        let max = d.max_fields().saturating_sub(1);
-                        d.field_focus = (d.field_focus + 1).min(max);
+                    if is_ssh && d.field_focus >= 1 && !d.filtered.is_empty() {
+                        d.selected = (d.selected + 1).min(d.filtered.len() - 1);
                     }
                 }
             }
-            Action::DialogInput(c) => {
+            _ => {
+                // Delegate text input actions (type, backspace, delete, cursor,
+                // selection, undo/redo, copy, cut) to TextInput::handle_action.
                 if let Some(ref mut d) = self.ssh_dialog {
                     let is_ssh = matches!(d.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp);
-                    d.active_input_mut().insert_char(c);
-                    if is_ssh {
+                    if d.active_input_mut().handle_action(&action) && is_ssh {
                         d.update_filter();
                     }
                 }
             }
-            Action::DialogBackspace => {
-                if let Some(ref mut d) = self.ssh_dialog {
-                    let is_ssh = matches!(d.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp);
-                    d.active_input_mut().backspace();
-                    if is_ssh {
-                        d.update_filter();
-                    }
-                }
-            }
-            _ => {}
         }
     }
 
@@ -6916,9 +7081,21 @@ impl App {
     fn connect_s3(&mut self, bucket: &str, profile: &str, endpoint: &str, region: &str) {
         self.status_message = Some(format!("Connecting S3 to {}...", bucket));
         let bucket = bucket.to_string();
-        let profile = if profile.is_empty() { None } else { Some(profile.to_string()) };
-        let endpoint = if endpoint.is_empty() { None } else { Some(endpoint.to_string()) };
-        let region = if region.is_empty() { None } else { Some(region.to_string()) };
+        let profile = if profile.is_empty() {
+            None
+        } else {
+            Some(profile.to_string())
+        };
+        let endpoint = if endpoint.is_empty() {
+            None
+        } else {
+            Some(endpoint.to_string())
+        };
+        let region = if region.is_empty() {
+            None
+        } else {
+            Some(region.to_string())
+        };
         self.spawn_remote_connect(move || {
             crate::s3::S3Connection::connect(
                 &bucket,
@@ -6933,7 +7110,11 @@ impl App {
     fn connect_gcs(&mut self, bucket: &str, project: &str) {
         self.status_message = Some(format!("Connecting GCS to {}...", bucket));
         let bucket = bucket.to_string();
-        let project = if project.is_empty() { None } else { Some(project.to_string()) };
+        let project = if project.is_empty() {
+            None
+        } else {
+            Some(project.to_string())
+        };
         self.spawn_remote_connect(move || {
             crate::gcs::GcsConnection::connect(&bucket, project.as_deref())
                 .map(|c| Box::new(c) as Box<dyn crate::remote_fs::RemoteFs + Send>)
@@ -6944,11 +7125,22 @@ impl App {
         self.status_message = Some(format!("Connecting Azure to {}/{}...", account, container));
         let account = account.to_string();
         let container = container.to_string();
-        let sas = if sas.is_empty() { None } else { Some(sas.to_string()) };
-        let conn_str = if conn_str.is_empty() { None } else { Some(conn_str.to_string()) };
+        let sas = if sas.is_empty() {
+            None
+        } else {
+            Some(sas.to_string())
+        };
+        let conn_str = if conn_str.is_empty() {
+            None
+        } else {
+            Some(conn_str.to_string())
+        };
         self.spawn_remote_connect(move || {
             crate::azure_blob::AzureBlobConnection::connect(
-                &account, &container, sas.as_deref(), conn_str.as_deref(),
+                &account,
+                &container,
+                sas.as_deref(),
+                conn_str.as_deref(),
             )
             .map(|c| Box::new(c) as Box<dyn crate::remote_fs::RemoteFs + Send>)
         });
@@ -6970,7 +7162,9 @@ impl App {
         match conn.protocol.as_str() {
             "ssh" => {
                 if let Some(host) = crate::ssh::SshHost::from_quick_connect(
-                    &conn.display_label().strip_prefix("SSH: ").unwrap_or(&conn.name),
+                    conn.display_label()
+                        .strip_prefix("SSH: ")
+                        .unwrap_or(&conn.name),
                 ) {
                     self.connect_ssh(host);
                 }
@@ -7055,12 +7249,25 @@ impl App {
             let mut c = crate::saved_connections::SavedConnection {
                 name: String::new(),
                 protocol: protocol.to_string(),
-                host: None, port: None, user: None, password: None,
-                share: None, url: None, bucket: None, profile: None,
-                endpoint_url: None, region: None, project: None,
-                account: None, container: None, sas_token: None,
-                connection_string: None, export: None, mount_options: None,
-                identity_file: None, jump_host: None,
+                host: None,
+                port: None,
+                user: None,
+                password: None,
+                share: None,
+                url: None,
+                bucket: None,
+                profile: None,
+                endpoint_url: None,
+                region: None,
+                project: None,
+                account: None,
+                container: None,
+                sas_token: None,
+                connection_string: None,
+                export: None,
+                mount_options: None,
+                identity_file: None,
+                jump_host: None,
             };
             match d.protocol {
                 RemoteProtocol::Ssh | RemoteProtocol::Sftp => {
@@ -7119,7 +7326,10 @@ impl App {
                 d.saved_connections.push(c);
                 crate::saved_connections::save_connections(&d.saved_connections);
                 // Show popup over the dialog so user can see it
-                self.popup = Some(("Saved".to_string(), format!("{}\n\nConnection saved for quick access.", name)));
+                self.popup = Some((
+                    "Saved".to_string(),
+                    format!("{}\n\nConnection saved for quick access.", name),
+                ));
             }
         }
     }
@@ -7135,7 +7345,10 @@ impl App {
         std::thread::spawn(move || {
             let result = f();
             match &result {
-                Ok(conn) => crate::debug_log::log(&format!("Connection succeeded: {}", conn.display_label())),
+                Ok(conn) => crate::debug_log::log(&format!(
+                    "Connection succeeded: {}",
+                    conn.display_label()
+                )),
                 Err(e) => crate::debug_log::log_error("connect", &format!("{}", e)),
             }
             let _ = tx.send(RemoteConnectResult { result });
@@ -7173,11 +7386,14 @@ impl App {
                     if !name.is_empty() {
                         match crate::session::create_session(&name) {
                             Ok(()) => {
-                                self.status_message =
-                                    Some(format!("Created session '{}'. Use --session {} to attach.", name, name));
+                                self.status_message = Some(format!(
+                                    "Created session '{}'. Use --session {} to attach.",
+                                    name, name
+                                ));
                             }
                             Err(e) => {
-                                self.status_message = Some(format!("Failed to create session: {}", e));
+                                self.status_message =
+                                    Some(format!("Failed to create session: {}", e));
                             }
                         }
                     }
@@ -7273,9 +7489,16 @@ impl App {
             let dir = std::env::var_os("HOME")
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| std::path::PathBuf::from("/"));
-            match TerminalPanel::spawn_cmd(&cmd, &args_refs, &dir, cols, rows,
-                format!(" tmux: {} ", session_name), true, wakeup.clone())
-            {
+            match TerminalPanel::spawn_cmd(
+                &cmd,
+                &args_refs,
+                &dir,
+                cols,
+                rows,
+                format!(" tmux: {} ", session_name),
+                true,
+                wakeup.clone(),
+            ) {
                 Ok(tp) => {
                     self.shell_panels[side] = Some(tp);
                     self.focus = PanelFocus::Shell(side);
@@ -7314,7 +7537,9 @@ impl App {
         }
 
         // Check auth requirements before starting
-        let has_github = failed_checks.iter().any(|c| c.details_url.contains("github.com"));
+        let has_github = failed_checks
+            .iter()
+            .any(|c| c.details_url.contains("github.com"));
         let has_azure = failed_checks.iter().any(|c| c.azure_info.is_some());
         let mut warnings = Vec::new();
 
@@ -7326,10 +7551,7 @@ impl App {
         }
 
         if !warnings.is_empty() {
-            self.popup = Some((
-                "Authentication Required".to_string(),
-                warnings.join("\n\n"),
-            ));
+            self.popup = Some(("Authentication Required".to_string(), warnings.join("\n\n")));
             return;
         }
 
@@ -7673,10 +7895,8 @@ impl App {
                     let dest_path = dest.join(&file_name);
 
                     let op = if is_move { "Moving" } else { "Copying" };
-                    self.status_message = Some(format!(
-                        "{} {}/{}: {}",
-                        op, i + 1, total_files, file_name
-                    ));
+                    self.status_message =
+                        Some(format!("{} {}/{}: {}", op, i + 1, total_files, file_name));
                     self.dirty = true;
 
                     let result = match (src_remote, dst_remote) {
@@ -8011,13 +8231,81 @@ impl App {
                 && row < content.y + content.height
             {
                 let y_off = (row - content.y) as usize;
-                self.handle_dialog_click(y_off);
+                let x_off = (col - content.x) as usize;
+                self.handle_dialog_click(y_off, x_off);
                 self.dirty = true;
             }
         }
     }
 
-    fn handle_dialog_click(&mut self, y_off: usize) {
+    fn handle_dialog_click(&mut self, y_off: usize, x_off: usize) {
+        // SSH/Connectivity dialog: row 0 = protocol tabs, row 4 = input, row 7+ = host list
+        if let Some(ref mut d) = self.ssh_dialog {
+            if d.saved_selected.is_some() {
+                // Saved connections mode: click selects a connection
+                if y_off >= 2 {
+                    let idx = y_off - 2;
+                    if idx < d.saved_connections.len() {
+                        d.saved_selected = Some(idx);
+                    }
+                }
+                return;
+            }
+            if y_off == 0 {
+                // Click on protocol tab row — hit-test each tab
+                let protocols = [
+                    RemoteProtocol::Ssh,
+                    RemoteProtocol::Sftp,
+                    RemoteProtocol::Smb,
+                    RemoteProtocol::WebDav,
+                    RemoteProtocol::S3,
+                    RemoteProtocol::Gcs,
+                    RemoteProtocol::AzureBlob,
+                    RemoteProtocol::Nfs,
+                ];
+                let mut pos = 0usize;
+                for (i, proto) in protocols.iter().enumerate() {
+                    if i > 0 {
+                        pos += 3; // " | "
+                    }
+                    let label_len = if *proto == d.protocol {
+                        proto.label().len() + 2 // "[X]"
+                    } else {
+                        proto.label().len()
+                    };
+                    if x_off >= pos && x_off < pos + label_len {
+                        d.protocol = *proto;
+                        d.field_focus = 0;
+                        return;
+                    }
+                    pos += label_len;
+                }
+                return;
+            }
+            let is_ssh = matches!(d.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp);
+            if is_ssh {
+                if (3..=4).contains(&y_off) {
+                    d.field_focus = 1; // Focus the input
+                } else if y_off >= 7 {
+                    d.field_focus = 2; // Focus the host list
+                    let list_idx = y_off - 7;
+                    if list_idx < d.filtered.len() {
+                        d.selected = list_idx;
+                    }
+                }
+            } else {
+                // For multi-field protocols, each field takes ~3 rows (label + input + gap)
+                // starting at row 3: field 0 at rows 3-4, field 1 at rows 6-7, etc.
+                if y_off >= 3 {
+                    let field_idx = (y_off - 3) / 3;
+                    let max = d.max_fields().saturating_sub(1); // subtract protocol bar
+                    if field_idx < max {
+                        d.field_focus = field_idx + 1; // +1 for protocol bar
+                    }
+                }
+            }
+            return;
+        }
         // File search dialog: term=2, path=5, filter=8, regex=10
         if let Some(ref mut state) = self.file_search_dialog {
             state.term.clear_selection();

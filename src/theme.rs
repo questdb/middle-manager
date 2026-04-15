@@ -15,7 +15,7 @@ impl ThemeName {
         }
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn all() -> &'static [ThemeName] {
         &[ThemeName::FarManager, ThemeName::QuestdbDark]
     }
@@ -27,7 +27,7 @@ impl ThemeName {
         }
     }
 
-    pub fn to_str(&self) -> &'static str {
+    pub fn to_str(self) -> &'static str {
         match self {
             Self::FarManager => "far_manager",
             Self::QuestdbDark => "questdb_dark",
@@ -88,6 +88,9 @@ pub struct Theme {
     #[allow(dead_code)]
     pub dialog_hint_fg: Color,
     pub selected_fg: Color,
+    pub selected_highlight_fg: Color,
+    pub input_selection_fg: Color,
+    pub input_selection_bg: Color,
     pub viewer_line_num_fg: Color,
     pub viewer_text_fg: Color,
     pub viewer_hint_fg: Color,
@@ -123,6 +126,9 @@ pub struct Theme {
     pub overwrite_text_fg: Color,
     pub overwrite_btn_active_fg: Color,
     pub overwrite_btn_active_bg: Color,
+    // Popup overlay
+    pub popup_error_border: Color,
+    pub popup_success_border: Color,
     // Git
     pub git_modified_fg: Color,
     pub git_added_fg: Color,
@@ -180,6 +186,9 @@ impl Theme {
             dialog_input_bg: Color::Rgb(0, 128, 128),
             dialog_hint_fg: Color::DarkGray,
             selected_fg: Color::Yellow,
+            selected_highlight_fg: Color::Rgb(100, 60, 0),
+            input_selection_fg: Color::White,
+            input_selection_bg: Color::Black,
             viewer_line_num_fg: Color::Yellow,
             viewer_text_fg: Color::LightCyan,
             viewer_hint_fg: Color::Black,
@@ -205,6 +214,8 @@ impl Theme {
             overwrite_text_fg: Color::White,
             overwrite_btn_active_fg: Color::Black,
             overwrite_btn_active_bg: Color::White,
+            popup_error_border: Color::LightRed,
+            popup_success_border: Color::LightGreen,
             diff_added_bg: Color::Rgb(0, 50, 0),
             diff_deleted_bg: Color::Rgb(80, 0, 0),
             diff_changed_old_bg: Color::Rgb(80, 40, 0),
@@ -222,18 +233,18 @@ impl Theme {
     }
 
     pub fn questdb_dark() -> Self {
-        let bg = Color::Rgb(26, 21, 32);          // #1a1520 deep purple-black
-        let surface = Color::Rgb(36, 30, 46);      // #241e2e panel surfaces
-        let rose = Color::Rgb(209, 70, 113);        // #d14671 QuestDB primary
-        let magenta = Color::Rgb(137, 44, 108);     // #892c6c QuestDB deep
+        let bg = Color::Rgb(26, 21, 32); // #1a1520 deep purple-black
+        let surface = Color::Rgb(36, 30, 46); // #241e2e panel surfaces
+        let rose = Color::Rgb(209, 70, 113); // #d14671 QuestDB primary
+        let magenta = Color::Rgb(137, 44, 108); // #892c6c QuestDB deep
         let pink_light = Color::Rgb(232, 121, 154); // #e8799a soft pink
-        let text = Color::Rgb(232, 228, 237);        // #e8e4ed cool light grey
-        let text_dim = Color::Rgb(154, 143, 176);    // #9a8fb0 muted lavender
-        let text_very_dim = Color::Rgb(107, 90, 132);// #6b5a84 dim purple
-        let selection = Color::Rgb(46, 39, 64);       // #2e2740 selection bg
-        let green = Color::Rgb(130, 210, 150);        // #82d296 soft green
-        let blue = Color::Rgb(130, 160, 230);          // #82a0e6 soft blue
-        let red = Color::Rgb(240, 100, 100);           // #f06464 soft red
+        let text = Color::Rgb(232, 228, 237); // #e8e4ed cool light grey
+        let text_dim = Color::Rgb(154, 143, 176); // #9a8fb0 muted lavender
+        let text_very_dim = Color::Rgb(107, 90, 132); // #6b5a84 dim purple
+        let selection = Color::Rgb(46, 39, 64); // #2e2740 selection bg
+        let green = Color::Rgb(130, 210, 150); // #82d296 soft green
+        let blue = Color::Rgb(130, 160, 230); // #82a0e6 soft blue
+        let red = Color::Rgb(240, 100, 100); // #f06464 soft red
         let purple_light = Color::Rgb(195, 140, 220); // #c38cdc light purple
 
         Self {
@@ -243,7 +254,7 @@ impl Theme {
             title: rose,
             header_fg: pink_light,
             dir_fg: text,
-            file_fg: Color::Rgb(186, 178, 201),       // #bab2c9 light lavender
+            file_fg: Color::Rgb(186, 178, 201), // #bab2c9 light lavender
             symlink_fg: text_dim,
             exec_fg: green,
             size_fg: text_dim,
@@ -257,11 +268,11 @@ impl Theme {
             search_text_fg: text,
             path_active_fg: text,
             path_inactive_fg: text_very_dim,
-            footer_key_fg: Color::Rgb(26, 21, 32),         // dark bg text on pink buttons
-            footer_key_bg: Color::Rgb(209, 70, 113),        // rose button background
-            footer_fkey_fg: Color::Rgb(255, 230, 240),       // #ffe6f0 near-white pink for "F1" etc.
-            footer_sep_fg: Color::Rgb(137, 44, 108),         // magenta separator
-            footer_sep_bg: Color::Rgb(18, 14, 24),           // #120e18 very dark bar background
+            footer_key_fg: Color::Rgb(26, 21, 32), // dark bg text on pink buttons
+            footer_key_bg: Color::Rgb(209, 70, 113), // rose button background
+            footer_fkey_fg: Color::Rgb(255, 230, 240), // #ffe6f0 near-white pink for "F1" etc.
+            footer_sep_fg: Color::Rgb(137, 44, 108), // magenta separator
+            footer_sep_bg: Color::Rgb(18, 14, 24), // #120e18 very dark bar background
             dialog_bg: surface,
             dialog_border_fg: rose,
             dialog_title_fg: pink_light,
@@ -273,13 +284,16 @@ impl Theme {
             dialog_input_bg: selection,
             dialog_hint_fg: text_very_dim,
             selected_fg: pink_light,
+            selected_highlight_fg: Color::Rgb(26, 21, 32), // dark bg text on magenta highlight
+            input_selection_fg: text,
+            input_selection_bg: Color::Rgb(74, 56, 96), // muted purple selection
             viewer_line_num_fg: magenta,
             viewer_text_fg: text,
             viewer_hint_fg: bg,
             viewer_hint_bg: rose,
             syn_keyword: rose,
             syn_function: blue,
-            syn_type: Color::Rgb(195, 65, 112),       // #c34170 QuestDB pink alt
+            syn_type: Color::Rgb(195, 65, 112), // #c34170 QuestDB pink alt
             syn_string: green,
             syn_number: pink_light,
             syn_comment: text_very_dim,
@@ -300,6 +314,8 @@ impl Theme {
             overwrite_text_fg: text,
             overwrite_btn_active_fg: Color::Rgb(26, 21, 32),
             overwrite_btn_active_bg: pink_light,
+            popup_error_border: red,
+            popup_success_border: green,
             diff_added_bg: Color::Rgb(0, 50, 0),
             diff_deleted_bg: Color::Rgb(50, 0, 0),
             diff_changed_old_bg: Color::Rgb(80, 40, 0),
@@ -322,7 +338,11 @@ impl Theme {
     }
 
     pub fn border_style(&self, active: bool) -> Style {
-        let color = if active { self.border } else { self.border_inactive };
+        let color = if active {
+            self.border
+        } else {
+            self.border_inactive
+        };
         Style::default().fg(color).bg(self.bg)
     }
 
@@ -331,23 +351,37 @@ impl Theme {
     }
 
     pub fn header_style(&self) -> Style {
-        Style::default().fg(self.header_fg).bg(self.bg).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.header_fg)
+            .bg(self.bg)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn highlight_style(&self) -> Style {
-        Style::default().bg(self.highlight_bg).fg(self.highlight_fg).add_modifier(Modifier::BOLD)
+        Style::default()
+            .bg(self.highlight_bg)
+            .fg(self.highlight_fg)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn selected_highlight_style(&self) -> Style {
-        Style::default().bg(self.highlight_bg).fg(Color::Rgb(100, 60, 0)).add_modifier(Modifier::BOLD)
+        Style::default()
+            .bg(self.highlight_bg)
+            .fg(self.selected_highlight_fg)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn dir_style(&self) -> Style {
-        Style::default().fg(self.dir_fg).bg(self.bg).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.dir_fg)
+            .bg(self.bg)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn input_selection_style(&self) -> Style {
-        Style::default().fg(Color::White).bg(Color::Black)
+        Style::default()
+            .fg(self.input_selection_fg)
+            .bg(self.input_selection_bg)
     }
 
     pub fn file_style(&self) -> Style {
@@ -363,7 +397,10 @@ impl Theme {
     }
 
     pub fn selected_style(&self) -> Style {
-        Style::default().fg(self.selected_fg).bg(self.bg).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.selected_fg)
+            .bg(self.bg)
+            .add_modifier(Modifier::BOLD)
     }
 
     pub fn git_status_color(&self, status: crate::panel::git::GitFileStatus) -> Color {
@@ -383,11 +420,16 @@ impl Theme {
     }
 
     pub fn dialog_border_style(&self) -> Style {
-        Style::default().fg(self.dialog_border_fg).bg(self.dialog_bg)
+        Style::default()
+            .fg(self.dialog_border_fg)
+            .bg(self.dialog_bg)
     }
 
     pub fn dialog_title_style(&self) -> Style {
-        Style::default().fg(self.dialog_title_fg).bg(self.dialog_bg).add_modifier(Modifier::BOLD)
+        Style::default()
+            .fg(self.dialog_title_fg)
+            .bg(self.dialog_bg)
+            .add_modifier(Modifier::BOLD)
     }
 
     #[allow(dead_code)]
@@ -441,7 +483,7 @@ pub fn theme() -> Theme {
     use std::sync::atomic::Ordering;
 
     thread_local! {
-        static CACHED: RefCell<(u64, Option<Theme>)> = RefCell::new((0, None));
+        static CACHED: RefCell<(u64, Option<Theme>)> = const { RefCell::new((0, None)) };
     }
 
     let gen = THEME_GENERATION.load(Ordering::Relaxed);

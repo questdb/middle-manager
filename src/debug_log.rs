@@ -16,20 +16,7 @@ pub fn log_path_display() -> String {
 }
 
 fn log_path() -> &'static PathBuf {
-    LOG_PATH.get_or_init(|| {
-        if let Some(config_dir) = std::env::var_os("XDG_CONFIG_HOME") {
-            std::path::Path::new(&config_dir)
-                .join("middle-manager")
-                .join("debug.log")
-        } else if let Some(home) = std::env::var_os("HOME") {
-            std::path::Path::new(&home)
-                .join(".config")
-                .join("middle-manager")
-                .join("debug.log")
-        } else {
-            PathBuf::from("middle-manager-debug.log")
-        }
-    })
+    LOG_PATH.get_or_init(|| crate::remote_fs::config_dir().join("debug.log"))
 }
 
 /// Log a message to the debug log file.
@@ -55,26 +42,6 @@ pub fn log(msg: &str) {
             .collect();
         let _ = writeln!(file, "[{}] {}", timestamp, clean);
     }
-}
-
-/// Log a shell command that is about to be executed.
-#[allow(dead_code)]
-pub fn log_cmd(program: &str, args: &[&str]) {
-    if !is_enabled() {
-        return;
-    }
-    let args_str = args
-        .iter()
-        .map(|a| {
-            if a.contains(' ') || a.contains('"') {
-                format!("\"{}\"", a.replace('"', "\\\""))
-            } else {
-                a.to_string()
-            }
-        })
-        .collect::<Vec<_>>()
-        .join(" ");
-    log(&format!("CMD: {} {}", program, args_str));
 }
 
 /// Log a shell command result.

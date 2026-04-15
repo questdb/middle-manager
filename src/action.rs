@@ -51,6 +51,7 @@ pub enum Action {
 
     // Toggle checkbox / cycle dropdown in copy dialog
     Toggle,
+    ToggleReverse,
 
     // Go to line (all viewer/editor modes)
     GotoLinePrompt,

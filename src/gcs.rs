@@ -67,15 +67,7 @@ impl GcsConnection {
     }
 
     fn to_prefix(&self, path: &Path) -> String {
-        let s = path.to_string_lossy();
-        let clean = s.trim_start_matches('/');
-        if clean.is_empty() {
-            String::new()
-        } else if clean.ends_with('/') {
-            clean.to_string()
-        } else {
-            format!("{}/", clean)
-        }
+        crate::remote_fs::path_to_prefix(path)
     }
 
     pub fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> {
@@ -118,7 +110,11 @@ impl GcsConnection {
 
                 let size = item
                     .get("size")
-                    .and_then(|v| v.as_str().and_then(|s| s.parse().ok()).or_else(|| v.as_u64()))
+                    .and_then(|v| {
+                        v.as_str()
+                            .and_then(|s| s.parse().ok())
+                            .or_else(|| v.as_u64())
+                    })
                     .unwrap_or(0);
                 let modified = item
                     .get("updated")
@@ -216,16 +212,36 @@ impl GcsConnection {
 }
 
 impl crate::remote_fs::RemoteFs for GcsConnection {
-    fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> { self.read_dir(path) }
-    fn mkdir(&self, path: &Path) -> Result<()> { self.mkdir(path) }
-    fn remove_recursive(&self, path: &Path) -> Result<()> { self.remove_recursive(path) }
-    fn rename(&self, src: &Path, dst: &Path) -> Result<()> { self.rename(src, dst) }
-    fn download(&self, remote: &Path, local: &Path) -> Result<u64> { self.download(remote, local) }
-    fn upload(&self, local: &Path, remote: &Path) -> Result<u64> { self.upload(local, remote) }
-    fn download_dir(&self, remote: &Path, local: &Path) -> Result<u64> { self.download_dir(remote, local) }
-    fn upload_dir(&self, local: &Path, remote: &Path) -> Result<u64> { self.upload_dir(local, remote) }
-    fn home_dir(&self) -> PathBuf { self.home_dir() }
-    fn display_label(&self) -> String { self.display_label() }
+    fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> {
+        self.read_dir(path)
+    }
+    fn mkdir(&self, path: &Path) -> Result<()> {
+        self.mkdir(path)
+    }
+    fn remove_recursive(&self, path: &Path) -> Result<()> {
+        self.remove_recursive(path)
+    }
+    fn rename(&self, src: &Path, dst: &Path) -> Result<()> {
+        self.rename(src, dst)
+    }
+    fn download(&self, remote: &Path, local: &Path) -> Result<u64> {
+        self.download(remote, local)
+    }
+    fn upload(&self, local: &Path, remote: &Path) -> Result<u64> {
+        self.upload(local, remote)
+    }
+    fn download_dir(&self, remote: &Path, local: &Path) -> Result<u64> {
+        self.download_dir(remote, local)
+    }
+    fn upload_dir(&self, local: &Path, remote: &Path) -> Result<u64> {
+        self.upload_dir(local, remote)
+    }
+    fn home_dir(&self) -> PathBuf {
+        self.home_dir()
+    }
+    fn display_label(&self) -> String {
+        self.display_label()
+    }
 }
 
 fn parse_iso8601(s: &str) -> Option<SystemTime> {
@@ -254,8 +270,13 @@ mod tests {
                 let relative = url.strip_prefix(full_prefix).unwrap_or(url);
                 let is_dir = relative.ends_with('/');
                 let name = relative.trim_end_matches('/');
-                if name.is_empty() || name.contains('/') { continue; }
-                let size = item.get("size").and_then(|v| v.as_str().and_then(|s| s.parse().ok())).unwrap_or(0u64);
+                if name.is_empty() || name.contains('/') {
+                    continue;
+                }
+                let size = item
+                    .get("size")
+                    .and_then(|v| v.as_str().and_then(|s| s.parse().ok()))
+                    .unwrap_or(0u64);
                 entries.push((name.to_string(), is_dir, size));
             }
         }
@@ -274,19 +295,28 @@ mod tests {
             project: None,
         };
         assert_eq!(conn.gs_uri(Path::new("/")), "gs://my-bucket/");
-        assert_eq!(conn.gs_uri(Path::new("/docs/file.txt")), "gs://my-bucket/docs/file.txt");
+        assert_eq!(
+            conn.gs_uri(Path::new("/docs/file.txt")),
+            "gs://my-bucket/docs/file.txt"
+        );
     }
 
     #[test]
     fn gcs_to_prefix() {
-        let conn = GcsConnection { bucket: "b".to_string(), project: None };
+        let conn = GcsConnection {
+            bucket: "b".to_string(),
+            project: None,
+        };
         assert_eq!(conn.to_prefix(Path::new("/")), "");
         assert_eq!(conn.to_prefix(Path::new("/data")), "data/");
     }
 
     #[test]
     fn gcs_display_label() {
-        let conn = GcsConnection { bucket: "my-bucket".to_string(), project: Some("proj".to_string()) };
+        let conn = GcsConnection {
+            bucket: "my-bucket".to_string(),
+            project: Some("proj".to_string()),
+        };
         assert_eq!(conn.display_label(), "GCS: my-bucket");
     }
 }

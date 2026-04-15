@@ -23,8 +23,7 @@ impl NfsConnection {
                 .unwrap_or_default()
                 .as_millis()
         ));
-        std::fs::create_dir_all(&mount_point)
-            .context("Failed to create NFS mount point")?;
+        std::fs::create_dir_all(&mount_point).context("Failed to create NFS mount point")?;
 
         let source = format!("{}:{}", host, export);
         let mut cmd = Command::new("mount");
@@ -36,9 +35,9 @@ impl NfsConnection {
         }
         cmd.arg(&source).arg(&mount_point);
 
-        let output = cmd.output().context(
-            "Failed to run mount. Is nfs-common installed? You may need sudo.",
-        )?;
+        let output = cmd
+            .output()
+            .context("Failed to run mount. Is nfs-common installed? You may need sudo.")?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -177,16 +176,36 @@ impl Drop for NfsConnection {
 }
 
 impl crate::remote_fs::RemoteFs for NfsConnection {
-    fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> { self.read_dir(path) }
-    fn mkdir(&self, path: &Path) -> Result<()> { self.mkdir(path) }
-    fn remove_recursive(&self, path: &Path) -> Result<()> { self.remove_recursive(path) }
-    fn rename(&self, src: &Path, dst: &Path) -> Result<()> { self.rename(src, dst) }
-    fn download(&self, remote: &Path, local: &Path) -> Result<u64> { self.download(remote, local) }
-    fn upload(&self, local: &Path, remote: &Path) -> Result<u64> { self.upload(local, remote) }
-    fn download_dir(&self, remote: &Path, local: &Path) -> Result<u64> { self.download_dir(remote, local) }
-    fn upload_dir(&self, local: &Path, remote: &Path) -> Result<u64> { self.upload_dir(local, remote) }
-    fn home_dir(&self) -> PathBuf { self.home_dir() }
-    fn display_label(&self) -> String { self.display_label() }
+    fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> {
+        self.read_dir(path)
+    }
+    fn mkdir(&self, path: &Path) -> Result<()> {
+        self.mkdir(path)
+    }
+    fn remove_recursive(&self, path: &Path) -> Result<()> {
+        self.remove_recursive(path)
+    }
+    fn rename(&self, src: &Path, dst: &Path) -> Result<()> {
+        self.rename(src, dst)
+    }
+    fn download(&self, remote: &Path, local: &Path) -> Result<u64> {
+        self.download(remote, local)
+    }
+    fn upload(&self, local: &Path, remote: &Path) -> Result<u64> {
+        self.upload(local, remote)
+    }
+    fn download_dir(&self, remote: &Path, local: &Path) -> Result<u64> {
+        self.download_dir(remote, local)
+    }
+    fn upload_dir(&self, local: &Path, remote: &Path) -> Result<u64> {
+        self.upload_dir(local, remote)
+    }
+    fn home_dir(&self) -> PathBuf {
+        self.home_dir()
+    }
+    fn display_label(&self) -> String {
+        self.display_label()
+    }
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -196,7 +215,10 @@ fn normalize_path(path: &Path) -> PathBuf {
             std::path::Component::ParentDir => {
                 // Never pop past the root component so absolute paths stay absolute.
                 if let Some(last) = components.last() {
-                    if !matches!(last, std::path::Component::RootDir | std::path::Component::Prefix(_)) {
+                    if !matches!(
+                        last,
+                        std::path::Component::RootDir | std::path::Component::Prefix(_)
+                    ) {
                         components.pop();
                     }
                 }
@@ -231,18 +253,27 @@ mod tests {
 
     #[test]
     fn normalize_parent_dir() {
-        assert_eq!(normalize_path(Path::new("/a/b/../c")), PathBuf::from("/a/c"));
+        assert_eq!(
+            normalize_path(Path::new("/a/b/../c")),
+            PathBuf::from("/a/c")
+        );
     }
 
     #[test]
     fn normalize_cur_dir() {
-        assert_eq!(normalize_path(Path::new("/a/b/./c")), PathBuf::from("/a/b/c"));
+        assert_eq!(
+            normalize_path(Path::new("/a/b/./c")),
+            PathBuf::from("/a/b/c")
+        );
     }
 
     #[test]
     fn normalize_above_root() {
         // Going above root should collapse to just /etc
-        assert_eq!(normalize_path(Path::new("/a/../../etc")), PathBuf::from("/etc"));
+        assert_eq!(
+            normalize_path(Path::new("/a/../../etc")),
+            PathBuf::from("/etc")
+        );
     }
 
     #[test]
@@ -299,7 +330,11 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<u64> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
         let dest = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            continue; // Skip symlinks to prevent infinite recursion on cycles
+        }
+        if ft.is_dir() {
             total += copy_dir_recursive(&entry.path(), &dest)?;
         } else {
             std::fs::copy(entry.path(), &dest)?;

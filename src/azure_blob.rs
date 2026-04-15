@@ -85,8 +85,13 @@ impl AzureBlobConnection {
         }
         cmd.arg("--output").arg("json");
 
-        crate::debug_log::log(&format!("Azure [{}] az storage container list", self.account));
-        let output = cmd.output().context("Failed to run az CLI. Is it installed?")?;
+        crate::debug_log::log(&format!(
+            "Azure [{}] az storage container list",
+            self.account
+        ));
+        let output = cmd
+            .output()
+            .context("Failed to run az CLI. Is it installed?")?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             crate::debug_log::log_cmd_result("az", false, &stderr);
@@ -110,13 +115,19 @@ impl AzureBlobConnection {
     /// Create a new container.
     fn create_container(&self, name: &str) -> Result<()> {
         let mut cmd = Command::new("az");
-        cmd.arg("storage").arg("container").arg("create")
-            .arg("--name").arg(name);
+        cmd.arg("storage")
+            .arg("container")
+            .arg("create")
+            .arg("--name")
+            .arg(name);
         self.set_auth_env(&mut cmd);
         for arg in self.auth_args() {
             cmd.arg(arg);
         }
-        crate::debug_log::log(&format!("Azure [{}] az storage container create --name {}", self.account, name));
+        crate::debug_log::log(&format!(
+            "Azure [{}] az storage container create --name {}",
+            self.account, name
+        ));
         let output = cmd.output().context("Failed to run az CLI")?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
@@ -130,7 +141,12 @@ impl AzureBlobConnection {
     }
 
     /// Run az storage blob with a specific container (used when container is dynamic).
-    fn run_az_with_container(&self, subcmd: &[&str], extra_args: &[&str], container: &str) -> Result<String> {
+    fn run_az_with_container(
+        &self,
+        subcmd: &[&str],
+        extra_args: &[&str],
+        container: &str,
+    ) -> Result<String> {
         crate::debug_log::log(&format!(
             "Azure [{}/{}] az storage blob {:?} {:?}",
             self.account, container, subcmd, extra_args
@@ -147,7 +163,9 @@ impl AzureBlobConnection {
         for arg in extra_args {
             cmd.arg(arg);
         }
-        let output = cmd.output().context("Failed to run az CLI. Is it installed?")?;
+        let output = cmd
+            .output()
+            .context("Failed to run az CLI. Is it installed?")?;
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
             crate::debug_log::log_cmd_result("az", false, &stderr);
@@ -209,9 +227,12 @@ impl AzureBlobConnection {
     fn run_az_list(&self, prefix: &str, num_results: u32) -> Result<serde_json::Value> {
         let num_str = num_results.to_string();
         let mut extra = vec![
-            "--delimiter", "/",
-            "--num-results", &num_str,
-            "--output", "json",
+            "--delimiter",
+            "/",
+            "--num-results",
+            &num_str,
+            "--output",
+            "json",
         ];
         if !prefix.is_empty() {
             extra.push("--prefix");
@@ -263,15 +284,7 @@ impl AzureBlobConnection {
     }
 
     fn to_prefix(&self, path: &Path) -> String {
-        let s = path.to_string_lossy();
-        let clean = s.trim_start_matches('/');
-        if clean.is_empty() {
-            String::new()
-        } else if clean.ends_with('/') {
-            clean.to_string()
-        } else {
-            format!("{}/", clean)
-        }
+        crate::remote_fs::path_to_prefix(path)
     }
 
     pub fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> {
@@ -285,9 +298,12 @@ impl AzureBlobConnection {
         // Container level: list blobs with the resolved container
         let num_str = "1000".to_string();
         let mut extra: Vec<&str> = vec![
-            "--delimiter", "/",
-            "--num-results", &num_str,
-            "--output", "json",
+            "--delimiter",
+            "/",
+            "--num-results",
+            &num_str,
+            "--output",
+            "json",
         ];
         let prefix_owned = prefix.clone();
         if !prefix.is_empty() {
@@ -318,7 +334,10 @@ impl AzureBlobConnection {
                 let size = item
                     .get("properties")
                     .and_then(|p| p.get("contentLength"))
-                    .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+                    .and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
                     .unwrap_or(0);
 
                 let modified = item
@@ -378,7 +397,8 @@ impl AzureBlobConnection {
     pub fn mkdir(&self, path: &Path) -> Result<()> {
         // At account level: create a container
         if self.container.is_empty() {
-            let name = path.file_name()
+            let name = path
+                .file_name()
                 .map(|n| n.to_string_lossy().to_string())
                 .unwrap_or_default();
             if !name.is_empty() {
@@ -387,10 +407,7 @@ impl AzureBlobConnection {
         }
         let key = self.to_prefix(path);
         // Create zero-byte blob as directory marker
-        self.run_az(
-            &["upload"],
-            &["--data", "", "--name", &key, "--overwrite"],
-        )?;
+        self.run_az(&["upload"], &["--data", "", "--name", &key, "--overwrite"])?;
         Ok(())
     }
 
@@ -402,8 +419,11 @@ impl AzureBlobConnection {
         if prefix.is_empty() && self.container.is_empty() {
             // Deleting a container
             let mut cmd = Command::new("az");
-            cmd.arg("storage").arg("container").arg("delete")
-                .arg("--name").arg(&container);
+            cmd.arg("storage")
+                .arg("container")
+                .arg("delete")
+                .arg("--name")
+                .arg(&container);
             self.set_auth_env(&mut cmd);
             for arg in self.auth_args() {
                 cmd.arg(arg);
@@ -431,12 +451,22 @@ impl AzureBlobConnection {
         let dst_blob = dst_prefix.trim_end_matches('/');
 
         // Build source URI for copy
-        let endpoint = self.connection_string.as_ref()
+        let endpoint = self
+            .connection_string
+            .as_ref()
             .and_then(|cs| extract_connection_string_field(cs, "BlobEndpoint"));
         let source_uri = if let Some(ref ep) = endpoint {
-            format!("{}/{}/{}", ep.trim_end_matches('/'), src_container, src_blob)
+            format!(
+                "{}/{}/{}",
+                ep.trim_end_matches('/'),
+                src_container,
+                src_blob
+            )
         } else {
-            format!("https://{}.blob.core.windows.net/{}/{}", self.account, src_container, src_blob)
+            format!(
+                "https://{}.blob.core.windows.net/{}/{}",
+                self.account, src_container, src_blob
+            )
         };
 
         self.run_az_with_container(
@@ -503,8 +533,10 @@ impl AzureBlobConnection {
         self.run_az_with_container(
             &["upload"],
             &[
-                "--file", &local.to_string_lossy(),
-                "--name", name,
+                "--file",
+                &local.to_string_lossy(),
+                "--name",
+                name,
                 "--overwrite",
             ],
             &container,
@@ -520,9 +552,12 @@ impl AzureBlobConnection {
         self.run_az_with_container(
             &["download-batch"],
             &[
-                "--source", &container,
-                "--destination", &local.to_string_lossy(),
-                "--pattern", &pattern,
+                "--source",
+                &container,
+                "--destination",
+                &local.to_string_lossy(),
+                "--pattern",
+                &pattern,
             ],
             &container,
         )?;
@@ -534,9 +569,12 @@ impl AzureBlobConnection {
         self.run_az_with_container(
             &["upload-batch"],
             &[
-                "--source", &local.to_string_lossy(),
-                "--destination", &container,
-                "--destination-path", &prefix,
+                "--source",
+                &local.to_string_lossy(),
+                "--destination",
+                &container,
+                "--destination-path",
+                &prefix,
             ],
             &container,
         )?;
@@ -560,16 +598,36 @@ fn extract_connection_string_field(cs: &str, field: &str) -> Option<String> {
 }
 
 impl crate::remote_fs::RemoteFs for AzureBlobConnection {
-    fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> { self.read_dir(path) }
-    fn mkdir(&self, path: &Path) -> Result<()> { self.mkdir(path) }
-    fn remove_recursive(&self, path: &Path) -> Result<()> { self.remove_recursive(path) }
-    fn rename(&self, src: &Path, dst: &Path) -> Result<()> { self.rename(src, dst) }
-    fn download(&self, remote: &Path, local: &Path) -> Result<u64> { self.download(remote, local) }
-    fn upload(&self, local: &Path, remote: &Path) -> Result<u64> { self.upload(local, remote) }
-    fn download_dir(&self, remote: &Path, local: &Path) -> Result<u64> { self.download_dir(remote, local) }
-    fn upload_dir(&self, local: &Path, remote: &Path) -> Result<u64> { self.upload_dir(local, remote) }
-    fn home_dir(&self) -> PathBuf { self.home_dir() }
-    fn display_label(&self) -> String { self.display_label() }
+    fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> {
+        self.read_dir(path)
+    }
+    fn mkdir(&self, path: &Path) -> Result<()> {
+        self.mkdir(path)
+    }
+    fn remove_recursive(&self, path: &Path) -> Result<()> {
+        self.remove_recursive(path)
+    }
+    fn rename(&self, src: &Path, dst: &Path) -> Result<()> {
+        self.rename(src, dst)
+    }
+    fn download(&self, remote: &Path, local: &Path) -> Result<u64> {
+        self.download(remote, local)
+    }
+    fn upload(&self, local: &Path, remote: &Path) -> Result<u64> {
+        self.upload(local, remote)
+    }
+    fn download_dir(&self, remote: &Path, local: &Path) -> Result<u64> {
+        self.download_dir(remote, local)
+    }
+    fn upload_dir(&self, local: &Path, remote: &Path) -> Result<u64> {
+        self.upload_dir(local, remote)
+    }
+    fn home_dir(&self) -> PathBuf {
+        self.home_dir()
+    }
+    fn display_label(&self) -> String {
+        self.display_label()
+    }
 }
 
 #[cfg(test)]
@@ -579,7 +637,8 @@ mod tests {
 
     #[test]
     fn parse_azure_listing_basic() {
-        let json: serde_json::Value = serde_json::from_str(r#"[
+        let json: serde_json::Value = serde_json::from_str(
+            r#"[
             {
                 "name": "data/file.csv",
                 "properties": {
@@ -594,7 +653,9 @@ mod tests {
                     "lastModified": "2024-01-01T00:00:00+00:00"
                 }
             }
-        ]"#).unwrap();
+        ]"#,
+        )
+        .unwrap();
 
         let prefix = "data/";
         let mut entries = Vec::new();
@@ -604,8 +665,11 @@ mod tests {
                 let relative = name_full.strip_prefix(prefix).unwrap_or(name_full);
                 let is_dir = relative.ends_with('/');
                 let name = relative.trim_end_matches('/');
-                if name.is_empty() || name.contains('/') { continue; }
-                let size = item.get("properties")
+                if name.is_empty() || name.contains('/') {
+                    continue;
+                }
+                let size = item
+                    .get("properties")
                     .and_then(|p| p.get("contentLength"))
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0);
@@ -700,8 +764,7 @@ mod tests {
     #[test]
     fn resolve_path_nested_dirs() {
         let conn = account_level_conn();
-        let (container, prefix) =
-            conn.resolve_path(Path::new("/mycontainer/dir1/dir2/file.txt"));
+        let (container, prefix) = conn.resolve_path(Path::new("/mycontainer/dir1/dir2/file.txt"));
         assert_eq!(container, "mycontainer");
         assert_eq!(prefix, "dir1/dir2/file.txt/");
     }

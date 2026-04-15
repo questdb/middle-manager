@@ -130,8 +130,14 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "Connectivity (Ctrl+T / Shift+F2) [experimental]",
         &[
-            ("Ctrl+T / Shift+F2", "Open remote dialog / close panel / disconnect"),
-            ("Alt+Left/Right", "Switch protocol (SSH/SFTP/SMB/WebDAV/S3/GCS/Azure/NFS)"),
+            (
+                "Ctrl+T / Shift+F2",
+                "Open remote dialog / close panel / disconnect",
+            ),
+            (
+                "Alt+Left/Right",
+                "Switch protocol (SSH/SFTP/SMB/WebDAV/S3/GCS/Azure/NFS)",
+            ),
             ("Tab/BackTab", "Next/previous field"),
             ("F2", "Save current connection for quick access"),
             ("Enter", "Connect to selected / typed host"),

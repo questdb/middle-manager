@@ -52,7 +52,10 @@ pub fn list_sessions() -> Vec<MmSession> {
         if !name.starts_with(SESSION_PREFIX) {
             continue;
         }
-        let display_name = name.strip_prefix(SESSION_PREFIX).unwrap_or(name).to_string();
+        let display_name = name
+            .strip_prefix(SESSION_PREFIX)
+            .unwrap_or(name)
+            .to_string();
         let attached = parts[1] != "0";
         let created = parts[2].to_string();
         let windows = parts[3].parse().unwrap_or(1);
@@ -83,8 +86,8 @@ pub fn session_exists(name: &str) -> bool {
 /// The session runs `middle-manager` inside it.
 pub fn create_session(name: &str) -> anyhow::Result<()> {
     let full_name = prefixed_name(name);
-    let exe = std::env::current_exe()
-        .unwrap_or_else(|_| std::path::PathBuf::from("middle-manager"));
+    let exe =
+        std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("middle-manager"));
 
     let status = Command::new("tmux")
         .args([
@@ -114,8 +117,8 @@ pub fn create_session(name: &str) -> anyhow::Result<()> {
         ("status", "off"),
         ("xterm-keys", "on"),
         ("default-terminal", "xterm-256color"),
-        ("escape-time", "0"),          // No delay after Esc (faster key handling)
-        ("mouse", "on"),               // Enable mouse passthrough
+        ("escape-time", "0"), // No delay after Esc (faster key handling)
+        ("mouse", "on"),      // Enable mouse passthrough
     ];
     for (key, val) in opts {
         let _ = Command::new("tmux")
@@ -134,15 +137,38 @@ pub fn create_session(name: &str) -> anyhow::Result<()> {
         .args(["unbind-key", "-t", &full_name, "-T", "root", "WheelUpPane"])
         .status();
     let _ = Command::new("tmux")
-        .args(["unbind-key", "-t", &full_name, "-T", "root", "WheelDownPane"])
+        .args([
+            "unbind-key",
+            "-t",
+            &full_name,
+            "-T",
+            "root",
+            "WheelDownPane",
+        ])
         .status();
     let _ = Command::new("tmux")
-        .args(["bind-key", "-t", &full_name, "-T", "root", "WheelUpPane",
-               "send-keys", "-M"])
+        .args([
+            "bind-key",
+            "-t",
+            &full_name,
+            "-T",
+            "root",
+            "WheelUpPane",
+            "send-keys",
+            "-M",
+        ])
         .status();
     let _ = Command::new("tmux")
-        .args(["bind-key", "-t", &full_name, "-T", "root", "WheelDownPane",
-               "send-keys", "-M"])
+        .args([
+            "bind-key",
+            "-t",
+            &full_name,
+            "-T",
+            "root",
+            "WheelDownPane",
+            "send-keys",
+            "-M",
+        ])
         .status();
 
     Ok(())

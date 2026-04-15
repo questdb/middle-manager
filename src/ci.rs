@@ -218,15 +218,7 @@ impl LogDownload {
 }
 
 fn format_size(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{} B", bytes)
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    }
+    crate::remote_fs::format_size(bytes)
 }
 
 type ChecksReceiver = std::sync::mpsc::Receiver<Result<(Option<u64>, Vec<CiCheck>), String>>;
@@ -452,7 +444,9 @@ impl CiPanel {
                     }
                     Some(TreeItem::Step { step, check_idx }) => {
                         // Activate step for log viewing
-                        checks.get(*check_idx).map(|check| (check.run_id, step.clone()))
+                        checks
+                            .get(*check_idx)
+                            .map(|check| (check.run_id, step.clone()))
                     }
                     None => None,
                 }
@@ -491,7 +485,9 @@ impl CiPanel {
                 ..
             } => match items.get(*selected)? {
                 TreeItem::Check { check, .. } => Some(&check.details_url),
-                TreeItem::Step { check_idx, .. } => checks.get(*check_idx).map(|c| c.details_url.as_str()),
+                TreeItem::Step { check_idx, .. } => {
+                    checks.get(*check_idx).map(|c| c.details_url.as_str())
+                }
             },
             _ => None,
         }
@@ -642,10 +638,14 @@ pub struct FailureExtraction {
 impl FailureExtraction {
     /// Start extracting failures from all failed checks in the background.
     pub fn start(repo: String, checks: Vec<CiCheck>) -> Self {
-        let failed_count = checks.iter().filter(|c| c.status == CiStatus::Failure).count();
+        let failed_count = checks
+            .iter()
+            .filter(|c| c.status == CiStatus::Failure)
+            .count();
         crate::debug_log::log(&format!(
             "FailureExtraction::start: {} total checks, {} failed",
-            checks.len(), failed_count
+            checks.len(),
+            failed_count
         ));
 
         let (tx, rx) = std::sync::mpsc::channel();
@@ -660,7 +660,11 @@ impl FailureExtraction {
             let _ = tx.send(result);
         });
 
-        Self { rx, progress_rx, progress: "Starting extraction...".to_string() }
+        Self {
+            rx,
+            progress_rx,
+            progress: "Starting extraction...".to_string(),
+        }
     }
 
     /// Poll for completion. Returns Some when done. Also updates progress.
@@ -692,7 +696,12 @@ pub fn has_azure_pat() -> bool {
 /// Check GitHub API rate limit. Returns (remaining, limit) or None if check fails.
 fn check_github_rate_limit() -> Option<(u32, u32)> {
     let output = Command::new("gh")
-        .args(["api", "rate_limit", "--jq", ".resources.core | \"\\(.remaining) \\(.limit)\""])
+        .args([
+            "api",
+            "rate_limit",
+            "--jq",
+            ".resources.core | \"\\(.remaining) \\(.limit)\"",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -701,7 +710,7 @@ fn check_github_rate_limit() -> Option<(u32, u32)> {
         return None;
     }
     let text = String::from_utf8_lossy(&output.stdout);
-    let mut parts = text.trim().split_whitespace();
+    let mut parts = text.split_whitespace();
     let remaining: u32 = parts.next()?.parse().ok()?;
     let limit: u32 = parts.next()?.parse().ok()?;
     Some((remaining, limit))
@@ -716,8 +725,14 @@ fn extract_all_failures(
     let has_github_checks = checks.iter().any(|c| c.details_url.contains("github.com"));
     if has_github_checks {
         if let Some((remaining, limit)) = check_github_rate_limit() {
-            crate::debug_log::log(&format!("GitHub rate limit: {}/{} remaining", remaining, limit));
-            let _ = progress.send(format!("GitHub API: {}/{} requests remaining", remaining, limit));
+            crate::debug_log::log(&format!(
+                "GitHub rate limit: {}/{} remaining",
+                remaining, limit
+            ));
+            let _ = progress.send(format!(
+                "GitHub API: {}/{} requests remaining",
+                remaining, limit
+            ));
             if remaining < 10 {
                 return Err(format!(
                     "GitHub API rate limit nearly exhausted ({}/{}). Try again later.",
@@ -728,7 +743,10 @@ fn extract_all_failures(
     }
 
     let mut all_failures = Vec::new();
-    let total = checks.iter().filter(|c| c.status == CiStatus::Failure).count();
+    let total = checks
+        .iter()
+        .filter(|c| c.status == CiStatus::Failure)
+        .count();
     let mut current = 0;
 
     for check in checks {
@@ -741,26 +759,45 @@ fn extract_all_failures(
 
         crate::debug_log::log(&format!(
             "Extracting: {} (job_id={}, run_id={}, is_gh={}, has_azure={})",
-            check_name, check.job_id, check.run_id,
+            check_name,
+            check.job_id,
+            check.run_id,
             check.is_github_actions(),
             check.azure_info.is_some(),
         ));
 
         // Azure DevOps: use test results API (structured test names + error messages)
         if let Some(ref azure) = check.azure_info {
-            let _ = progress.send(format!("Check {}/{}: {} (querying test results)", current, total, check_name));
+            let _ = progress.send(format!(
+                "Check {}/{}: {} (querying test results)",
+                current, total, check_name
+            ));
             if let Some(failures) = query_azure_test_results(azure, &check_name) {
-                crate::debug_log::log(&format!("Got {} failures from Azure test results API for {}", failures.len(), check_name));
+                crate::debug_log::log(&format!(
+                    "Got {} failures from Azure test results API for {}",
+                    failures.len(),
+                    check_name
+                ));
                 all_failures.extend(failures);
             } else {
-                crate::debug_log::log(&format!("Azure test results API returned no results for {}", check_name));
+                crate::debug_log::log(&format!(
+                    "Azure test results API returned no results for {}",
+                    check_name
+                ));
             }
         }
         // GitHub: use check run annotations API (structured error annotations)
         else if check.details_url.contains("github.com") && check.job_id > 0 {
-            let _ = progress.send(format!("Check {}/{}: {} (querying annotations)", current, total, check_name));
+            let _ = progress.send(format!(
+                "Check {}/{}: {} (querying annotations)",
+                current, total, check_name
+            ));
             let failures = query_github_annotations(repo, check.job_id, &check_name);
-            crate::debug_log::log(&format!("Got {} failures from GitHub annotations for {}", failures.len(), check_name));
+            crate::debug_log::log(&format!(
+                "Got {} failures from GitHub annotations for {}",
+                failures.len(),
+                check_name
+            ));
             all_failures.extend(failures);
         } else {
             crate::debug_log::log(&format!("Skipping {}: no API method available", check_name));
@@ -774,7 +811,10 @@ fn extract_all_failures(
                 "Done. GitHub API: {}/{} requests remaining",
                 remaining, limit
             ));
-            crate::debug_log::log(&format!("GitHub rate limit after extraction: {}/{}", remaining, limit));
+            crate::debug_log::log(&format!(
+                "GitHub rate limit after extraction: {}/{}",
+                remaining, limit
+            ));
         }
     }
 
@@ -810,7 +850,10 @@ fn query_github_annotations(repo: &str, job_id: u64, check_name: &str) -> Vec<Te
     let mut failures = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for ann in annotations {
-        let level = ann.get("annotation_level").and_then(|v| v.as_str()).unwrap_or("");
+        let level = ann
+            .get("annotation_level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if level != "failure" && level != "error" {
             continue;
         }
@@ -832,7 +875,12 @@ fn query_github_annotations(repo: &str, job_id: u64, check_name: &str) -> Vec<Te
             let failure_info = if !message.is_empty() {
                 // Truncate very long messages
                 let msg = if message.len() > 500 {
-                    format!("{}...", &message[..500])
+                    // Find a valid UTF-8 char boundary at or before byte 500.
+                    let mut end = 500;
+                    while end > 0 && !message.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}...", &message[..end])
                 } else {
                     message.to_string()
                 };
@@ -861,7 +909,13 @@ fn get_azure_pat() -> Option<String> {
     }
     // 2. System keyring via secret-tool (GNOME Keyring / KDE Wallet)
     if let Ok(output) = Command::new("secret-tool")
-        .args(["lookup", "service", "middle-manager", "account", "azure-pat"])
+        .args([
+            "lookup",
+            "service",
+            "middle-manager",
+            "account",
+            "azure-pat",
+        ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -881,7 +935,10 @@ fn azure_auth_args() -> Vec<String> {
     if let Some(pat) = get_azure_pat() {
         // Azure DevOps PAT uses Basic auth with empty username
         let encoded = crate::clipboard::base64_encode(format!(":{}", pat).as_bytes());
-        vec!["-H".to_string(), format!("Authorization: Basic {}", encoded)]
+        vec![
+            "-H".to_string(),
+            format!("Authorization: Basic {}", encoded),
+        ]
     } else {
         vec![]
     }
@@ -928,7 +985,10 @@ fn query_azure_test_results(azure: &AzureInfo, check_name: &str) -> Option<Vec<T
         return None;
     }
 
-    crate::debug_log::log(&format!("Azure test results API: found {} test runs", runs.len()));
+    crate::debug_log::log(&format!(
+        "Azure test results API: found {} test runs",
+        runs.len()
+    ));
 
     // Step 2: Get failed results from each run
     let mut failures = Vec::new();
@@ -977,7 +1037,8 @@ fn query_azure_test_results(azure: &AzureInfo, check_name: &str) -> Option<Vec<T
                     .and_then(|v| v.as_str())
                     .unwrap_or("");
                 if !test_name.is_empty() && seen.insert(test_name.to_string()) {
-                    let error_msg = result.get("errorMessage")
+                    let error_msg = result
+                        .get("errorMessage")
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string());
                     failures.push(TestFailure {
@@ -1003,26 +1064,25 @@ pub fn write_failures_file(
     use std::io::Write;
     let mut f = std::fs::File::create(path)?;
 
-    let pr_str = pr_number
-        .map(|n| format!(" PR #{}", n))
-        .unwrap_or_default();
+    let pr_str = pr_number.map(|n| format!(" PR #{}", n)).unwrap_or_default();
     writeln!(f, "# CI Failures — {}{}", repo, pr_str)?;
     writeln!(f)?;
 
     if failures.is_empty() {
         writeln!(f, "No test failures found in the logs.")?;
         writeln!(f)?;
-        writeln!(f, "The failed checks may not contain recognizable test output.")?;
+        writeln!(
+            f,
+            "The failed checks may not contain recognizable test output."
+        )?;
         return Ok(());
     }
 
     // Group by check name, preserving failure info
-    let mut by_check: std::collections::BTreeMap<&str, Vec<&TestFailure>> = std::collections::BTreeMap::new();
+    let mut by_check: std::collections::BTreeMap<&str, Vec<&TestFailure>> =
+        std::collections::BTreeMap::new();
     for fail in failures {
-        by_check
-            .entry(&fail.check_name)
-            .or_default()
-            .push(fail);
+        by_check.entry(&fail.check_name).or_default().push(fail);
     }
 
     for (check, tests) in &by_check {
@@ -1041,7 +1101,8 @@ pub fn write_failures_file(
         writeln!(f)?;
     }
 
-    let unique: std::collections::HashSet<&str> = failures.iter().map(|f| f.test_name.as_str()).collect();
+    let unique: std::collections::HashSet<&str> =
+        failures.iter().map(|f| f.test_name.as_str()).collect();
     writeln!(f, "---")?;
     writeln!(
         f,
@@ -1052,7 +1113,11 @@ pub fn write_failures_file(
 
     // Append rate limit info if available
     if let Some((remaining, limit)) = check_github_rate_limit() {
-        writeln!(f, "GitHub API rate limit: {}/{} remaining.", remaining, limit)?;
+        writeln!(
+            f,
+            "GitHub API rate limit: {}/{} remaining.",
+            remaining, limit
+        )?;
     }
 
     Ok(())

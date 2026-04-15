@@ -53,9 +53,11 @@ mod s3mock {
         // Create bucket via aws CLI
         let _ = Command::new("aws")
             .args([
-                "s3", "mb",
+                "s3",
+                "mb",
                 &format!("s3://{}", bucket),
-                "--endpoint-url", "http://localhost:9090",
+                "--endpoint-url",
+                "http://localhost:9090",
             ])
             .env("AWS_ACCESS_KEY_ID", "dummy")
             .env("AWS_SECRET_ACCESS_KEY", "dummy")
@@ -66,10 +68,12 @@ mod s3mock {
     fn cleanup_bucket(bucket: &str) {
         let _ = Command::new("aws")
             .args([
-                "s3", "rb",
+                "s3",
+                "rb",
                 &format!("s3://{}", bucket),
                 "--force",
-                "--endpoint-url", "http://localhost:9090",
+                "--endpoint-url",
+                "http://localhost:9090",
             ])
             .env("AWS_ACCESS_KEY_ID", "dummy")
             .env("AWS_SECRET_ACCESS_KEY", "dummy")
@@ -82,10 +86,12 @@ mod s3mock {
         std::fs::write(&tmp, content).unwrap();
         let _ = Command::new("aws")
             .args([
-                "s3", "cp",
+                "s3",
+                "cp",
                 &tmp.to_string_lossy(),
                 &format!("s3://{}/{}", bucket, key),
-                "--endpoint-url", "http://localhost:9090",
+                "--endpoint-url",
+                "http://localhost:9090",
             ])
             .env("AWS_ACCESS_KEY_ID", "dummy")
             .env("AWS_SECRET_ACCESS_KEY", "dummy")
@@ -112,10 +118,17 @@ mod s3mock {
             Ok(c) => {
                 let entries = c.read_dir(Path::new("/")).unwrap();
                 // Empty bucket should have no entries
-                assert!(entries.is_empty(), "Expected empty, got {:?}", entries.iter().map(|e| &e.name).collect::<Vec<_>>());
+                assert!(
+                    entries.is_empty(),
+                    "Expected empty, got {:?}",
+                    entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+                );
             }
             Err(e) => {
-                panic!("S3 connect failed (skip guard confirmed service is up): {}", e);
+                panic!(
+                    "S3 connect failed (skip guard confirmed service is up): {}",
+                    e
+                );
             }
         }
 
@@ -141,13 +154,25 @@ mod s3mock {
         if let Ok(c) = conn {
             let entries = c.read_dir(Path::new("/")).unwrap();
             let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-            assert!(names.contains(&"hello.txt"), "Missing hello.txt in {:?}", names);
-            assert!(names.iter().any(|n| *n == "subdir"), "Missing subdir/ in {:?}", names);
+            assert!(
+                names.contains(&"hello.txt"),
+                "Missing hello.txt in {:?}",
+                names
+            );
+            assert!(
+                names.iter().any(|n| *n == "subdir"),
+                "Missing subdir/ in {:?}",
+                names
+            );
 
             // Check subdir listing
             let sub_entries = c.read_dir(Path::new("/subdir")).unwrap();
             let sub_names: Vec<&str> = sub_entries.iter().map(|e| e.name.as_str()).collect();
-            assert!(sub_names.contains(&"nested.txt"), "Missing nested.txt in {:?}", sub_names);
+            assert!(
+                sub_names.contains(&"nested.txt"),
+                "Missing nested.txt in {:?}",
+                sub_names
+            );
         }
 
         cleanup_bucket(bucket);
@@ -161,7 +186,10 @@ mod s3mock {
         setup_bucket(bucket);
 
         if let Ok(c) = middle_manager::s3::S3Connection::connect(
-            bucket, Some("dummy"), Some("http://localhost:9090"), Some("us-east-1"),
+            bucket,
+            Some("dummy"),
+            Some("http://localhost:9090"),
+            Some("us-east-1"),
         ) {
             // Create a directory
             c.mkdir(Path::new("/newdir")).unwrap();
@@ -186,7 +214,10 @@ mod s3mock {
         setup_bucket(bucket);
 
         if let Ok(c) = middle_manager::s3::S3Connection::connect(
-            bucket, Some("dummy"), Some("http://localhost:9090"), Some("us-east-1"),
+            bucket,
+            Some("dummy"),
+            Some("http://localhost:9090"),
+            Some("us-east-1"),
         ) {
             // Upload
             let tmp_up = std::env::temp_dir().join("mm-test-s3-upload.txt");
@@ -229,9 +260,13 @@ mod azurite {
     fn create_container(name: &str) {
         let _ = Command::new("az")
             .args([
-                "storage", "container", "create",
-                "--name", name,
-                "--connection-string", CONN_STR,
+                "storage",
+                "container",
+                "create",
+                "--name",
+                name,
+                "--connection-string",
+                CONN_STR,
             ])
             .output();
     }
@@ -239,9 +274,13 @@ mod azurite {
     fn delete_container(name: &str) {
         let _ = Command::new("az")
             .args([
-                "storage", "container", "delete",
-                "--name", name,
-                "--connection-string", CONN_STR,
+                "storage",
+                "container",
+                "delete",
+                "--name",
+                name,
+                "--connection-string",
+                CONN_STR,
             ])
             .output();
     }
@@ -254,17 +293,27 @@ mod azurite {
         create_container(container);
 
         let conn = middle_manager::azure_blob::AzureBlobConnection::connect(
-            "devstoreaccount1", "", None, Some(CONN_STR),
+            "devstoreaccount1",
+            "",
+            None,
+            Some(CONN_STR),
         );
 
         match conn {
             Ok(c) => {
                 let entries = c.read_dir(Path::new("/")).unwrap();
                 let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-                assert!(names.contains(&"mm-test-list"), "Missing container in {:?}", names);
+                assert!(
+                    names.contains(&"mm-test-list"),
+                    "Missing container in {:?}",
+                    names
+                );
             }
             Err(e) => {
-                panic!("Azure connect failed (skip guard confirmed service is up): {}", e);
+                panic!(
+                    "Azure connect failed (skip guard confirmed service is up): {}",
+                    e
+                );
             }
         }
 
@@ -283,24 +332,37 @@ mod azurite {
         std::fs::write(&tmp, "azure test content").unwrap();
         let _ = Command::new("az")
             .args([
-                "storage", "blob", "upload",
-                "--file", &tmp.to_string_lossy(),
-                "--name", "testfile.txt",
-                "--container-name", container,
-                "--connection-string", CONN_STR,
+                "storage",
+                "blob",
+                "upload",
+                "--file",
+                &tmp.to_string_lossy(),
+                "--name",
+                "testfile.txt",
+                "--container-name",
+                container,
+                "--connection-string",
+                CONN_STR,
                 "--overwrite",
             ])
             .output();
         let _ = std::fs::remove_file(&tmp);
 
         let conn = middle_manager::azure_blob::AzureBlobConnection::connect(
-            "devstoreaccount1", container, None, Some(CONN_STR),
+            "devstoreaccount1",
+            container,
+            None,
+            Some(CONN_STR),
         );
 
         if let Ok(c) = conn {
             let entries = c.read_dir(Path::new("/")).unwrap();
             let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-            assert!(names.contains(&"testfile.txt"), "Missing testfile.txt in {:?}", names);
+            assert!(
+                names.contains(&"testfile.txt"),
+                "Missing testfile.txt in {:?}",
+                names
+            );
         }
 
         delete_container(container);
@@ -317,7 +379,15 @@ mod sftp {
     fn sftp_available() -> bool {
         // Check if we can SSH to localhost without password
         Command::new("ssh")
-            .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=2", "localhost", "echo", "ok"])
+            .args([
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=2",
+                "localhost",
+                "echo",
+                "ok",
+            ])
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
@@ -341,11 +411,18 @@ mod sftp {
 
         let conn = middle_manager::sftp::SftpConnection::connect(&host).unwrap();
         let home = conn.home_dir();
-        assert!(home.to_string_lossy().starts_with('/'), "Home should be absolute: {:?}", home);
+        assert!(
+            home.to_string_lossy().starts_with('/'),
+            "Home should be absolute: {:?}",
+            home
+        );
 
         let entries = conn.read_dir(&home).unwrap();
         // Home directory should have at least one entry
-        assert!(!entries.is_empty(), "Home directory listing should not be empty");
+        assert!(
+            !entries.is_empty(),
+            "Home directory listing should not be empty"
+        );
     }
 
     #[test]
@@ -355,8 +432,12 @@ mod sftp {
         let host = middle_manager::ssh::SshHost {
             name: "localhost".to_string(),
             hostname: "localhost".to_string(),
-            port: None, user: None, identity_file: None,
-            group: None, jump_host: None, extra_args: vec![],
+            port: None,
+            user: None,
+            identity_file: None,
+            group: None,
+            jump_host: None,
+            extra_args: vec![],
             source: middle_manager::ssh::HostSource::Saved,
         };
 
@@ -369,16 +450,20 @@ mod sftp {
 
         // Verify it exists
         let entries = conn.read_dir(&home).unwrap();
-        assert!(entries.iter().any(|e| e.name == ".mm-test-sftp-dir"),
-            "Created directory not found in listing");
+        assert!(
+            entries.iter().any(|e| e.name == ".mm-test-sftp-dir"),
+            "Created directory not found in listing"
+        );
 
         // Remove
         conn.remove_recursive(&test_dir).unwrap();
 
         // Verify it's gone
         let entries = conn.read_dir(&home).unwrap();
-        assert!(!entries.iter().any(|e| e.name == ".mm-test-sftp-dir"),
-            "Deleted directory still appears in listing");
+        assert!(
+            !entries.iter().any(|e| e.name == ".mm-test-sftp-dir"),
+            "Deleted directory still appears in listing"
+        );
     }
 }
 
@@ -440,7 +525,12 @@ mod webdav {
 
         // The first <d:response> is the directory itself (/webdav/) and should be skipped.
         // We expect 2 entries: "documents" (dir) and "readme.txt" (file).
-        assert_eq!(entries.len(), 2, "Expected 2 entries, got {:?}", entries.iter().map(|e| &e.name).collect::<Vec<_>>());
+        assert_eq!(
+            entries.len(),
+            2,
+            "Expected 2 entries, got {:?}",
+            entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
 
         // Verify the directory entry
         assert_eq!(entries[0].name, "documents");
@@ -476,13 +566,30 @@ mod smb {
             .expect("parse_smbclient_ls should succeed");
 
         // "." is skipped by the parser, so we expect 4 entries: "..", "Documents", "photo.jpg", "readme.txt"
-        assert_eq!(entries.len(), 4, "Expected 4 entries, got {:?}", entries.iter().map(|e| &e.name).collect::<Vec<_>>());
+        assert_eq!(
+            entries.len(),
+            4,
+            "Expected 4 entries, got {:?}",
+            entries.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
 
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert!(names.contains(&".."), "Missing '..' in {:?}", names);
-        assert!(names.contains(&"Documents"), "Missing 'Documents' in {:?}", names);
-        assert!(names.contains(&"photo.jpg"), "Missing 'photo.jpg' in {:?}", names);
-        assert!(names.contains(&"readme.txt"), "Missing 'readme.txt' in {:?}", names);
+        assert!(
+            names.contains(&"Documents"),
+            "Missing 'Documents' in {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"photo.jpg"),
+            "Missing 'photo.jpg' in {:?}",
+            names
+        );
+        assert!(
+            names.contains(&"readme.txt"),
+            "Missing 'readme.txt' in {:?}",
+            names
+        );
 
         // Verify directory flag
         let docs = entries.iter().find(|e| e.name == "Documents").unwrap();

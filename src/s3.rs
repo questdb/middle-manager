@@ -117,28 +117,14 @@ impl S3Connection {
         }
     }
 
-    /// Convert a panel path to an S3 prefix (no leading slash, with trailing slash for dirs).
     fn to_prefix(&self, path: &Path) -> String {
-        let s = path.to_string_lossy();
-        let clean = s.trim_start_matches('/');
-        if clean.is_empty() {
-            String::new()
-        } else if clean.ends_with('/') {
-            clean.to_string()
-        } else {
-            format!("{}/", clean)
-        }
+        crate::remote_fs::path_to_prefix(path)
     }
 
     pub fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> {
         let prefix = self.to_prefix(path);
 
-        let mut args = vec![
-            "list-objects-v2",
-            "--delimiter",
-            "/",
-            "--no-paginate",
-        ];
+        let mut args = vec!["list-objects-v2", "--delimiter", "/", "--no-paginate"];
 
         let prefix_owned;
         if !prefix.is_empty() {
@@ -179,9 +165,7 @@ impl S3Connection {
         if let Some(contents) = json.get("Contents").and_then(|v| v.as_array()) {
             for obj in contents {
                 let key = obj.get("Key").and_then(|v| v.as_str()).unwrap_or("");
-                let name = key
-                    .strip_prefix(&prefix)
-                    .unwrap_or(key);
+                let name = key.strip_prefix(&prefix).unwrap_or(key);
                 // Skip the prefix itself (empty name) and directory markers
                 if name.is_empty() || name == "/" {
                     continue;
@@ -210,13 +194,7 @@ impl S3Connection {
 
     pub fn mkdir(&self, path: &Path) -> Result<()> {
         let key = self.to_prefix(path);
-        self.run_s3api(&[
-            "put-object",
-            "--key",
-            &key,
-            "--content-length",
-            "0",
-        ])?;
+        self.run_s3api(&["put-object", "--key", &key, "--content-length", "0"])?;
         Ok(())
     }
 
@@ -275,16 +253,36 @@ impl S3Connection {
 }
 
 impl crate::remote_fs::RemoteFs for S3Connection {
-    fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> { self.read_dir(path) }
-    fn mkdir(&self, path: &Path) -> Result<()> { self.mkdir(path) }
-    fn remove_recursive(&self, path: &Path) -> Result<()> { self.remove_recursive(path) }
-    fn rename(&self, src: &Path, dst: &Path) -> Result<()> { self.rename(src, dst) }
-    fn download(&self, remote: &Path, local: &Path) -> Result<u64> { self.download(remote, local) }
-    fn upload(&self, local: &Path, remote: &Path) -> Result<u64> { self.upload(local, remote) }
-    fn download_dir(&self, remote: &Path, local: &Path) -> Result<u64> { self.download_dir(remote, local) }
-    fn upload_dir(&self, local: &Path, remote: &Path) -> Result<u64> { self.upload_dir(local, remote) }
-    fn home_dir(&self) -> PathBuf { self.home_dir() }
-    fn display_label(&self) -> String { self.display_label() }
+    fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> {
+        self.read_dir(path)
+    }
+    fn mkdir(&self, path: &Path) -> Result<()> {
+        self.mkdir(path)
+    }
+    fn remove_recursive(&self, path: &Path) -> Result<()> {
+        self.remove_recursive(path)
+    }
+    fn rename(&self, src: &Path, dst: &Path) -> Result<()> {
+        self.rename(src, dst)
+    }
+    fn download(&self, remote: &Path, local: &Path) -> Result<u64> {
+        self.download(remote, local)
+    }
+    fn upload(&self, local: &Path, remote: &Path) -> Result<u64> {
+        self.upload(local, remote)
+    }
+    fn download_dir(&self, remote: &Path, local: &Path) -> Result<u64> {
+        self.download_dir(remote, local)
+    }
+    fn upload_dir(&self, local: &Path, remote: &Path) -> Result<u64> {
+        self.upload_dir(local, remote)
+    }
+    fn home_dir(&self) -> PathBuf {
+        self.home_dir()
+    }
+    fn display_label(&self) -> String {
+        self.display_label()
+    }
 }
 
 pub fn parse_iso8601(s: &str) -> Option<SystemTime> {
@@ -405,7 +403,8 @@ mod tests {
 
     #[test]
     fn parse_s3_listing_basic() {
-        let json: serde_json::Value = serde_json::from_str(r#"{
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
             "Contents": [
                 {"Key": "docs/readme.md", "Size": 1234, "LastModified": "2024-01-15T10:30:27.000Z"},
                 {"Key": "docs/notes.txt", "Size": 567, "LastModified": "2024-02-01T12:00:00.000Z"}
@@ -414,7 +413,9 @@ mod tests {
                 {"Prefix": "docs/images/"},
                 {"Prefix": "docs/data/"}
             ]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
 
         let entries = parse_s3_listing(&json, "docs/", Path::new("/docs"));
         assert_eq!(entries.len(), 4);
@@ -442,14 +443,17 @@ mod tests {
 
     #[test]
     fn parse_s3_listing_root_prefix() {
-        let json: serde_json::Value = serde_json::from_str(r#"{
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
             "Contents": [
                 {"Key": "file.txt", "Size": 100, "LastModified": "2024-01-01T00:00:00Z"}
             ],
             "CommonPrefixes": [
                 {"Prefix": "folder/"}
             ]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
 
         let entries = parse_s3_listing(&json, "", Path::new("/"));
         assert_eq!(entries.len(), 2);
@@ -460,12 +464,15 @@ mod tests {
 
     #[test]
     fn parse_s3_listing_skips_prefix_marker() {
-        let json: serde_json::Value = serde_json::from_str(r#"{
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{
             "Contents": [
                 {"Key": "mydir/", "Size": 0, "LastModified": "2024-01-01T00:00:00Z"},
                 {"Key": "mydir/file.txt", "Size": 42, "LastModified": "2024-01-01T00:00:00Z"}
             ]
-        }"#).unwrap();
+        }"#,
+        )
+        .unwrap();
 
         let entries = parse_s3_listing(&json, "mydir/", Path::new("/mydir"));
         // The "mydir/" key results in empty name after prefix stripping → skipped
@@ -482,7 +489,10 @@ mod tests {
             region: None,
         };
         assert_eq!(conn.s3_uri(Path::new("/")), "s3://my-bucket/");
-        assert_eq!(conn.s3_uri(Path::new("/docs/file.txt")), "s3://my-bucket/docs/file.txt");
+        assert_eq!(
+            conn.s3_uri(Path::new("/docs/file.txt")),
+            "s3://my-bucket/docs/file.txt"
+        );
         assert_eq!(conn.s3_uri(Path::new("")), "s3://my-bucket/");
     }
 
@@ -519,6 +529,9 @@ mod tests {
             endpoint_url: Some("https://minio.local:9000".to_string()),
             region: None,
         };
-        assert_eq!(conn.display_label(), "S3: https://minio.local:9000/my-bucket");
+        assert_eq!(
+            conn.display_label(),
+            "S3: https://minio.local:9000/my-bucket"
+        );
     }
 }

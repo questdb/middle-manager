@@ -29,8 +29,8 @@ mod text_input;
 mod theme;
 mod ui;
 mod vt;
-pub mod webdav;
 mod watcher;
+pub mod webdav;
 
 use std::io;
 use std::process::Command;
@@ -168,7 +168,10 @@ fn handle_cli_action(action: CliAction) -> Result<()> {
             // Prevent nested tmux -- refuse to attach from inside any tmux session
             if std::env::var("TMUX").is_ok() {
                 eprintln!("Error: already inside a tmux session.");
-                eprintln!("Detach first (` then d), then run: middle-manager --session {}", name);
+                eprintln!(
+                    "Detach first (` then d), then run: middle-manager --session {}",
+                    name
+                );
                 eprintln!("Or use Ctrl+Y inside middle-manager to manage sessions.");
                 std::process::exit(1);
             }
@@ -181,14 +184,16 @@ fn handle_cli_action(action: CliAction) -> Result<()> {
             }
 
             // Attach (replaces this process with tmux)
-            let err = exec_replace("tmux", &[
-                "attach-session".to_string(),
-                "-t".to_string(),
-                full_name,
-            ]);
+            let err = exec_replace(
+                "tmux",
+                &["attach-session".to_string(), "-t".to_string(), full_name],
+            );
             eprintln!("Failed to attach: {}", err);
             eprintln!("If running via 'cargo run', try the built binary directly:");
-            eprintln!("  cargo build && ./target/debug/middle-manager --session {}", name);
+            eprintln!(
+                "  cargo build && ./target/debug/middle-manager --session {}",
+                name
+            );
             std::process::exit(1);
         }
         CliAction::Help => {

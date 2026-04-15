@@ -12,7 +12,12 @@ use super::dialog_helpers::{self as dh};
 pub fn render(frame: &mut Frame, state: &SessionDialogState) {
     let t = theme();
     let dialog_height = 18u16.min(frame.area().height.saturating_sub(4));
-    let layout = dh::render_dialog_frame(frame, " Connectivity: Sessions [experimental] ", 60, dialog_height);
+    let layout = dh::render_dialog_frame(
+        frame,
+        " Connectivity: Sessions [experimental] ",
+        60,
+        dialog_height,
+    );
     let (normal, highlight, _input_normal) = dh::dialog_styles();
 
     if state.creating {
@@ -69,10 +74,7 @@ pub fn render(frame: &mut Frame, state: &SessionDialogState) {
 
     // Session list
     let list_start = 2u16;
-    let list_height = layout
-        .content
-        .height
-        .saturating_sub(list_start + 2) as usize;
+    let list_height = layout.content.height.saturating_sub(list_start + 2) as usize;
 
     let total = state.sessions.len();
     let scroll = if total <= list_height {

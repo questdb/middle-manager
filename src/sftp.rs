@@ -35,10 +35,7 @@ impl SftpConnection {
             ssh_args.push(jump.clone());
         }
 
-        let conn = Self {
-            target,
-            ssh_args,
-        };
+        let conn = Self { target, ssh_args };
 
         // Validate connection by listing root
         conn.run_batch("pwd")?;
@@ -47,7 +44,11 @@ impl SftpConnection {
 
     /// Run an sftp batch command and return stdout.
     fn run_batch(&self, batch_cmd: &str) -> Result<String> {
-        crate::debug_log::log(&format!("SFTP [{}] batch: {}", self.target, batch_cmd.lines().next().unwrap_or("")));
+        crate::debug_log::log(&format!(
+            "SFTP [{}] batch: {}",
+            self.target,
+            batch_cmd.lines().next().unwrap_or("")
+        ));
 
         let mut cmd = Command::new("sftp");
         cmd.arg("-oBatchMode=yes")
@@ -64,7 +65,9 @@ impl SftpConnection {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
 
-        let mut child = cmd.spawn().context("Failed to run sftp. Is OpenSSH installed?")?;
+        let mut child = cmd
+            .spawn()
+            .context("Failed to run sftp. Is OpenSSH installed?")?;
 
         if let Some(mut stdin) = child.stdin.take() {
             use std::io::Write;
@@ -104,14 +107,6 @@ impl SftpConnection {
     /// Create a remote directory.
     pub fn mkdir(&self, path: &Path) -> Result<()> {
         let cmd = format!("mkdir {}", shell_quote(&path.to_string_lossy()));
-        self.run_batch(&cmd)?;
-        Ok(())
-    }
-
-    /// Remove a remote file.
-    #[allow(dead_code)]
-    pub fn remove_file(&self, path: &Path) -> Result<()> {
-        let cmd = format!("rm {}", shell_quote(&path.to_string_lossy()));
         self.run_batch(&cmd)?;
         Ok(())
     }
@@ -180,41 +175,6 @@ impl SftpConnection {
         Ok(meta.len())
     }
 
-    /// Download a directory recursively.
-    pub fn download_dir(&self, remote: &Path, local: &Path) -> Result<u64> {
-        std::fs::create_dir_all(local)?;
-        let entries = self.read_dir(remote)?;
-        let mut total = 0u64;
-        for entry in entries {
-            if entry.name == ".." {
-                continue;
-            }
-            let local_dest = local.join(&entry.name);
-            if entry.is_dir {
-                total += self.download_dir(&entry.path, &local_dest)?;
-            } else {
-                total += self.download(&entry.path, &local_dest)?;
-            }
-        }
-        Ok(total)
-    }
-
-    /// Upload a directory recursively.
-    pub fn upload_dir(&self, local: &Path, remote: &Path) -> Result<u64> {
-        let _ = self.mkdir(remote); // ignore if exists
-        let mut total = 0u64;
-        for entry in std::fs::read_dir(local)? {
-            let entry = entry?;
-            let remote_dest = remote.join(entry.file_name());
-            if entry.file_type()?.is_dir() {
-                total += self.upload_dir(&entry.path(), &remote_dest)?;
-            } else {
-                total += self.upload(&entry.path(), &remote_dest)?;
-            }
-        }
-        Ok(total)
-    }
-
     /// Get the home directory on the remote host.
     pub fn home_dir(&self) -> PathBuf {
         // Run `pwd` to get the initial directory (which is the home dir)
@@ -239,16 +199,30 @@ impl SftpConnection {
 }
 
 impl crate::remote_fs::RemoteFs for SftpConnection {
-    fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> { self.read_dir(path) }
-    fn mkdir(&self, path: &Path) -> Result<()> { self.mkdir(path) }
-    fn remove_recursive(&self, path: &Path) -> Result<()> { self.remove_recursive(path) }
-    fn rename(&self, src: &Path, dst: &Path) -> Result<()> { self.rename(src, dst) }
-    fn download(&self, remote: &Path, local: &Path) -> Result<u64> { self.download(remote, local) }
-    fn upload(&self, local: &Path, remote: &Path) -> Result<u64> { self.upload(local, remote) }
-    fn download_dir(&self, remote: &Path, local: &Path) -> Result<u64> { self.download_dir(remote, local) }
-    fn upload_dir(&self, local: &Path, remote: &Path) -> Result<u64> { self.upload_dir(local, remote) }
-    fn home_dir(&self) -> PathBuf { self.home_dir() }
-    fn display_label(&self) -> String { self.display_label() }
+    fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> {
+        self.read_dir(path)
+    }
+    fn mkdir(&self, path: &Path) -> Result<()> {
+        self.mkdir(path)
+    }
+    fn remove_recursive(&self, path: &Path) -> Result<()> {
+        self.remove_recursive(path)
+    }
+    fn rename(&self, src: &Path, dst: &Path) -> Result<()> {
+        self.rename(src, dst)
+    }
+    fn download(&self, remote: &Path, local: &Path) -> Result<u64> {
+        self.download(remote, local)
+    }
+    fn upload(&self, local: &Path, remote: &Path) -> Result<u64> {
+        self.upload(local, remote)
+    }
+    fn home_dir(&self) -> PathBuf {
+        self.home_dir()
+    }
+    fn display_label(&self) -> String {
+        self.display_label()
+    }
 }
 
 /// Quote a string for sftp batch commands (wrap in double quotes, escape inner quotes).

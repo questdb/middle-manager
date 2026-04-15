@@ -126,7 +126,11 @@ impl SmbConnection {
     pub fn rename(&self, src: &Path, dst: &Path) -> Result<()> {
         let src_smb = to_smb_path(src);
         let dst_smb = to_smb_path(dst);
-        self.run_cmd(&format!("rename {} {}", smb_quote(&src_smb), smb_quote(&dst_smb)))?;
+        self.run_cmd(&format!(
+            "rename {} {}",
+            smb_quote(&src_smb),
+            smb_quote(&dst_smb)
+        ))?;
         Ok(())
     }
 
@@ -148,41 +152,6 @@ impl SmbConnection {
         Ok(meta.len())
     }
 
-    /// Download a directory recursively.
-    pub fn download_dir(&self, remote: &Path, local: &Path) -> Result<u64> {
-        std::fs::create_dir_all(local)?;
-        let entries = self.read_dir(remote)?;
-        let mut total = 0u64;
-        for entry in entries {
-            if entry.name == ".." {
-                continue;
-            }
-            let local_dest = local.join(&entry.name);
-            if entry.is_dir {
-                total += self.download_dir(&entry.path, &local_dest)?;
-            } else {
-                total += self.download(&entry.path, &local_dest)?;
-            }
-        }
-        Ok(total)
-    }
-
-    /// Upload a directory recursively.
-    pub fn upload_dir(&self, local: &Path, remote: &Path) -> Result<u64> {
-        let _ = self.mkdir(remote); // ignore if exists
-        let mut total = 0u64;
-        for entry in std::fs::read_dir(local)? {
-            let entry = entry?;
-            let remote_dest = remote.join(entry.file_name());
-            if entry.file_type()?.is_dir() {
-                total += self.upload_dir(&entry.path(), &remote_dest)?;
-            } else {
-                total += self.upload(&entry.path(), &remote_dest)?;
-            }
-        }
-        Ok(total)
-    }
-
     /// Home directory (share root).
     pub fn home_dir(&self) -> PathBuf {
         PathBuf::from("\\")
@@ -190,16 +159,30 @@ impl SmbConnection {
 }
 
 impl crate::remote_fs::RemoteFs for SmbConnection {
-    fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> { self.read_dir(path) }
-    fn mkdir(&self, path: &Path) -> Result<()> { self.mkdir(path) }
-    fn remove_recursive(&self, path: &Path) -> Result<()> { self.remove_recursive(path) }
-    fn rename(&self, src: &Path, dst: &Path) -> Result<()> { self.rename(src, dst) }
-    fn download(&self, remote: &Path, local: &Path) -> Result<u64> { self.download(remote, local) }
-    fn upload(&self, local: &Path, remote: &Path) -> Result<u64> { self.upload(local, remote) }
-    fn download_dir(&self, remote: &Path, local: &Path) -> Result<u64> { self.download_dir(remote, local) }
-    fn upload_dir(&self, local: &Path, remote: &Path) -> Result<u64> { self.upload_dir(local, remote) }
-    fn home_dir(&self) -> PathBuf { self.home_dir() }
-    fn display_label(&self) -> String { self.display_label() }
+    fn read_dir(&self, path: &Path) -> Result<Vec<FileEntry>> {
+        self.read_dir(path)
+    }
+    fn mkdir(&self, path: &Path) -> Result<()> {
+        self.mkdir(path)
+    }
+    fn remove_recursive(&self, path: &Path) -> Result<()> {
+        self.remove_recursive(path)
+    }
+    fn rename(&self, src: &Path, dst: &Path) -> Result<()> {
+        self.rename(src, dst)
+    }
+    fn download(&self, remote: &Path, local: &Path) -> Result<u64> {
+        self.download(remote, local)
+    }
+    fn upload(&self, local: &Path, remote: &Path) -> Result<u64> {
+        self.upload(local, remote)
+    }
+    fn home_dir(&self) -> PathBuf {
+        self.home_dir()
+    }
+    fn display_label(&self) -> String {
+        self.display_label()
+    }
 }
 
 /// Convert a PathBuf (forward slashes) to SMB path (backslashes), escaped for smbclient commands.
@@ -453,10 +436,7 @@ mod tests {
     #[test]
     fn to_smb_path_all_special_chars() {
         // Combine backslash, quote, and semicolon
-        assert_eq!(
-            to_smb_path(Path::new("/x\\y\"z;w")),
-            "\\x\\\\y\\\"z\\;w"
-        );
+        assert_eq!(to_smb_path(Path::new("/x\\y\"z;w")), "\\x\\\\y\\\"z\\;w");
     }
 
     #[test]
