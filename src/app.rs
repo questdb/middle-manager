@@ -1920,9 +1920,31 @@ impl App {
             };
         }
 
+        // Settings dialog intercepts keys when open
+        if self.settings_open.is_some() {
+            return match key.code {
+                KeyCode::F(1) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Action::ToggleSettings
+                }
+                KeyCode::Esc => Action::DialogCancel,
+                KeyCode::Up => Action::MoveUp,
+                KeyCode::Down => Action::MoveDown,
+                KeyCode::Left => Action::CursorLeft,
+                KeyCode::Right => Action::CursorRight,
+                KeyCode::Char(' ') => Action::Toggle,
+                KeyCode::Enter => Action::Enter,
+                _ => Action::None,
+            };
+        }
+
         // Bottom panel focus intercepts only in normal/quick-search modes
         // (full-screen modes like DiffViewing/Editing map their own keys via AppMode match below)
         if matches!(self.mode, AppMode::Normal | AppMode::QuickSearch) {
+            // Shift+F1 opens settings from any panel
+            if key.code == KeyCode::F(1) && key.modifiers.contains(KeyModifiers::SHIFT) {
+                return Action::ToggleSettings;
+            }
+
             // Claude panel intercepts keys when focused
             if let PanelFocus::Claude(side) = self.focus {
                 // Ctrl+C copies selection if any, otherwise sends SIGINT
@@ -2091,20 +2113,6 @@ impl App {
                     _ => Action::None,
                 };
             }
-        }
-
-        // Settings dialog intercepts keys when open
-        if self.settings_open.is_some() {
-            return match key.code {
-                KeyCode::Esc => Action::DialogCancel,
-                KeyCode::Up => Action::MoveUp,
-                KeyCode::Down => Action::MoveDown,
-                KeyCode::Left => Action::CursorLeft,
-                KeyCode::Right => Action::CursorRight,
-                KeyCode::Char(' ') => Action::Toggle,
-                KeyCode::Enter => Action::Enter,
-                _ => Action::None,
-            };
         }
 
         // Session dialog intercepts keys when open
@@ -2789,6 +2797,7 @@ impl App {
             KeyCode::PageDown => Action::PageDown,
             KeyCode::Tab => Action::Toggle,
             KeyCode::F(2) => Action::EditorSave,
+            KeyCode::F(1) if shift => Action::ToggleSettings,
             KeyCode::F(7) if shift => Action::FindNext,
             KeyCode::F(7) => Action::SearchPrompt,
             KeyCode::F(10) => Action::Quit,
@@ -2833,6 +2842,7 @@ impl App {
             KeyCode::Char('N') => Action::WordLeft,
             KeyCode::Char('g') => Action::GotoLinePrompt,
             KeyCode::Tab => Action::SwitchPanel,
+            KeyCode::F(1) if shift => Action::ToggleSettings,
             KeyCode::F(4) => Action::EditBuiltin,
             KeyCode::Char('q') | KeyCode::Esc => Action::DialogCancel,
             _ => Action::None,
@@ -3471,6 +3481,16 @@ impl App {
             return;
         }
 
+        // ToggleSettings works from any panel/mode
+        if matches!(action, Action::ToggleSettings) {
+            if self.settings_open.is_some() {
+                self.settings_open = None;
+            } else {
+                self.settings_open = Some(0);
+            }
+            return;
+        }
+
         // Bottom panel focus intercepts only apply in normal/quick-search modes
         // (full-screen modes like DiffViewing/Editing handle their own keys)
         if matches!(self.mode, AppMode::Normal | AppMode::QuickSearch) {
@@ -3876,13 +3896,7 @@ impl App {
                 });
             }
 
-            Action::ToggleSettings => {
-                if self.settings_open.is_some() {
-                    self.settings_open = None;
-                } else {
-                    self.settings_open = Some(0);
-                }
-            }
+            Action::ToggleSettings => {} // handled early, before bottom-panel dispatch
 
             // CI failure extraction (only works when CI panel is focused, handled above)
             Action::ExtractCiFailures => {}
@@ -5658,16 +5672,33 @@ impl App {
         let panel = &self.panels[self.active_panel];
 
         // Gather entries to calculate: multi-selection or cursor item
-        let entries: Vec<(PathBuf, bool, u64)> = if !panel.selected_indices.is_empty() {
+        // Each tuple: (key_path, scan_path, is_dir, size)
+        // key_path is used for dir_sizes lookup; scan_path is the directory to scan.
+        // They differ only for ".." where we scan current_dir but key by entry.path.
+        let entries: Vec<(PathBuf, PathBuf, bool, u64)> = if !panel.selected_indices.is_empty() {
             panel
                 .selected_indices
                 .iter()
                 .filter_map(|&i| panel.entries.get(i))
                 .filter(|e| e.name != "..")
-                .map(|e| (e.path.clone(), e.is_dir, e.size))
+                .map(|e| (e.path.clone(), e.path.clone(), e.is_dir, e.size))
                 .collect()
         } else if let Some(entry) = panel.selected_entry() {
-            vec![(entry.path.clone(), entry.is_dir, entry.size)]
+            if entry.name == ".." {
+                vec![(
+                    entry.path.clone(),
+                    panel.current_dir.clone(),
+                    true,
+                    entry.size,
+                )]
+            } else {
+                vec![(
+                    entry.path.clone(),
+                    entry.path.clone(),
+                    entry.is_dir,
+                    entry.size,
+                )]
+            }
         } else {
             return;
         };
@@ -5677,16 +5708,16 @@ impl App {
         let mut dir_count = 0usize;
         let mut file_count = 0usize;
 
-        for (path, is_dir, size) in &entries {
+        for (key, scan_path, is_dir, size) in &entries {
             if *is_dir {
                 // Cancel and remove existing calculation (allows re-scan on repeated F3)
                 if let Some(crate::panel::DirSizeState::Calculating { cancelled, .. }) =
-                    panel.dir_sizes.get(path)
+                    panel.dir_sizes.get(key)
                 {
                     cancelled.store(true, std::sync::atomic::Ordering::Release);
                 }
-                panel.dir_sizes.remove(path);
-                panel.start_size_calc(path.clone());
+                panel.dir_sizes.remove(key);
+                panel.start_size_calc_at(key.clone(), scan_path.clone());
                 dir_count += 1;
             } else {
                 file_total += size;
@@ -5706,8 +5737,8 @@ impl App {
             // Track pending total for when all dir scans finish
             let dir_paths: Vec<PathBuf> = entries
                 .iter()
-                .filter(|(_, is_dir, _)| *is_dir)
-                .map(|(p, _, _)| p.clone())
+                .filter(|(_, _, is_dir, _)| *is_dir)
+                .map(|(key, _, _, _)| key.clone())
                 .collect();
             panel.pending_size_total = Some((dir_paths, file_total, file_count, dir_count));
         }
