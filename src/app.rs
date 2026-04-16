@@ -149,6 +149,8 @@ pub struct App {
     pub stashed_diff: Option<StashedDiff>,
     /// Focus to restore when closing editor (tracks where we came from).
     pub pre_editor_focus: Option<PanelFocus>,
+    /// Azure DevOps authentication dialog.
+    pub azure_auth_dialog: Option<AzureAuthDialogState>,
 }
 
 /// Result of a background remote connection attempt.
@@ -489,6 +491,206 @@ pub enum DialogKind {
     ConfirmDelete,
     InputRename,
     InputCreateFile,
+}
+
+// --- Azure DevOps auth dialog ---
+
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum AzureAuthMode {
+    Pat,
+    Browser,
+    AzCli,
+}
+
+impl AzureAuthMode {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Pat => Self::Browser,
+            Self::Browser => Self::AzCli,
+            Self::AzCli => Self::Pat,
+        }
+    }
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Pat => Self::AzCli,
+            Self::Browser => Self::Pat,
+            Self::AzCli => Self::Browser,
+        }
+    }
+    pub fn has_input(self) -> bool {
+        matches!(self, Self::Pat | Self::Browser)
+    }
+}
+
+/// Cached state of the `az` CLI for the auth dialog. Avoids re-running
+/// `az account show` on every render (it's slow — ~100-300ms per call).
+#[derive(Clone, Debug)]
+pub enum AzCliStatus {
+    /// Haven't checked yet.
+    Unknown,
+    /// Check in progress in a background thread.
+    Checking,
+    /// `az` found and logged in.
+    LoggedIn { user: String, tenant: String },
+    /// `az` found but `az account show` failed.
+    NotLoggedIn,
+    /// `az` binary not in PATH.
+    NotInstalled,
+}
+
+pub struct AzureAuthDialogState {
+    pub mode: AzureAuthMode,
+    pub pat_input: TextInput,
+    pub tenant_input: TextInput,
+    /// Focus zones (dynamic — see max_focus):
+    ///   0 = mode tab bar
+    ///   1 = input field (Pat/Browser only)
+    ///   next = OK/Login button (when not in active flow)
+    ///   last = Cancel button
+    pub field_focus: usize,
+    pub browser_flow: Option<crate::azure_auth::BrowserAuthFlow>,
+    /// True while an az CLI token fetch is in progress (no input, only Cancel).
+    pub az_fetching: bool,
+    /// Animated spinner tick for the in-flight az CLI fetch message.
+    pub az_fetch_tick: usize,
+    pub error: Option<String>,
+    /// Cached az CLI status. Populated asynchronously when entering az CLI tab.
+    pub az_status: AzCliStatus,
+    /// Receiver for the in-flight az status check. Dropping this cancels the
+    /// effect of a stale thread (its send() fails silently).
+    az_status_rx: Option<std::sync::mpsc::Receiver<AzCliStatus>>,
+    /// Receiver for the in-flight `az account get-access-token` call. Dropping
+    /// it tells the worker its result will be discarded.
+    az_token_rx:
+        Option<std::sync::mpsc::Receiver<Result<crate::azure_auth::TokenResponse, String>>>,
+}
+
+impl AzureAuthDialogState {
+    pub fn new() -> Self {
+        let tenant = std::env::var("AZURE_DEVOPS_TENANT")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .or_else(crate::azure_auth::get_stored_tenant)
+            .unwrap_or_default();
+        Self {
+            mode: AzureAuthMode::Pat,
+            pat_input: TextInput::new(String::new()),
+            tenant_input: TextInput::new(tenant),
+            field_focus: 0,
+            browser_flow: None,
+            az_fetching: false,
+            az_fetch_tick: 0,
+            error: None,
+            az_status: AzCliStatus::Unknown,
+            az_status_rx: None,
+            az_token_rx: None,
+        }
+    }
+
+    /// Kick off a background `az account get-access-token` call. Cancels any
+    /// in-flight fetch (by replacing the receiver).
+    pub fn start_az_token_fetch(&mut self) {
+        self.az_fetching = true;
+        self.az_fetch_tick = 0;
+        self.error = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.az_token_rx = Some(rx); // drops any previous receiver
+        std::thread::spawn(move || {
+            let result = crate::azure_auth::get_token_via_az_cli();
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Poll the in-flight az token fetch. Returns Some(result) when done.
+    pub fn poll_az_token(&mut self) -> Option<Result<crate::azure_auth::TokenResponse, String>> {
+        let done = self.az_token_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+        if done.is_some() {
+            self.az_fetching = false;
+            self.az_token_rx = None;
+        }
+        done
+    }
+
+    /// Human-readable status text for the in-flight az fetch, with spinner.
+    pub fn az_fetch_status(&self) -> String {
+        let c = crate::azure_auth::SPINNER[self.az_fetch_tick % crate::azure_auth::SPINNER.len()];
+        format!("{} Fetching token from az CLI...", c)
+    }
+
+    /// Kick off a background check of `az` CLI status. Cancels any in-flight
+    /// check (by replacing the receiver).
+    pub fn start_az_status_check(&mut self) {
+        self.az_status = AzCliStatus::Checking;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.az_status_rx = Some(rx); // drops any previous receiver
+        std::thread::spawn(move || {
+            let status = if !crate::azure_auth::az_cli_available() {
+                AzCliStatus::NotInstalled
+            } else if let Some((user, tenant)) = crate::azure_auth::az_cli_account() {
+                AzCliStatus::LoggedIn { user, tenant }
+            } else {
+                AzCliStatus::NotLoggedIn
+            };
+            // Send may fail silently if the receiver was dropped — that's fine.
+            let _ = tx.send(status);
+        });
+    }
+
+    /// Poll the in-flight az status check.
+    pub fn poll_az_status(&mut self) {
+        let done = self.az_status_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+        if let Some(status) = done {
+            self.az_status = status;
+            self.az_status_rx = None;
+        }
+    }
+
+    /// True when an async flow is running (Login/Cancel-only UI).
+    fn in_flight(&self) -> bool {
+        self.browser_flow.is_some() || self.az_fetching
+    }
+
+    /// Total number of focus zones.
+    /// Layout: [bar, (input?), (ok?), cancel]
+    pub fn max_focus(&self) -> usize {
+        let mut n = 1; // bar
+        if self.mode.has_input() && !self.in_flight() {
+            n += 1; // input
+        }
+        if !self.in_flight() {
+            n += 1; // OK/Login
+        }
+        n += 1; // Cancel
+        n
+    }
+
+    pub fn on_bar(&self) -> bool {
+        self.field_focus == 0
+    }
+
+    pub fn on_input(&self) -> bool {
+        self.mode.has_input() && !self.in_flight() && self.field_focus == 1
+    }
+
+    pub fn on_ok(&self) -> bool {
+        if self.in_flight() {
+            return false;
+        }
+        let ok_zone = if self.mode.has_input() { 2 } else { 1 };
+        self.field_focus == ok_zone
+    }
+
+    pub fn on_cancel(&self) -> bool {
+        self.field_focus == self.max_focus().saturating_sub(1)
+    }
+
+    pub fn active_input_mut(&mut self) -> &mut TextInput {
+        match self.mode {
+            AzureAuthMode::Pat => &mut self.pat_input,
+            // Browser uses tenant, AzCli has no input but return something valid.
+            AzureAuthMode::Browser | AzureAuthMode::AzCli => &mut self.tenant_input,
+        }
+    }
 }
 
 // --- Make folder dialog ---
@@ -1597,6 +1799,7 @@ impl App {
             pending_remote: None,
             stashed_diff: None,
             pre_editor_focus: None,
+            azure_auth_dialog: None,
         }
     }
 
@@ -1964,6 +2167,11 @@ impl App {
     }
 
     pub fn map_key_to_action(&self, key: KeyEvent) -> Action {
+        // Azure auth dialog intercepts keys when active (must be before panel focus intercepts)
+        if let Some(ref state) = self.azure_auth_dialog {
+            return Self::map_azure_auth_key(key, state);
+        }
+
         // Help dialog intercepts keys
         if self.help_state.is_some() {
             return match key.code {
@@ -2360,6 +2568,7 @@ impl App {
                     KeyCode::Right => Action::CursorRight,
                     KeyCode::Left => Action::GoUp,
                     KeyCode::Char('o') => Action::OpenPr,
+                    KeyCode::Char('a') => Action::OpenAzureAuth,
                     KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         Action::ExtractCiFailures
                     }
@@ -2747,6 +2956,69 @@ impl App {
             KeyCode::Right if focused == DialogField::Input => Action::CursorRight,
             KeyCode::Home if focused == DialogField::Input => Action::CursorLineStart,
             KeyCode::End if focused == DialogField::Input => Action::CursorLineEnd,
+            _ => Action::None,
+        }
+    }
+
+    fn map_azure_auth_key(key: KeyEvent, state: &AzureAuthDialogState) -> Action {
+        let on_bar = state.on_bar();
+        let on_input = state.on_input();
+        match key.code {
+            KeyCode::Esc => Action::DialogCancel,
+            KeyCode::Enter => Action::DialogConfirm,
+            // Tab / Shift+Tab: cycle focus zones
+            KeyCode::Tab => Action::Toggle,
+            KeyCode::BackTab => Action::ToggleReverse,
+            // On bar: Left/Right switch mode
+            KeyCode::Left if on_bar => Action::SwitchPanelReverse,
+            KeyCode::Right if on_bar => Action::SwitchPanel,
+            // Alt+Left/Right always switches mode
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                Action::SwitchPanelReverse
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => Action::SwitchPanel,
+            // Up/Down: cycle focus zones (mirror Tab for convenience)
+            KeyCode::Up => Action::ToggleReverse,
+            KeyCode::Down => Action::Toggle,
+            // Text editing: undo/redo, cut, select-all, copy
+            KeyCode::Char('z')
+                if on_input
+                    && key.modifiers.contains(KeyModifiers::CONTROL)
+                    && key.modifiers.contains(KeyModifiers::SHIFT) =>
+            {
+                Action::EditorRedo
+            }
+            KeyCode::Char('z') if on_input && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::EditorUndo
+            }
+            KeyCode::Char('x') if on_input && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::EditorDeleteLine
+            }
+            KeyCode::Char('a') if on_input && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::SelectAll
+            }
+            KeyCode::Char('c') if on_input && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::CopySelection
+            }
+            KeyCode::Char(c) if on_input => Action::DialogInput(c),
+            KeyCode::Backspace if on_input => Action::DialogBackspace,
+            KeyCode::Delete if on_input => Action::EditorDeleteForward,
+            KeyCode::Left if on_input && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Action::SelectLeft
+            }
+            KeyCode::Right if on_input && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Action::SelectRight
+            }
+            KeyCode::Home if on_input && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Action::SelectLineStart
+            }
+            KeyCode::End if on_input && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                Action::SelectLineEnd
+            }
+            KeyCode::Left if on_input => Action::CursorLeft,
+            KeyCode::Right if on_input => Action::CursorRight,
+            KeyCode::Home if on_input => Action::CursorLineStart,
+            KeyCode::End if on_input => Action::CursorLineEnd,
             _ => Action::None,
         }
     }
@@ -3294,7 +3566,19 @@ impl App {
         // Poll CI panels for async results, downloads, and failure extraction
         for (side, ci) in self.ci_panels.iter_mut().enumerate() {
             let Some(ci) = ci else { continue };
-            ci.poll();
+            if let Some(err) = ci.poll() {
+                // Auto-open auth dialog only when no credentials are present.
+                // If credentials exist but are rejected ("authentication failed"),
+                // surface the error in the status bar — reopening the dialog would
+                // just loop with the same bad token.
+                let needs_auth =
+                    err.contains("authentication required") && self.azure_auth_dialog.is_none();
+                if needs_auth {
+                    self.azure_auth_dialog = Some(AzureAuthDialogState::new());
+                } else {
+                    self.status_message = Some(err);
+                }
+            }
             if let Some(result) = ci.poll_download() {
                 match result {
                     Ok(path) => {
@@ -3377,6 +3661,74 @@ impl App {
                 }
             }
         }
+        // Poll Azure auth background checks (az CLI status + browser flow).
+        if let Some(ref mut auth) = self.azure_auth_dialog {
+            auth.poll_az_status();
+        }
+        if let Some(ref mut auth) = self.azure_auth_dialog {
+            if let Some(ref mut flow) = auth.browser_flow {
+                if let Some(result) = flow.poll() {
+                    match result {
+                        crate::azure_auth::AuthResult::Success(token) => {
+                            if let Err(e) =
+                                crate::azure_auth::store_bearer_token(&token.access_token)
+                            {
+                                auth.browser_flow = None;
+                                // Zones expand when browser_flow transitions to None;
+                                // re-anchor focus to Cancel so it doesn't silently
+                                // land on the input field.
+                                auth.field_focus = auth.max_focus().saturating_sub(1);
+                                auth.error =
+                                    Some(format!("Token obtained but failed to store: {}", e));
+                            } else {
+                                if let Some(ref rt) = token.refresh_token {
+                                    let _ = crate::azure_auth::store_refresh_token(rt);
+                                }
+                                self.status_message =
+                                    Some("Azure DevOps authenticated successfully".to_string());
+                                self.azure_auth_dialog = None;
+                                self.retry_ci_auth_expansions();
+                            }
+                        }
+                        crate::azure_auth::AuthResult::Error(e) => {
+                            auth.browser_flow = None;
+                            auth.field_focus = auth.max_focus().saturating_sub(1);
+                            auth.error = Some(e);
+                        }
+                    }
+                }
+            }
+        }
+        // Poll the async az CLI token fetch, if one is in flight.
+        if let Some(ref mut auth) = self.azure_auth_dialog {
+            if auth.az_fetching {
+                auth.az_fetch_tick = auth.az_fetch_tick.wrapping_add(1);
+                if let Some(result) = auth.poll_az_token() {
+                    // Zones expand when az_fetching flips to false; re-anchor
+                    // focus to Cancel before (possibly) closing the dialog so
+                    // it's never left on a stale index.
+                    auth.field_focus = auth.max_focus().saturating_sub(1);
+                    match result {
+                        Ok(token) => {
+                            if let Err(e) =
+                                crate::azure_auth::store_bearer_token(&token.access_token)
+                            {
+                                auth.error = Some(format!("Got token but failed to store: {}", e));
+                            } else {
+                                self.status_message =
+                                    Some("Azure DevOps authenticated via az CLI".to_string());
+                                self.azure_auth_dialog = None;
+                                self.retry_ci_auth_expansions();
+                            }
+                        }
+                        Err(e) => {
+                            auth.error = Some(e);
+                        }
+                    }
+                }
+            }
+        }
+
         // Poll diff panels
         for diff in self.diff_panels.iter_mut().flatten() {
             diff.poll();
@@ -3835,6 +4187,12 @@ impl App {
             return;
         }
 
+        // Azure DevOps auth dialog intercepts when active
+        if self.azure_auth_dialog.is_some() {
+            self.handle_azure_auth_action(action);
+            return;
+        }
+
         // Search wrap confirmation dialog intercepts when active
         if self.search_wrap_dialog.is_some() {
             self.handle_search_wrap_dialog_action(action);
@@ -3853,6 +4211,14 @@ impl App {
                 self.settings_open = None;
             } else {
                 self.settings_open = Some(0);
+            }
+            return;
+        }
+
+        // OpenAzureAuth works from any panel/mode (opens the auth dialog).
+        if matches!(action, Action::OpenAzureAuth) {
+            if self.azure_auth_dialog.is_none() {
+                self.azure_auth_dialog = Some(AzureAuthDialogState::new());
             }
             return;
         }
@@ -4474,7 +4840,10 @@ impl App {
             Action::DialogCancel => self.handle_dialog_cancel(),
             Action::DialogBackspace => self.handle_dialog_backspace(),
             Action::DialogConfirm | Action::DialogInput(_) => {}
-            Action::TerminalInput(_) | Action::TerminalOpenFile | Action::ToggleReverse => {} // handled by intercepts above
+            Action::TerminalInput(_)
+            | Action::TerminalOpenFile
+            | Action::ToggleReverse
+            | Action::OpenAzureAuth => {} // handled by intercepts above
         }
     }
 
@@ -8128,8 +8497,17 @@ impl App {
         if has_github && !crate::ci::check_gh_auth() {
             warnings.push("GitHub: `gh auth login` required for log access.");
         }
-        if has_azure && !crate::ci::has_azure_pat() {
-            warnings.push("Azure DevOps: PAT required. Set AZURE_DEVOPS_PAT\nor store via: secret-tool store --label 'mm azure'\n  service middle-manager account azure-pat");
+        if has_azure
+            && !crate::ci::has_azure_pat()
+            && crate::azure_auth::get_bearer_token().is_none()
+        {
+            // Open auth dialog instead of static popup
+            self.azure_auth_dialog = Some(AzureAuthDialogState::new());
+            if !warnings.is_empty() {
+                // Also show GitHub warning if applicable
+                self.status_message = Some(warnings.join(" | "));
+            }
+            return;
         }
 
         if !warnings.is_empty() {
@@ -8215,6 +8593,170 @@ impl App {
             }
         } else {
             self.status_message = Some("Cannot download logs: no run ID found".to_string());
+        }
+    }
+
+    // --- Azure DevOps auth dialog handler ---
+
+    fn handle_azure_auth_action(&mut self, action: Action) {
+        match action {
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
+            Action::DialogCancel => {
+                self.azure_auth_dialog = None;
+            }
+            Action::DialogConfirm => {
+                // If focused on Cancel, close. Otherwise submit based on mode.
+                let on_cancel = self
+                    .azure_auth_dialog
+                    .as_ref()
+                    .is_some_and(|s| s.on_cancel());
+                if on_cancel {
+                    self.azure_auth_dialog = None;
+                    return;
+                }
+                self.submit_azure_auth();
+            }
+            // Tab / Shift+Tab and Up/Down cycle focus zones
+            Action::Toggle => {
+                if let Some(ref mut s) = self.azure_auth_dialog {
+                    s.pat_input.clear_selection();
+                    s.tenant_input.clear_selection();
+                    let max = s.max_focus();
+                    s.field_focus = (s.field_focus + 1) % max;
+                }
+            }
+            Action::ToggleReverse => {
+                if let Some(ref mut s) = self.azure_auth_dialog {
+                    s.pat_input.clear_selection();
+                    s.tenant_input.clear_selection();
+                    let max = s.max_focus();
+                    s.field_focus = (s.field_focus + max - 1) % max;
+                }
+            }
+            // Left/Right on tab bar, or Alt+Left/Right anywhere: switch mode
+            Action::SwitchPanel => {
+                if let Some(ref mut s) = self.azure_auth_dialog {
+                    s.pat_input.clear_selection();
+                    s.tenant_input.clear_selection();
+                    s.mode = s.mode.next();
+                    s.field_focus = 0;
+                    s.error = None;
+                    if s.mode == AzureAuthMode::AzCli {
+                        s.start_az_status_check();
+                    }
+                }
+            }
+            Action::SwitchPanelReverse => {
+                if let Some(ref mut s) = self.azure_auth_dialog {
+                    s.pat_input.clear_selection();
+                    s.tenant_input.clear_selection();
+                    s.mode = s.mode.prev();
+                    s.field_focus = 0;
+                    s.error = None;
+                    if s.mode == AzureAuthMode::AzCli {
+                        s.start_az_status_check();
+                    }
+                }
+            }
+            _ => {
+                if let Some(ref mut s) = self.azure_auth_dialog {
+                    s.active_input_mut().handle_action(&action);
+                }
+            }
+        }
+    }
+
+    /// After an auth success, restart any CI step expansions that failed due
+    /// to missing/invalid credentials.
+    fn retry_ci_auth_expansions(&mut self) {
+        let mut retried = 0usize;
+        for ci in self.ci_panels.iter_mut().flatten() {
+            if ci.retry_pending_auth() {
+                retried += 1;
+            }
+        }
+        if retried > 0 {
+            self.status_message = Some(format!("Retrying {} CI expansion(s)...", retried));
+        }
+    }
+
+    fn submit_azure_auth(&mut self) {
+        let Some(ref state) = self.azure_auth_dialog else {
+            return;
+        };
+        match state.mode {
+            AzureAuthMode::Pat => {
+                let pat = state.pat_input.text.trim().to_string();
+                if pat.is_empty() {
+                    return;
+                }
+                match crate::ci::store_azure_pat(&pat) {
+                    Ok(()) => {
+                        self.status_message =
+                            Some("Azure DevOps PAT stored successfully".to_string());
+                        self.azure_auth_dialog = None;
+                        self.retry_ci_auth_expansions();
+                    }
+                    Err(e) => {
+                        if let Some(ref mut s) = self.azure_auth_dialog {
+                            s.error = Some(format!("Failed to store: {}", e));
+                        }
+                    }
+                }
+            }
+            AzureAuthMode::Browser => {
+                if state.browser_flow.is_some() {
+                    return;
+                }
+                let tenant = state.tenant_input.text.trim().to_string();
+                if tenant.is_empty() {
+                    if let Some(ref mut s) = self.azure_auth_dialog {
+                        s.error = Some("Tenant is required (e.g. mycompany.com)".to_string());
+                        s.field_focus = 1;
+                    }
+                    return;
+                }
+                match crate::azure_auth::BrowserAuthFlow::start(&tenant) {
+                    Ok(flow) => {
+                        let _ = crate::azure_auth::store_tenant(&tenant);
+                        if let Some(ref mut s) = self.azure_auth_dialog {
+                            s.browser_flow = Some(flow);
+                            s.error = None;
+                            // After starting the flow, only Cancel remains.
+                            s.field_focus = s.max_focus().saturating_sub(1);
+                        }
+                    }
+                    Err(e) => {
+                        if let Some(ref mut s) = self.azure_auth_dialog {
+                            s.error = Some(e);
+                        }
+                    }
+                }
+            }
+            AzureAuthMode::AzCli => {
+                if state.az_fetching {
+                    return;
+                }
+                if !crate::azure_auth::az_cli_available() {
+                    if let Some(ref mut s) = self.azure_auth_dialog {
+                        s.error = Some(
+                            "az CLI not found in PATH. Install from aka.ms/InstallAzureCli."
+                                .to_string(),
+                        );
+                    }
+                    return;
+                }
+                // Run on a background thread so the UI thread stays responsive
+                // (`az account get-access-token` is ~1s on a warm cache, longer
+                // on a cold one). The tick loop polls `az_token_rx` and closes
+                // the dialog on success.
+                if let Some(ref mut s) = self.azure_auth_dialog {
+                    s.start_az_token_fetch();
+                    // While fetching, only bar + Cancel are reachable; land
+                    // focus on Cancel so Enter cancels.
+                    s.field_focus = s.max_focus().saturating_sub(1);
+                }
+            }
         }
     }
 
@@ -9994,5 +10536,211 @@ mod fuzzy_tests {
         // Move up wraps
         state.selected = (state.selected + len - 1) % len;
         assert_eq!(state.selected, 2); // wrapped backward
+    }
+}
+
+#[cfg(test)]
+mod azure_auth_dialog_tests {
+    use super::*;
+
+    // ── AzureAuthMode ───────────────────────────────────────────────
+
+    #[test]
+    fn mode_next_cycles_pat_browser_azcli() {
+        assert_eq!(AzureAuthMode::Pat.next(), AzureAuthMode::Browser);
+        assert_eq!(AzureAuthMode::Browser.next(), AzureAuthMode::AzCli);
+        assert_eq!(AzureAuthMode::AzCli.next(), AzureAuthMode::Pat);
+    }
+
+    #[test]
+    fn mode_prev_is_inverse_of_next() {
+        for m in [
+            AzureAuthMode::Pat,
+            AzureAuthMode::Browser,
+            AzureAuthMode::AzCli,
+        ] {
+            assert_eq!(m.next().prev(), m);
+            assert_eq!(m.prev().next(), m);
+        }
+    }
+
+    #[test]
+    fn has_input_only_for_pat_and_browser() {
+        assert!(AzureAuthMode::Pat.has_input());
+        assert!(AzureAuthMode::Browser.has_input());
+        assert!(!AzureAuthMode::AzCli.has_input());
+    }
+
+    // ── AzureAuthDialogState: max_focus layout ─────────────────────
+    //
+    // Layout: [bar, (input?), (ok?), cancel]
+    //   - input zone only for Pat/Browser and only when not in flight
+    //   - ok zone only when not in flight
+    //   - cancel zone always present
+
+    #[test]
+    fn max_focus_pat_idle_has_four_zones() {
+        let s = AzureAuthDialogState::new();
+        // Default mode is Pat, no flow active.
+        assert_eq!(s.mode, AzureAuthMode::Pat);
+        assert_eq!(s.max_focus(), 4); // bar, input, ok, cancel
+    }
+
+    #[test]
+    fn max_focus_azcli_idle_has_three_zones() {
+        let mut s = AzureAuthDialogState::new();
+        s.mode = AzureAuthMode::AzCli;
+        // AzCli has no input field.
+        assert_eq!(s.max_focus(), 3); // bar, ok, cancel
+    }
+
+    #[test]
+    fn max_focus_azcli_in_flight_has_two_zones() {
+        let mut s = AzureAuthDialogState::new();
+        s.mode = AzureAuthMode::AzCli;
+        s.az_fetching = true;
+        // When fetching, no input and no OK — just bar + cancel.
+        assert_eq!(s.max_focus(), 2);
+    }
+
+    #[test]
+    fn max_focus_browser_idle_has_four_zones() {
+        let mut s = AzureAuthDialogState::new();
+        s.mode = AzureAuthMode::Browser;
+        assert_eq!(s.max_focus(), 4); // bar, input (tenant), login, cancel
+    }
+
+    // ── focus predicates partition the zone space ─────────────────
+
+    #[test]
+    fn focus_predicates_pat_mode() {
+        let mut s = AzureAuthDialogState::new();
+        s.mode = AzureAuthMode::Pat;
+
+        // zone 0 = bar
+        s.field_focus = 0;
+        assert!(s.on_bar());
+        assert!(!s.on_input());
+        assert!(!s.on_ok());
+        assert!(!s.on_cancel());
+
+        // zone 1 = input
+        s.field_focus = 1;
+        assert!(!s.on_bar());
+        assert!(s.on_input());
+        assert!(!s.on_ok());
+        assert!(!s.on_cancel());
+
+        // zone 2 = ok
+        s.field_focus = 2;
+        assert!(!s.on_bar());
+        assert!(!s.on_input());
+        assert!(s.on_ok());
+        assert!(!s.on_cancel());
+
+        // zone 3 = cancel
+        s.field_focus = 3;
+        assert!(!s.on_bar());
+        assert!(!s.on_input());
+        assert!(!s.on_ok());
+        assert!(s.on_cancel());
+    }
+
+    #[test]
+    fn focus_predicates_azcli_mode_skips_input_zone() {
+        let mut s = AzureAuthDialogState::new();
+        s.mode = AzureAuthMode::AzCli;
+
+        // zones: [bar(0), ok(1), cancel(2)]
+        s.field_focus = 0;
+        assert!(s.on_bar());
+        assert!(!s.on_input());
+
+        s.field_focus = 1;
+        assert!(!s.on_bar());
+        assert!(!s.on_input());
+        assert!(s.on_ok());
+        assert!(!s.on_cancel());
+
+        s.field_focus = 2;
+        assert!(s.on_cancel());
+    }
+
+    #[test]
+    fn focus_predicates_in_flight_only_bar_and_cancel() {
+        let mut s = AzureAuthDialogState::new();
+        s.mode = AzureAuthMode::Browser;
+        // Simulate an active browser flow by setting az_fetching (same in_flight
+        // branch reachable without building a real TcpListener).
+        s.az_fetching = true;
+
+        // zones: [bar(0), cancel(1)]
+        assert_eq!(s.max_focus(), 2);
+
+        s.field_focus = 0;
+        assert!(s.on_bar());
+        assert!(!s.on_input());
+        assert!(!s.on_ok());
+        assert!(!s.on_cancel());
+
+        s.field_focus = 1;
+        assert!(!s.on_bar());
+        assert!(!s.on_input());
+        assert!(!s.on_ok());
+        assert!(s.on_cancel());
+    }
+
+    #[test]
+    fn exactly_one_predicate_true_per_zone_across_modes() {
+        // For every mode × idle/in-flight × zone, exactly one focus predicate
+        // should return true — otherwise the UI would highlight two zones at
+        // once or none at all.
+        for mode in [
+            AzureAuthMode::Pat,
+            AzureAuthMode::Browser,
+            AzureAuthMode::AzCli,
+        ] {
+            for in_flight in [false, true] {
+                let mut s = AzureAuthDialogState::new();
+                s.mode = mode;
+                s.az_fetching = in_flight;
+                let n = s.max_focus();
+                for zone in 0..n {
+                    s.field_focus = zone;
+                    let hits = [s.on_bar(), s.on_input(), s.on_ok(), s.on_cancel()]
+                        .iter()
+                        .filter(|b| **b)
+                        .count();
+                    assert_eq!(
+                        hits, 1,
+                        "mode={:?} in_flight={} zone={}/{} → hits={}",
+                        mode, in_flight, zone, n, hits
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn active_input_mut_returns_pat_or_tenant_by_mode() {
+        // `new()` may seed tenant_input from the environment; reset for a clean
+        // starting state so the test doesn't depend on the dev's shell.
+        let mut s = AzureAuthDialogState::new();
+        s.pat_input = crate::text_input::TextInput::new(String::new());
+        s.tenant_input = crate::text_input::TextInput::new(String::new());
+
+        s.mode = AzureAuthMode::Pat;
+        s.active_input_mut().text.push_str("pat-value");
+        assert_eq!(s.pat_input.text, "pat-value");
+        assert_eq!(s.tenant_input.text, "");
+
+        s.mode = AzureAuthMode::Browser;
+        s.active_input_mut().text.push_str("my.tenant");
+        assert_eq!(s.tenant_input.text, "my.tenant");
+        assert_eq!(s.pat_input.text, "pat-value");
+
+        // AzCli has no input; active_input_mut returns tenant as a safe default.
+        s.mode = AzureAuthMode::AzCli;
+        let _ = s.active_input_mut();
     }
 }

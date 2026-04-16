@@ -57,8 +57,32 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Enter", "Expand/collapse or download step log"),
             ("o", "Open check in browser"),
             ("Ctrl+E", "Extract all failures to file"),
+            ("a", "Open Azure DevOps auth dialog"),
             ("Alt+Up / Alt+Down", "Resize panel split"),
             ("Alt+Enter", "Maximize / restore panel"),
+        ],
+    ),
+    (
+        "Azure DevOps Auth",
+        &[
+            ("a (in CI panel)", "Open auth dialog (auto-opens if needed)"),
+            ("Tab / Shift+Tab", "Cycle tab bar / input / buttons"),
+            ("Left / Right (on bar)", "Switch PAT / Browser / az CLI"),
+            ("Alt+Left / Alt+Right", "Switch mode from any zone"),
+            ("Enter", "Submit (PAT: store, Browser: Login, az: Fetch)"),
+            ("Esc", "Close dialog"),
+            ("PAT mode", "Paste token; stored in system keychain"),
+            (
+                "Browser mode",
+                "Tenant prompted in dialog; OAuth2+PKCE login",
+            ),
+            ("az CLI mode", "Reuses `az login` session; no OAuth needed"),
+            ("AZURE_DEVOPS_PAT", "Env var for CI/headless PAT use"),
+            ("AZURE_DEVOPS_TENANT", "Preseeds the tenant input"),
+            (
+                "AZURE_DEVOPS_CLIENT_ID",
+                "Override Azure CLI public client ID",
+            ),
         ],
     ),
     (
@@ -254,6 +278,22 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
     ),
 ];
 
+/// Width (in chars) of the key column when rendering a help entry. Computed
+/// from the widest key string in `HELP_SECTIONS` so no row overflows. Padding
+/// is via `{:>KEY_COL_WIDTH$}`.
+fn key_col_width() -> usize {
+    use std::sync::OnceLock;
+    static W: OnceLock<usize> = OnceLock::new();
+    *W.get_or_init(|| {
+        HELP_SECTIONS
+            .iter()
+            .flat_map(|(_, entries)| entries.iter())
+            .map(|(k, _)| k.chars().count())
+            .max()
+            .unwrap_or(20)
+    })
+}
+
 /// Build unfiltered help lines (cached — only built once).
 fn help_lines() -> &'static Vec<Line<'static>> {
     use std::sync::OnceLock;
@@ -289,9 +329,10 @@ fn build_help_lines() -> Vec<Line<'static>> {
             Style::default().fg(t.dialog_border_fg).bg(t.dialog_bg),
         )));
 
+        let kw = key_col_width();
         for (key, desc) in *entries {
             lines.push(Line::from(vec![
-                Span::styled(format!("  {:>20}  ", key), key_style),
+                Span::styled(format!("  {:>kw$}  ", key, kw = kw), key_style),
                 Span::styled(desc.to_string(), desc_style),
             ]));
         }
@@ -348,8 +389,9 @@ fn build_filtered_lines(filter: &str) -> Vec<Line<'static>> {
             Style::default().fg(t.dialog_border_fg).bg(t.dialog_bg),
         )));
 
+        let kw = key_col_width();
         for (key, desc) in matching {
-            let key_fmt = format!("  {:>20}  ", key);
+            let key_fmt = format!("  {:>kw$}  ", key, kw = kw);
             let key_spans = highlight_spans(&key_fmt, &filter_lower, key_style, highlight_style);
             let desc_spans = highlight_spans(desc, &filter_lower, desc_style, highlight_style);
             let mut spans = key_spans;

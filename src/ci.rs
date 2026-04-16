@@ -108,7 +108,7 @@ pub enum CiView {
     Error(String),
 }
 
-const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+use crate::azure_auth::SPINNER;
 
 /// Active log download state.
 pub struct LogDownload {
@@ -118,17 +118,27 @@ pub struct LogDownload {
 }
 
 impl LogDownload {
-    /// Start an async download. Returns immediately.
+    /// Start an async download with optional Azure auth. Returns immediately.
     pub fn start(url: &str, output_path: PathBuf, step_name: String) -> Self {
         let (tx, rx) = std::sync::mpsc::channel();
         let url = url.to_string();
         let path = output_path.clone();
+        // Capture auth args on the calling thread (before spawning)
+        let auth = if url.contains("dev.azure.com") {
+            azure_auth_args()
+        } else {
+            vec![]
+        };
 
         std::thread::spawn(move || {
-            let result = Command::new("curl")
-                .args(["-s", "-L", "-o"])
-                .arg(&path)
-                .arg(&url)
+            let mut cmd = Command::new("curl");
+            cmd.args(["-s", "-L", "--compressed", "--max-time", "60", "-o"]);
+            cmd.arg(&path);
+            for arg in &auth {
+                cmd.arg(arg);
+            }
+            cmd.arg(&url);
+            let result = cmd
                 .stdout(Stdio::null())
                 .stderr(Stdio::null())
                 .status()
@@ -247,6 +257,9 @@ pub struct CiPanel {
     pending_steps: Option<PendingStepFetch>,
     /// Active failure extraction.
     pub failure_extraction: Option<FailureExtraction>,
+    /// The check that last failed with an Azure auth error — used to auto-retry
+    /// after the user completes authentication in the dialog.
+    pending_auth_retry: Option<CiCheck>,
 }
 
 impl CiPanel {
@@ -265,6 +278,7 @@ impl CiPanel {
                 download: None,
                 pending_steps: None,
                 failure_extraction: None,
+                pending_auth_retry: None,
             };
         }
 
@@ -289,13 +303,15 @@ impl CiPanel {
             download: None,
             pending_steps: None,
             failure_extraction: None,
+            pending_auth_retry: None,
         }
     }
 
     /// Poll for async results. Call on each tick.
-    pub fn poll(&mut self) {
+    /// Returns an error message if step expansion failed (for status bar display).
+    pub fn poll(&mut self) -> Option<String> {
         self.spinner_tick = self.spinner_tick.wrapping_add(1);
-        self.poll_steps();
+        let step_err = self.poll_steps();
 
         if let Some(ref rx) = self.pending_checks {
             if let Ok(result) = rx.try_recv() {
@@ -330,10 +346,12 @@ impl CiPanel {
                 self.view = CiView::Loading(format!("{} Fetching checks...", c));
             }
         }
+        step_err
     }
 
     /// Poll for async step fetch results.
-    fn poll_steps(&mut self) {
+    /// Returns an error message if expansion failed.
+    fn poll_steps(&mut self) -> Option<String> {
         if let Some((item_idx, check_idx, ref check, ref rx)) = self.pending_steps {
             if let Ok(result) = rx.try_recv() {
                 let check = check.clone();
@@ -354,14 +372,25 @@ impl CiPanel {
                             for (i, item) in step_items.into_iter().enumerate() {
                                 items.insert(item_idx + 1 + i, item);
                             }
+                            return None;
                         }
-                        Err(_) => {
+                        Err(e) => {
                             // Revert to collapsed
+                            let failed_check = check.clone();
                             items[item_idx] = TreeItem::Check {
                                 check,
                                 expanded: false,
                                 loading: false,
                             };
+                            // Remember the check if this looks like an auth failure,
+                            // so we can auto-retry after the user authenticates.
+                            let lower = e.to_lowercase();
+                            if lower.contains("authentication required")
+                                || lower.contains("authentication failed")
+                            {
+                                self.pending_auth_retry = Some(failed_check);
+                            }
+                            return Some(e);
                         }
                     }
                 }
@@ -374,6 +403,7 @@ impl CiPanel {
                 }
             }
         }
+        None
     }
 
     /// Check if a download completed. Returns the output path on success.
@@ -453,6 +483,51 @@ impl CiPanel {
             }
             _ => None,
         }
+    }
+
+    /// If a previous step expansion failed due to Azure auth, restart it.
+    /// Returns true if a retry was started.
+    pub fn retry_pending_auth(&mut self) -> bool {
+        let Some(check) = self.pending_auth_retry.take() else {
+            return false;
+        };
+        let CiView::Tree { checks, items, .. } = &mut self.view else {
+            return false;
+        };
+        // Find the item index for this check (URLs are unique)
+        let item_idx = match items
+            .iter()
+            .position(|it| matches!(it, TreeItem::Check { check: c, .. } if c.details_url == check.details_url))
+        {
+            Some(i) => i,
+            None => return false,
+        };
+        let check_idx = checks
+            .iter()
+            .position(|c| c.details_url == check.details_url)
+            .unwrap_or(0);
+
+        // Mark as loading
+        items[item_idx] = TreeItem::Check {
+            check: check.clone(),
+            expanded: false,
+            loading: true,
+        };
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let azure_info = check.azure_info.clone();
+        let job_id = check.job_id;
+        let repo = self.repo.clone();
+        std::thread::spawn(move || {
+            let result = if let Some(ref azure) = azure_info {
+                query_azure_steps(azure)
+            } else {
+                query_steps(&repo, job_id)
+            };
+            let _ = tx.send(result);
+        });
+        self.pending_steps = Some((item_idx, check_idx, check, rx));
+        true
     }
 
     fn collapse_at(items: &mut Vec<TreeItem>, check_pos: usize) {
@@ -688,8 +763,13 @@ pub fn check_gh_auth() -> bool {
         .unwrap_or(false)
 }
 
-/// Check if Azure DevOps PAT is available.
+/// Check if Azure DevOps credentials are available (PAT or Bearer token).
 pub fn has_azure_pat() -> bool {
+    get_azure_pat().is_some() || crate::azure_auth::get_bearer_token().is_some()
+}
+
+/// Check if a PAT is specifically stored (env var or keychain).
+pub fn has_stored_pat() -> bool {
     get_azure_pat().is_some()
 }
 
@@ -907,41 +987,133 @@ fn get_azure_pat() -> Option<String> {
             return Some(pat);
         }
     }
-    // 2. System keyring via secret-tool (GNOME Keyring / KDE Wallet)
-    if let Ok(output) = Command::new("secret-tool")
-        .args([
-            "lookup",
-            "service",
-            "middle-manager",
-            "account",
-            "azure-pat",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-    {
-        if output.status.success() {
-            let pat = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !pat.is_empty() {
-                return Some(pat);
+    // 2. macOS Keychain
+    if cfg!(target_os = "macos") {
+        if let Ok(output) = Command::new("security")
+            .args([
+                "find-generic-password",
+                "-s",
+                "middle-manager",
+                "-a",
+                "azure-pat",
+                "-w",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        {
+            if output.status.success() {
+                let pat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !pat.is_empty() {
+                    return Some(pat);
+                }
+            }
+        }
+    }
+    // 3. Linux keyring via secret-tool (GNOME Keyring / KDE Wallet)
+    if !cfg!(target_os = "macos") {
+        if let Ok(output) = Command::new("secret-tool")
+            .args([
+                "lookup",
+                "service",
+                "middle-manager",
+                "account",
+                "azure-pat",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+        {
+            if output.status.success() {
+                let pat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !pat.is_empty() {
+                    return Some(pat);
+                }
             }
         }
     }
     None
 }
 
-/// Build curl auth args for Azure DevOps (if PAT available).
+/// Store Azure DevOps PAT in the system keyring.
+/// Returns Ok(()) on success or Err with a message.
+pub fn store_azure_pat(pat: &str) -> Result<(), String> {
+    if cfg!(target_os = "macos") {
+        // macOS `security add-generic-password` takes the PAT as argv (-w),
+        // which is briefly visible to other local users via `ps`. The alternative
+        // (interactive prompt) is unusable from a TUI. We use `-U` to upsert in
+        // a single command, keeping the exposure window as short as possible.
+        let status = Command::new("security")
+            .args([
+                "add-generic-password",
+                "-U",
+                "-s",
+                "middle-manager",
+                "-a",
+                "azure-pat",
+                "-l",
+                "middle-manager azure PAT",
+                "-w",
+                pat,
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map_err(|e| format!("Failed to run security: {}", e))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("Failed to store PAT in macOS Keychain".to_string())
+        }
+    } else {
+        // Linux: secret-tool store
+        let mut child = Command::new("secret-tool")
+            .args([
+                "store",
+                "--label",
+                "middle-manager azure PAT",
+                "service",
+                "middle-manager",
+                "account",
+                "azure-pat",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("Failed to run secret-tool: {}", e))?;
+        if let Some(mut stdin) = child.stdin.take() {
+            use std::io::Write;
+            stdin
+                .write_all(pat.as_bytes())
+                .map_err(|e| format!("Failed to write PAT: {}", e))?;
+        }
+        let status = child
+            .wait()
+            .map_err(|e| format!("secret-tool failed: {}", e))?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err("Failed to store PAT in keyring".to_string())
+        }
+    }
+}
+
+/// Build curl auth args for Azure DevOps (PAT or Bearer token).
 fn azure_auth_args() -> Vec<String> {
+    // 1. Try PAT (Basic auth)
     if let Some(pat) = get_azure_pat() {
-        // Azure DevOps PAT uses Basic auth with empty username
         let encoded = crate::clipboard::base64_encode(format!(":{}", pat).as_bytes());
-        vec![
+        return vec![
             "-H".to_string(),
             format!("Authorization: Basic {}", encoded),
-        ]
-    } else {
-        vec![]
+        ];
     }
+    // 2. Try Bearer token from device code flow
+    if let Some(token) = crate::azure_auth::get_bearer_token() {
+        return vec!["-H".to_string(), format!("Authorization: Bearer {}", token)];
+    }
+    vec![]
 }
 
 /// Try to get test failures directly from Azure DevOps test results API.
@@ -1336,8 +1508,22 @@ fn query_azure_steps(azure: &AzureInfo) -> Result<Vec<CiStep>, String> {
         azure.org, azure.project, azure.build_id
     );
 
-    let output = Command::new("curl")
-        .args(["-s", &url])
+    let auth = azure_auth_args();
+    let mut cmd = Command::new("curl");
+    cmd.args([
+        "-s",
+        "-L",
+        "--compressed",
+        "--max-time",
+        "15",
+        "-w",
+        "\n__HTTP_STATUS__:%{http_code}",
+    ]);
+    for arg in &auth {
+        cmd.arg(arg);
+    }
+    cmd.arg(&url);
+    let output = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
@@ -1347,7 +1533,37 @@ fn query_azure_steps(azure: &AzureInfo) -> Result<Vec<CiStep>, String> {
         return Err("Failed to fetch Azure timeline".to_string());
     }
 
-    let text = String::from_utf8_lossy(&output.stdout);
+    let raw = String::from_utf8_lossy(&output.stdout);
+    // Split body and status written by curl's -w flag.
+    let (body, http_status) = match raw.rsplit_once("\n__HTTP_STATUS__:") {
+        Some((b, s)) => (b, s.trim().parse::<u16>().unwrap_or(0)),
+        None => (raw.as_ref(), 0),
+    };
+
+    // Check for HTML auth redirect or 401/403.
+    let looks_html = body.contains("<!DOCTYPE") || body.contains("<html");
+    if http_status == 401 || http_status == 403 || looks_html {
+        crate::debug_log::log(&format!(
+            "Azure timeline API: http_status={} body_len={} auth={}",
+            http_status,
+            body.len(),
+            if auth.is_empty() {
+                "none"
+            } else {
+                "bearer/basic"
+            }
+        ));
+        if auth.is_empty() {
+            return Err("Azure DevOps authentication required — open the auth dialog.".to_string());
+        }
+        return Err(format!(
+            "Azure DevOps authentication failed (HTTP {}). \
+             The stored token may be for the wrong tenant, expired, or lack \
+             Azure DevOps scope. Try a different auth method.",
+            http_status
+        ));
+    }
+    let text = body;
 
     #[derive(Deserialize)]
     struct Timeline {
@@ -1379,8 +1595,8 @@ fn query_azure_steps(azure: &AzureInfo) -> Result<Vec<CiStep>, String> {
         id: u64,
     }
 
-    let timeline: Timeline = serde_json::from_str(&text)
-        .map_err(|e| format!("Failed to parse Azure timeline: {}", e))?;
+    let timeline: Timeline =
+        serde_json::from_str(text).map_err(|e| format!("Failed to parse Azure timeline: {}", e))?;
 
     // Find tasks belonging to the target job
     let job_id = if azure.job_id.is_empty() {

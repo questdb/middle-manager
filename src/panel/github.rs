@@ -3,10 +3,8 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 #[derive(Debug, Clone)]
-#[allow(dead_code)]
 pub struct PrInfo {
     pub number: u64,
-    pub title: String,
     pub url: String,
     pub state: String,
     pub checks: PrCheckStatus,
@@ -38,7 +36,6 @@ impl PrCheckStatus {
 #[derive(Deserialize)]
 struct GhPrItem {
     number: u64,
-    title: String,
     url: String,
     state: String,
     #[serde(rename = "statusCheckRollup", default)]
@@ -71,12 +68,7 @@ pub fn query_pr_info(dir: &Path, branch: &str) -> Option<PrInfo> {
 
     // Use `gh pr view` which finds the PR for this specific branch
     let output = Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            "--json",
-            "number,title,state,statusCheckRollup,url",
-        ])
+        .args(["pr", "view", "--json", "number,state,statusCheckRollup,url"])
         .current_dir(dir)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -111,7 +103,6 @@ pub fn query_pr_info(dir: &Path, branch: &str) -> Option<PrInfo> {
 
     Some(PrInfo {
         number: item.number,
-        title: item.title,
         url: item.url,
         state: item.state,
         checks,
@@ -124,10 +115,4 @@ pub fn open_url(url: &str) {
     let _ = Command::new("open").arg(url).spawn();
     #[cfg(target_os = "linux")]
     let _ = Command::new("xdg-open").arg(url).spawn();
-}
-
-/// Get the checks detail URL for a PR (the "Checks" tab).
-#[allow(dead_code)]
-pub fn checks_url(pr_url: &str) -> String {
-    format!("{}/checks", pr_url)
 }

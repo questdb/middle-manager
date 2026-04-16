@@ -516,22 +516,6 @@ pub fn delete_entry(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-pub fn create_directory(parent: &Path, name: &str) -> Result<()> {
-    let path = parent.join(name);
-    fs::create_dir_all(&path).with_context(|| format!("Failed to create directory {:?}", path))?;
-    Ok(())
-}
-
-#[allow(dead_code)]
-pub fn rename_entry(path: &Path, new_name: &str) -> Result<()> {
-    let parent = path.parent().context("path has no parent")?;
-    let new_path = parent.join(new_name);
-    fs::rename(path, &new_path)
-        .with_context(|| format!("Failed to rename {:?} to {:?}", path, new_path))?;
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Sparse copy
 // ---------------------------------------------------------------------------

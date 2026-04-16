@@ -78,7 +78,12 @@ Designed to handle **very large files** — the hex editor and text editor both 
 - Failed checks sorted to top for quick access
 - PR number displayed in panel title
 - **Ctrl+E: Extract all failures** — downloads failed test logs, parses failure patterns (Rust, Java, Go, Python, Jest), writes consolidated Markdown report
-- Azure DevOps test results API (instant, no log download) with PAT auth support
+- Azure DevOps: authenticated timeline, step, log, and test results APIs
+- **Azure auth dialog** — opens automatically when credentials are needed:
+  - PAT mode (default): paste a token, securely stored in macOS Keychain or Linux keyring
+  - Browser mode: OAuth2 auth code flow (set `AZURE_DEVOPS_TENANT` to enable)
+- Also supports `AZURE_DEVOPS_PAT` env var for CI/headless environments
+- Clear status bar feedback when Azure auth is missing or invalid
 - GitHub API rate limit monitoring
 
 **Shell Panel (Ctrl+O)**
@@ -278,6 +283,23 @@ MM_DEBUG=1 middle-manager            # Enable debug logging to ~/.config/middle-
 | Tab / Shift+Tab | Switch panel forward / backward |
 | F2 | Close CI panel |
 | Mouse click | Select item and focus panel |
+
+### Azure DevOps Authentication
+
+Azure DevOps checks require authentication. An auth dialog opens automatically when you first expand an Azure DevOps check that requires credentials.
+
+**PAT mode** (default) — paste a Personal Access Token with **Build (Read)** and **Test Management (Read)** scopes. The PAT is securely stored in the system keychain (macOS Keychain / GNOME Keyring).
+
+**Browser mode** — OAuth2 authorization code flow. Requires your tenant admin to have the Azure CLI app installed. Set environment variables to enable:
+```bash
+export AZURE_DEVOPS_TENANT=mycompany.io          # required
+export AZURE_DEVOPS_CLIENT_ID=your-app-id         # optional, defaults to Azure CLI
+```
+
+**Environment variable** — for CI or headless use:
+```bash
+export AZURE_DEVOPS_PAT=your-pat-here
+```
 
 ### Shell Panel
 

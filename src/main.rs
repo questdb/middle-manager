@@ -1,5 +1,6 @@
 mod action;
 mod app;
+mod azure_auth;
 pub mod azure_blob;
 mod ci;
 mod clipboard;

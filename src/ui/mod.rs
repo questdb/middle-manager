@@ -1,4 +1,5 @@
 pub mod archive_dialog;
+pub mod azure_auth_dialog;
 pub mod ci_view;
 pub mod copy_dialog;
 pub mod dialog;
@@ -430,6 +431,12 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
     // Settings dialog
     if let Some(selected) = app.settings_open {
         let area = settings_dialog::render(frame, selected);
+        shadow::render_shadow(frame, area);
+    }
+
+    // Azure auth dialog
+    if let Some(ref state) = app.azure_auth_dialog {
+        let area = azure_auth_dialog::render(frame, state);
         shadow::render_shadow(frame, area);
     }
 

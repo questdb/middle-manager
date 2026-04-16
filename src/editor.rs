@@ -2163,9 +2163,8 @@ mod tests {
         let mut f = std::fs::File::create(&path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
         drop(f);
-        let editor = EditorState::open(path.clone());
         // Clean up is best-effort; tests are short-lived
-        editor
+        EditorState::open(path.clone())
     }
 
     #[test]

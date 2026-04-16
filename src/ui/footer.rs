@@ -83,8 +83,9 @@ pub fn render_ci(frame: &mut Frame, area: Rect, view: &CiView) {
     let items: &[(&str, &str)] = match view {
         CiView::Tree { .. } => &[
             ("Enter", "Expand/Log"),
-            ("C-e", "Failures"),
+            ("Ctrl+E", "Failures"),
             ("o", "Browser"),
+            ("a", "Azure Auth"),
             ("Tab", "Switch"),
             ("F2", "Close"),
         ],
@@ -103,8 +104,8 @@ pub fn render_terminal(frame: &mut Frame, area: Rect) {
         ("F5", "Open"),
         ("F10", "Quit"),
         ("F12", "Close"),
-        ("A-Up/Dn", "Resize"),
-        ("A-Enter", "Max"),
+        ("Alt+Up/Dn", "Resize"),
+        ("Alt+Enter", "Max"),
     ];
 
     let spans = build_colon_spans(items, fkey_style, label_style, sep_style, area.width);
@@ -116,10 +117,10 @@ pub fn render_shell(frame: &mut Frame, area: Rect) {
 
     let items: &[(&str, &str)] = &[
         ("F1", "Switch"),
-        ("C-o", "Close"),
+        ("Ctrl+O", "Close"),
         ("F10", "Quit"),
-        ("A-Up/Dn", "Resize"),
-        ("A-Enter", "Max"),
+        ("Alt+Up/Dn", "Resize"),
+        ("Alt+Enter", "Max"),
     ];
 
     let spans = build_colon_spans(items, fkey_style, label_style, sep_style, area.width);
@@ -131,10 +132,10 @@ pub fn render_ssh(frame: &mut Frame, area: Rect) {
 
     let items: &[(&str, &str)] = &[
         ("F1", "Switch"),
-        ("C-t", "Close"),
+        ("Ctrl+T", "Close"),
         ("F10", "Quit"),
-        ("A-Up/Dn", "Resize"),
-        ("A-Enter", "Max"),
+        ("Alt+Up/Dn", "Resize"),
+        ("Alt+Enter", "Max"),
     ];
 
     let spans = build_colon_spans(items, fkey_style, label_style, sep_style, area.width);
@@ -149,7 +150,7 @@ pub fn render_diff(frame: &mut Frame, area: Rect) {
         ("F4", "Edit"),
         ("\u{2190}\u{2192}", "Fold"),
         ("Tab", "Switch"),
-        ("C-d", "Close"),
+        ("Ctrl+D", "Close"),
     ];
 
     let spans = build_colon_spans(items, fkey_style, label_style, sep_style, area.width);
