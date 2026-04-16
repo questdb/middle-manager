@@ -54,7 +54,7 @@ pub fn render(frame: &mut Frame, area: Rect) {
         ("F6", "RnMov"),
         ("F7", "MkFld"),
         ("F8", "Del"),
-        ("F9", "Sort"),
+        ("F9", "Menu"),
         ("F10", "Quit"),
         ("F12", "Claude"),
     ];

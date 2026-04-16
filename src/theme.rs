@@ -241,7 +241,7 @@ impl Theme {
         let text = Color::Rgb(232, 228, 237); // #e8e4ed cool light grey
         let text_dim = Color::Rgb(154, 143, 176); // #9a8fb0 muted lavender
         let text_very_dim = Color::Rgb(107, 90, 132); // #6b5a84 dim purple
-        let selection = Color::Rgb(46, 39, 64); // #2e2740 selection bg
+        let selection = Color::Rgb(74, 50, 100); // #4a3264 selection bg
         let green = Color::Rgb(130, 210, 150); // #82d296 soft green
         let blue = Color::Rgb(130, 160, 230); // #82a0e6 soft blue
         let red = Color::Rgb(240, 100, 100); // #f06464 soft red

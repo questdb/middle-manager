@@ -42,7 +42,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Shift+F7", "Create (touch) file"),
             ("Shift+F5", "Create archive (tar.zst/gz/xz/zip)"),
             ("F8", "Delete file/selection"),
-            ("F9", "Cycle sort (name/size/date)"),
+            ("Ctrl+F9", "Cycle sort (name/size/date)"),
         ],
     ),
     (
@@ -244,6 +244,7 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("F1", "This help screen"),
             ("Shift+F1", "Settings (theme, etc.)"),
+            ("F9", "Menu"),
             ("F10 / Ctrl+Q", "Quit (with confirmation)"),
             ("F11", "Open PR in browser"),
         ],
