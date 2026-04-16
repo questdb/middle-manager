@@ -38,7 +38,7 @@ pub enum Action {
 
     // Sorting
     CycleSort,
-    SortByName(usize),  // panel index
+    SortByName(usize), // panel index
     SortBySize(usize),
     SortByDate(usize),
 

@@ -145,7 +145,12 @@ pub(crate) fn selected_action(state: &MenuState) -> Option<Action> {
 /// Compute the unclamped dropdown content width for a menu.
 fn menu_content_width(menu: &MenuCategory) -> usize {
     let max_label: usize = menu.items.iter().map(|i| i.label.len()).max().unwrap_or(10);
-    let max_shortcut: usize = menu.items.iter().map(|i| i.shortcut.len()).max().unwrap_or(0);
+    let max_shortcut: usize = menu
+        .items
+        .iter()
+        .map(|i| i.shortcut.len())
+        .max()
+        .unwrap_or(0);
     max_label + 2 + max_shortcut + 2
 }
 
@@ -155,8 +160,12 @@ fn dropdown_rect(menu: &MenuCategory, dropdown_x: u16, dropdown_y: u16, screen: 
     let raw_w = inner_width as u16 + 2; // +2 for border
     let raw_h = menu.items.len() as u16 + 2;
 
-    let avail_w = screen.width.saturating_sub(dropdown_x.saturating_sub(screen.x));
-    let avail_h = screen.height.saturating_sub(dropdown_y.saturating_sub(screen.y));
+    let avail_w = screen
+        .width
+        .saturating_sub(dropdown_x.saturating_sub(screen.x));
+    let avail_h = screen
+        .height
+        .saturating_sub(dropdown_y.saturating_sub(screen.y));
     let dw = raw_w.min(avail_w).max(10);
     let dh = raw_h.min(avail_h).max(3);
 
@@ -316,7 +325,11 @@ pub(crate) fn render(
         } else {
             let is_selected = sel_count == state.selected_item;
             let st = if is_selected { highlight } else { normal };
-            let sc = if is_selected { shortcut_hl } else { shortcut_style };
+            let sc = if is_selected {
+                shortcut_hl
+            } else {
+                shortcut_style
+            };
 
             let marker = if is_active_sort(&item.action, sort_fields) {
                 "\u{2022}" // bullet •

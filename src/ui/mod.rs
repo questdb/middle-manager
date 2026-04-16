@@ -235,12 +235,7 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     // Render menu bar overlay (on top of everything, only when open)
     if let Some(ref state) = app.menu_state {
-        let bar_area = Rect::new(
-            frame.area().x,
-            frame.area().y,
-            frame.area().width,
-            1,
-        );
+        let bar_area = Rect::new(frame.area().x, frame.area().y, frame.area().width, 1);
         let sort_fields = [app.panels[0].sort_field, app.panels[1].sort_field];
         app.menu_title_ranges = menu::render(frame, state, bar_area, sort_fields);
     } else {

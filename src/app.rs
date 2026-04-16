@@ -8907,9 +8907,35 @@ impl App {
                 30 => FileSearchField::MaxCount,
                 31 => FileSearchField::MaxFileSize,
                 32 => FileSearchField::Encoding,
-                _ => FileSearchField::ButtonSearch,
+                _ => {
+                    // Button row — pick Search or Cancel by x position,
+                    // then fire the action immediately.
+                    let cw = self
+                        .dialog_content_area
+                        .map(|a| a.width as usize)
+                        .unwrap_or(60);
+                    // Cancel button is on the right half
+                    let btn = if x_off > cw / 2 {
+                        FileSearchField::ButtonCancel
+                    } else {
+                        FileSearchField::ButtonSearch
+                    };
+                    state.focused = btn;
+                    state.select_focused();
+                    self.handle_file_search_dialog(Action::DialogConfirm);
+                    return;
+                }
             };
             state.select_focused();
+            // Toggle checkbox on click (inputs just get focused/selected above)
+            if !state.focused.is_input()
+                && !matches!(
+                    state.focused,
+                    FileSearchField::ButtonSearch | FileSearchField::ButtonCancel
+                )
+            {
+                state.toggle_focused();
+            }
             return;
         }
         // Search dialog: query at y=2
@@ -8971,10 +8997,7 @@ impl App {
         if row == self.menu_bar_y && matches!(self.mode, AppMode::Normal) {
             for (i, &(x_start, x_end)) in self.menu_title_ranges.iter().enumerate() {
                 if col >= x_start && col < x_end {
-                    let already_open = self
-                        .menu_state
-                        .as_ref()
-                        .is_some_and(|m| m.active_menu == i);
+                    let already_open = self.menu_state.as_ref().is_some_and(|m| m.active_menu == i);
                     self.menu_state = if already_open {
                         None
                     } else {
