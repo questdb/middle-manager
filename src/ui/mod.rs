@@ -11,20 +11,41 @@ pub mod footer;
 pub mod header;
 pub mod help_dialog;
 pub mod hex_view;
+pub mod menu;
 pub mod mkdir_dialog;
 pub mod panel_view;
 pub mod parquet_view;
 pub mod search_dialog;
 pub mod search_results_view;
+pub mod session_dialog;
+pub mod settings_dialog;
 mod shadow;
+pub mod ssh_dialog;
 pub mod terminal_view;
-pub mod viewer_view;
 
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 use ratatui::Frame;
+use unicode_width::UnicodeWidthChar;
+
+/// Truncate a string so its display width (measured in terminal columns) does
+/// not exceed `max_width`.  This is char-boundary safe and accounts for
+/// double-width (CJK) characters.
+pub(crate) fn truncate_to_width(s: &str, max_width: usize) -> &str {
+    let mut end = 0;
+    let mut width = 0;
+    for (i, c) in s.char_indices() {
+        let cw = UnicodeWidthChar::width(c).unwrap_or(0);
+        if width + cw > max_width {
+            break;
+        }
+        width += cw;
+        end = i + c.len_utf8();
+    }
+    &s[..end]
+}
 
 use std::cell::Cell;
 
@@ -58,7 +79,17 @@ pub fn take_dialog_content() -> Option<Rect> {
     DIALOG_CONTENT.replace(None)
 }
 
-/// Split a panel column into file area + optional bottom panels (CI, diff, shell, Claude).
+/// Layout result for a panel column: (file, ci, diff, shell, claude, ssh).
+type PanelColumnLayout = (
+    Rect,
+    Option<Rect>,
+    Option<Rect>,
+    Option<Rect>,
+    Option<Rect>,
+    Option<Rect>,
+);
+
+/// Split a panel column into file area + optional bottom panels (CI, diff, shell, Claude, SSH).
 ///
 /// When `maximized` is true, the file panel gets 0 height and the bottom panels fill the column.
 /// `split_pct` controls the top/bottom ratio (percentage for the file panel).
@@ -69,19 +100,23 @@ fn split_panel_column(
     has_diff: bool,
     has_shell: bool,
     has_claude: bool,
+    has_ssh: bool,
     split_pct: u16,
     maximized: bool,
-) -> (Rect, Option<Rect>, Option<Rect>, Option<Rect>, Option<Rect>) {
+) -> PanelColumnLayout {
     // When Claude is maximized, it takes the entire column
     if maximized && has_claude {
         let zero = Rect::new(col.x, col.y, col.width, 0);
-        return (zero, None, None, None, Some(col));
+        return (zero, None, None, None, Some(col), None);
     }
 
-    let bottom_count =
-        has_ci as usize + has_diff as usize + has_shell as usize + has_claude as usize;
+    let bottom_count = has_ci as usize
+        + has_diff as usize
+        + has_shell as usize
+        + has_claude as usize
+        + has_ssh as usize;
     if bottom_count == 0 {
-        return (col, None, None, None, None);
+        return (col, None, None, None, None, None);
     }
 
     // Split top (file panel) vs bottom (all sub-panels share equally)
@@ -125,18 +160,31 @@ fn split_panel_column(
     };
     let claude_area = if has_claude {
         let a = areas[idx];
+        idx += 1;
+        Some(a)
+    } else {
+        None
+    };
+    let ssh_area = if has_ssh {
+        let a = areas[idx];
         let _ = idx;
         Some(a)
     } else {
         None
     };
 
-    (file_area, ci_area, diff_area, shell_area, claude_area)
+    (
+        file_area,
+        ci_area,
+        diff_area,
+        shell_area,
+        claude_area,
+        ssh_area,
+    )
 }
 
 pub fn render(frame: &mut Frame, app: &mut App) {
     match &app.mode {
-        AppMode::Viewing(_) => render_viewer(frame, app),
         AppMode::HexViewing(_) => render_hex_viewer(frame, app),
         AppMode::ParquetViewing(_) => render_parquet_viewer(frame, app),
         AppMode::DiffViewing(_) => render_diff_viewer(frame, app),
@@ -146,7 +194,12 @@ pub fn render(frame: &mut Frame, app: &mut App) {
 
     // Render goto-line prompt overlay if active
     if let Some(ref input) = app.goto_line_input {
-        render_goto_prompt(frame, input);
+        let title = if matches!(app.mode, AppMode::HexViewing(_)) {
+            " Go to Offset (hex) "
+        } else {
+            " Go to Line[:Col] "
+        };
+        render_goto_prompt(frame, input, title);
     }
 
     // Render quit confirmation overlay
@@ -161,10 +214,32 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         shadow::render_shadow(frame, area);
     }
 
-    // Render help dialog overlay
+    // Render help dialog overlay (or contextual rg help when F1 pressed in search dialog)
     if let Some(ref state) = app.help_state {
-        let area = help_dialog::render(frame, state.scroll, &state.filter);
+        let area = match app.file_search_help {
+            Some(crate::app::FileSearchHelp::FileTypes) => {
+                file_search_dialog::render_type_list(frame, state.scroll, &state.filter)
+            }
+            Some(crate::app::FileSearchHelp::Glob) => {
+                file_search_dialog::render_glob_help(frame, state.scroll)
+            }
+            Some(crate::app::FileSearchHelp::Field(f)) => {
+                file_search_dialog::render_field_help(frame, f)
+            }
+            None => help_dialog::render(frame, state.scroll, &state.filter),
+        };
         shadow::render_shadow(frame, area);
+        // Hide the text cursor while a help/F1 overlay is shown
+        CURSOR_POS.set(None);
+    }
+
+    // Render menu bar overlay (on top of everything, only when open)
+    if let Some(ref state) = app.menu_state {
+        let bar_area = Rect::new(frame.area().x, frame.area().y, frame.area().width, 1);
+        let sort_fields = [app.panels[0].sort_field, app.panels[1].sort_field];
+        app.menu_title_ranges = menu::render(frame, state, bar_area, sort_fields);
+    } else {
+        app.menu_title_ranges.clear();
     }
 }
 
@@ -180,34 +255,44 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
         Layout::horizontal([Constraint::Fill(1), Constraint::Fill(1)]).areas(panels_area);
 
     // Split each column: file panel on top, bottom panels below
-    let (left_area, left_ci_area, left_diff_area, left_shell_area, left_claude_area) =
+    let (left_area, left_ci_area, left_diff_area, left_shell_area, left_claude_area, left_ssh_area) =
         split_panel_column(
             left_col,
             app.ci_panels[0].is_some(),
             app.diff_panels[0].is_some(),
             app.shell_panels[0].is_some(),
             app.claude_panels[0].is_some(),
+            app.ssh_panels[0].is_some(),
             app.bottom_split_pct[0],
             app.bottom_maximized[0],
         );
-    let (right_area, right_ci_area, right_diff_area, right_shell_area, right_claude_area) =
-        split_panel_column(
-            right_col,
-            app.ci_panels[1].is_some(),
-            app.diff_panels[1].is_some(),
-            app.shell_panels[1].is_some(),
-            app.claude_panels[1].is_some(),
-            app.bottom_split_pct[1],
-            app.bottom_maximized[1],
-        );
+    let (
+        right_area,
+        right_ci_area,
+        right_diff_area,
+        right_shell_area,
+        right_claude_area,
+        right_ssh_area,
+    ) = split_panel_column(
+        right_col,
+        app.ci_panels[1].is_some(),
+        app.diff_panels[1].is_some(),
+        app.shell_panels[1].is_some(),
+        app.claude_panels[1].is_some(),
+        app.ssh_panels[1].is_some(),
+        app.bottom_split_pct[1],
+        app.bottom_maximized[1],
+    );
 
     app.panel_areas = [left_area, right_area];
     app.ci_panel_areas = [left_ci_area, right_ci_area];
     app.diff_panel_areas = [left_diff_area, right_diff_area];
     app.shell_panel_areas = [left_shell_area, right_shell_area];
     app.claude_panel_areas = [left_claude_area, right_claude_area];
+    app.ssh_panel_areas = [left_ssh_area, right_ssh_area];
 
     header::render(frame, header_area, app);
+    app.menu_bar_y = header_area.y;
 
     // File panels are active only when nothing else is focused
     let (left_active, right_active) = if app.focus == PanelFocus::FilePanel {
@@ -254,12 +339,6 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
         );
     }
 
-    // Render file search dialog overlay
-    if let Some(ref state) = app.file_search_dialog {
-        let area = file_search_dialog::render(frame, state);
-        shadow::render_shadow(frame, area);
-    }
-
     // Render CI panels
     if let (Some(ci_area), Some(ref mut ci)) = (left_ci_area, &mut app.ci_panels[0]) {
         ci_view::render(frame, ci_area, ci, app.focus == PanelFocus::Ci(0));
@@ -292,20 +371,49 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
         terminal_view::render(frame, claude_area, cp, app.focus == PanelFocus::Claude(1));
     }
 
-    // Show appropriate footer
-    match app.focus {
-        PanelFocus::Search => footer::render_search(frame, footer_area),
-        PanelFocus::Shell(_) => footer::render_shell(frame, footer_area),
-        PanelFocus::Claude(_) => footer::render_terminal(frame, footer_area),
-        PanelFocus::Ci(side) => {
-            if let Some(ref ci) = app.ci_panels[side] {
-                footer::render_ci(frame, footer_area, &ci.view);
-            } else {
-                footer::render(frame, footer_area);
+    // Render SSH panels
+    if let (Some(ssh_area), Some(ref sp)) = (left_ssh_area, &app.ssh_panels[0]) {
+        terminal_view::render(frame, ssh_area, sp, app.focus == PanelFocus::Ssh(0));
+    }
+    if let (Some(ssh_area), Some(ref sp)) = (right_ssh_area, &app.ssh_panels[1]) {
+        terminal_view::render(frame, ssh_area, sp, app.focus == PanelFocus::Ssh(1));
+    }
+
+    // Render file search dialog overlay (after bottom panels so it's on top)
+    if let Some(ref state) = app.file_search_dialog {
+        let area = file_search_dialog::render(frame, state);
+        shadow::render_shadow(frame, area);
+    }
+
+    // Render SSH dialog overlay
+    if let Some(ref state) = app.ssh_dialog {
+        ssh_dialog::render(frame, state);
+    }
+
+    // Render session dialog overlay
+    if let Some(ref state) = app.session_dialog {
+        session_dialog::render(frame, state);
+    }
+
+    // Show status message in footer if set, otherwise show key hints
+    if let Some(ref msg) = app.status_message {
+        footer::render_status(frame, footer_area, msg);
+    } else {
+        match app.focus {
+            PanelFocus::Search => footer::render_search(frame, footer_area),
+            PanelFocus::Ssh(_) => footer::render_ssh(frame, footer_area),
+            PanelFocus::Shell(_) => footer::render_shell(frame, footer_area),
+            PanelFocus::Claude(_) => footer::render_terminal(frame, footer_area),
+            PanelFocus::Ci(side) => {
+                if let Some(ref ci) = app.ci_panels[side] {
+                    footer::render_ci(frame, footer_area, &ci.view);
+                } else {
+                    footer::render(frame, footer_area);
+                }
             }
+            PanelFocus::Diff(_) => footer::render_diff(frame, footer_area),
+            PanelFocus::FilePanel => footer::render(frame, footer_area),
         }
-        PanelFocus::Diff(_) => footer::render_diff(frame, footer_area),
-        PanelFocus::FilePanel => footer::render(frame, footer_area),
     }
 
     let dialog_area = match &app.mode {
@@ -318,21 +426,100 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
     if let Some(area) = dialog_area {
         shadow::render_shadow(frame, area);
     }
-}
 
-fn render_viewer(frame: &mut Frame, app: &mut App) {
-    if let AppMode::Viewing(ref mut viewer) = app.mode {
-        viewer_view::render(frame, frame.area(), viewer);
-    }
-    if let Some(ref state) = app.search_dialog {
-        let area = search_dialog::render(frame, state);
+    // Settings dialog
+    if let Some(selected) = app.settings_open {
+        let area = settings_dialog::render(frame, selected);
         shadow::render_shadow(frame, area);
     }
+
+    // Popup overlay (rendered last, on top of everything)
+    if let Some((ref title, ref msg)) = app.popup {
+        render_popup(frame, title, msg);
+    }
+}
+
+fn render_popup(frame: &mut Frame, title: &str, msg: &str) {
+    let t = crate::theme::theme();
+    let lines: Vec<&str> = msg.lines().collect();
+    let max_line_width = lines.iter().map(|l| l.len()).max().unwrap_or(20);
+    let width = (max_line_width as u16 + 6)
+        .min(frame.area().width.saturating_sub(4))
+        .max(30);
+    let height = (lines.len() as u16 + 4)
+        .min(frame.area().height.saturating_sub(4))
+        .max(5);
+
+    let x = (frame.area().width.saturating_sub(width)) / 2;
+    let y = (frame.area().height.saturating_sub(height)) / 2;
+    let area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, area);
+
+    let is_error = title.contains("Error") || title.contains("error");
+    let border_color = if is_error {
+        t.popup_error_border
+    } else {
+        t.popup_success_border
+    };
+
+    let block = Block::default()
+        .title(Span::styled(
+            format!(" {} ", title),
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .style(Style::default().bg(t.dialog_bg));
+
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    // Render message lines
+    let text_style = Style::default().fg(t.dialog_text_fg).bg(t.dialog_bg);
+    for (i, line) in lines.iter().enumerate() {
+        if i as u16 >= inner.height.saturating_sub(1) {
+            break;
+        }
+        let rect = Rect::new(
+            inner.x + 1,
+            inner.y + i as u16,
+            inner.width.saturating_sub(2),
+            1,
+        );
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(*line, text_style))),
+            rect,
+        );
+    }
+
+    // "Press any key" hint at bottom
+    let hint_y = inner.y + inner.height.saturating_sub(1);
+    let hint = "Press any key to dismiss";
+    let hint_style = Style::default()
+        .fg(t.dialog_text_fg)
+        .bg(t.dialog_bg)
+        .add_modifier(Modifier::DIM);
+    let rect = Rect::new(inner.x + 1, hint_y, inner.width.saturating_sub(2), 1);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(hint, hint_style))),
+        rect,
+    );
 }
 
 fn render_hex_viewer(frame: &mut Frame, app: &mut App) {
     if let AppMode::HexViewing(ref mut hex) = app.mode {
         hex_view::render(frame, frame.area(), hex);
+    }
+    if let Some(ref state) = app.search_dialog {
+        let area = search_dialog::render(frame, state);
+        shadow::render_shadow(frame, area);
+    }
+    if let Some(focused) = app.unsaved_dialog {
+        let area = render_unsaved_dialog(frame, focused);
+        shadow::render_shadow(frame, area);
     }
 }
 
@@ -599,7 +786,7 @@ fn render_quit_dialog(frame: &mut Frame, quit_focused: bool) -> Rect {
     layout.outer
 }
 
-fn render_goto_prompt(frame: &mut Frame, input: &str) {
+fn render_goto_prompt(frame: &mut Frame, input: &str, title: &str) {
     let t = theme();
     let width: u16 = 36;
     let height: u16 = 3;
@@ -611,7 +798,7 @@ fn render_goto_prompt(frame: &mut Frame, input: &str) {
     frame.render_widget(Clear, rect);
 
     let block = Block::default()
-        .title(Span::styled(" Go to Line[:Col] ", t.dialog_title_style()))
+        .title(Span::styled(title, t.dialog_title_style()))
         .borders(Borders::ALL)
         .border_style(t.dialog_border_style())
         .style(t.dialog_bg_style());
@@ -636,4 +823,63 @@ fn render_goto_prompt(frame: &mut Frame, input: &str) {
     frame.render_widget(Paragraph::new(prompt), inner);
 
     shadow::render_shadow(frame, rect);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── truncate_to_width ──
+
+    #[test]
+    fn truncate_ascii_shorter_than_max() {
+        assert_eq!(truncate_to_width("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_ascii_exact_max() {
+        assert_eq!(truncate_to_width("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_ascii_longer_than_max() {
+        assert_eq!(truncate_to_width("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_empty_string() {
+        assert_eq!(truncate_to_width("", 5), "");
+    }
+
+    #[test]
+    fn truncate_cjk_characters() {
+        // Each CJK char is width 2. "日本語abc" = widths [2,2,2,1,1,1] = total 9.
+        // At max_width 5: "日本" fits (width 4), "語" would be 6 — doesn't fit.
+        assert_eq!(truncate_to_width("日本語abc", 5), "日本");
+    }
+
+    #[test]
+    fn truncate_mixed_ascii_multibyte() {
+        // "café": c(1) a(1) f(1) é(1) — all width 1.
+        assert_eq!(truncate_to_width("café", 3), "caf");
+        assert_eq!(truncate_to_width("café", 4), "café");
+    }
+
+    #[test]
+    fn truncate_max_width_zero() {
+        assert_eq!(truncate_to_width("hello", 0), "");
+    }
+
+    #[test]
+    fn truncate_emoji() {
+        // "a🎉b": a(1) 🎉(2) b(1).
+        // max_width 1 → "a"
+        assert_eq!(truncate_to_width("a🎉b", 1), "a");
+        // max_width 2 → "a" (🎉 needs 2 more, total would be 3)
+        assert_eq!(truncate_to_width("a🎉b", 2), "a");
+        // max_width 3 → "a🎉"
+        assert_eq!(truncate_to_width("a🎉b", 3), "a🎉");
+        // max_width 4 → "a🎉b"
+        assert_eq!(truncate_to_width("a🎉b", 4), "a🎉b");
+    }
 }

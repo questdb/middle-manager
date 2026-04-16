@@ -67,7 +67,7 @@ pub fn render(frame: &mut Frame, area: Rect, ci: &mut CiPanel, is_active: bool) 
                 inner,
                 items,
                 &TreeRenderCtx {
-                    t,
+                    t: &t,
                     is_active,
                     selected: *selected,
                     scroll: *scroll,

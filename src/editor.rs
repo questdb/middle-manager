@@ -63,6 +63,9 @@ pub struct EditorState {
     /// Undo/redo stacks.
     undo_stack: Vec<UndoEntry>,
     redo_stack: Vec<UndoEntry>,
+
+    /// If editing a remote file: (remote_path, panel_side) for upload-on-save.
+    pub remote_source: Option<(PathBuf, usize)>,
 }
 
 /// Minimal operation-based undo entry. Stores what changed, not full line copies.
@@ -141,9 +144,18 @@ impl EditorState {
             syntax,
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            remote_source: None,
         };
         // Pre-scan first batch of lines for immediate display
         state.scan_to_line(10_000);
+        // Empty files need at least one editable line
+        if state.file_size == 0 {
+            state.segments = vec![Segment::Buffer {
+                lines: vec![String::new()],
+            }];
+            state.scan_complete = true;
+            state.lines_scanned = 0;
+        }
         state
     }
 

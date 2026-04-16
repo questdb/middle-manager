@@ -28,12 +28,16 @@ pub struct TerminalPanel {
     pub spawn_dir: PathBuf,
     /// Whether to show the hardware cursor (false for apps that render their own, like Claude Code).
     pub show_cursor: bool,
+    /// Text selection start in screen-local coordinates (row, col). Inclusive.
+    pub selection_start: Option<(u16, u16)>,
+    /// Text selection end in screen-local coordinates (row, col). Inclusive.
+    pub selection_end: Option<(u16, u16)>,
 }
 
 impl TerminalPanel {
     /// Spawn a command in a PTY with the given working directory and dimensions.
     #[allow(clippy::too_many_arguments)]
-    fn spawn_cmd(
+    pub fn spawn_cmd(
         command: &str,
         args: &[&str],
         dir: &Path,
@@ -98,6 +102,8 @@ impl TerminalPanel {
             title,
             spawn_dir: dir.to_path_buf(),
             show_cursor,
+            selection_start: None,
+            selection_end: None,
         })
     }
 
@@ -135,6 +141,30 @@ impl TerminalPanel {
             rows,
             format!(" Claude -c — {} ", dir.display()),
             false,
+            wakeup,
+        )
+    }
+
+    /// Spawn an SSH connection in a PTY.
+    pub fn spawn_ssh(
+        host: &crate::ssh::SshHost,
+        cols: u16,
+        rows: u16,
+        wakeup: WakeupSender,
+    ) -> anyhow::Result<Self> {
+        let args = host.ssh_args();
+        let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let dir = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"));
+        Self::spawn_cmd(
+            "ssh",
+            &args_refs,
+            &dir,
+            cols,
+            rows,
+            format!(" SSH: {} ", host.name),
+            true, // SSH sessions need hardware cursor
             wakeup,
         )
     }
@@ -257,6 +287,176 @@ impl TerminalPanel {
             }
         }
         None
+    }
+
+    // --- Text selection ---
+
+    /// Clear any text selection.
+    pub fn clear_selection(&mut self) {
+        self.selection_start = None;
+        self.selection_end = None;
+    }
+
+    /// Start a new selection at the given screen position (clears previous selection).
+    pub fn click_select(&mut self, row: u16, col: u16) {
+        self.selection_start = Some((row, col));
+        self.selection_end = None;
+    }
+
+    /// Extend the current selection to the given screen position.
+    pub fn drag_select(&mut self, row: u16, col: u16) {
+        if self.selection_start.is_some() {
+            self.selection_end = Some((row, col));
+        }
+    }
+
+    /// Select the word at the given screen position (double-click).
+    pub fn select_word_at(&mut self, row: u16, col: u16) {
+        let screen = self.parser.screen();
+        let (rows, cols) = screen.size();
+        if row >= rows || col >= cols {
+            return;
+        }
+
+        let is_word_char = |c: u16| -> bool {
+            screen
+                .cell(row, c)
+                .map(|cell| {
+                    cell.contents()
+                        .chars()
+                        .next()
+                        .is_some_and(|ch| ch.is_alphanumeric() || ch == '_')
+                })
+                .unwrap_or(false)
+        };
+        let is_space = |c: u16| -> bool {
+            screen
+                .cell(row, c)
+                .map(|cell| !cell.has_contents() || cell.contents().trim().is_empty())
+                .unwrap_or(true)
+        };
+
+        let click_word = is_word_char(col);
+        let click_space = is_space(col);
+
+        let same_class = |c: u16| -> bool {
+            if click_space {
+                is_space(c)
+            } else if click_word {
+                is_word_char(c)
+            } else {
+                !is_word_char(c) && !is_space(c)
+            }
+        };
+
+        let mut start = col;
+        while start > 0 && same_class(start - 1) {
+            start -= 1;
+        }
+        let mut end = col;
+        while end + 1 < cols && same_class(end + 1) {
+            end += 1;
+        }
+
+        self.selection_start = Some((row, start));
+        self.selection_end = Some((row, end));
+    }
+
+    /// Select the entire line at the given screen row (triple-click).
+    pub fn select_line_at(&mut self, row: u16) {
+        let (rows, cols) = self.parser.screen().size();
+        if row >= rows {
+            return;
+        }
+        self.selection_start = Some((row, 0));
+        self.selection_end = Some((row, cols.saturating_sub(1)));
+    }
+
+    /// Returns ordered selection range (inclusive): ((start_row, start_col), (end_row, end_col)).
+    pub fn selection_range(&self) -> Option<((u16, u16), (u16, u16))> {
+        let start = self.selection_start?;
+        let end = self.selection_end?;
+        if start <= end {
+            Some((start, end))
+        } else {
+            Some((end, start))
+        }
+    }
+
+    /// Check if a cell at (row, col) is within the current selection.
+    pub fn is_selected(&self, row: u16, col: u16) -> bool {
+        let ((sr, sc), (er, ec)) = match self.selection_range() {
+            Some(range) => range,
+            None => return false,
+        };
+        if row < sr || row > er {
+            return false;
+        }
+        if sr == er {
+            col >= sc && col <= ec
+        } else if row == sr {
+            col >= sc
+        } else if row == er {
+            col <= ec
+        } else {
+            true
+        }
+    }
+
+    /// Extract the selected text from the VT screen.
+    pub fn selected_text(&self) -> Option<String> {
+        let ((sr, sc), (er, ec)) = self.selection_range()?;
+        let screen = self.parser.screen();
+        let (_, cols) = screen.size();
+        let mut result = String::new();
+
+        for row in sr..=er {
+            if row > sr {
+                result.push('\n');
+            }
+            let col_start = if row == sr { sc } else { 0 };
+            let col_end = if row == er { ec + 1 } else { cols }; // +1 because end is inclusive
+
+            let mut line = String::new();
+            let mut col = col_start;
+            while col < col_end {
+                if let Some(cell) = screen.cell(row, col) {
+                    if cell.is_wide_continuation() {
+                        col += 1;
+                        continue;
+                    }
+                    let contents = cell.contents();
+                    if contents.is_empty() {
+                        line.push(' ');
+                    } else {
+                        line.push_str(contents);
+                    }
+                } else {
+                    line.push(' ');
+                }
+                col += 1;
+            }
+            // Trim trailing whitespace from each line in multi-line selections
+            if sr != er {
+                result.push_str(line.trim_end());
+            } else {
+                result.push_str(&line);
+            }
+        }
+
+        if result.is_empty() {
+            None
+        } else {
+            Some(result)
+        }
+    }
+
+    /// Copy the selected text to the clipboard. Returns char count on success.
+    pub fn copy_selection(&self) -> Option<usize> {
+        let text = self.selected_text()?;
+        let len = text.len();
+        crate::clipboard::copy(&text);
+        Some(len)
     }
 }
 
@@ -393,7 +593,6 @@ pub fn encode_key_event(key: KeyEvent) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     /// Helper: parse_file_reference with a known base dir (this project's root)
     fn parse(text: &str) -> Option<(PathBuf, usize, usize)> {

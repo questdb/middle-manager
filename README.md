@@ -2,7 +2,7 @@
 
 A dual-panel file manager for the terminal, inspired by [Far Manager](https://www.farmanager.com/) and Norton Commander. Built in Rust with [ratatui](https://ratatui.rs/).
 
-Designed to handle **very large files** — the viewer, hex viewer, and editor all use sliding buffers and lazy scanning, so opening a 10 GB log file is instant.
+Designed to handle **very large files** — the hex editor and text editor both use sliding buffers and lazy scanning, so opening a 10 GB log file is instant.
 
 <img width="2051" height="1252" alt="image" src="https://github.com/user-attachments/assets/948abfb3-d7b2-49bc-9b4d-fa90397f7b7f" />
 
@@ -12,6 +12,7 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 **File Manager**
 - Dual-panel layout with directory listings (name, size, date, permissions)
 - File operations: copy (F5), move (F6), rename (Shift+F6), mkdir (F7), delete (F8), archive (Shift+F5)
+- Directory size calculation (F3) — async recursive scan with live progress, works on selections
 - Multi-file selection with Shift+Up/Down (toggle) and Insert key for batch operations
 - Far Manager-style dialogs with keyboard navigation (copy, mkdir, delete, rename)
 - Quick search — just start typing to jump to a file, Enter to open
@@ -35,6 +36,34 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Uses `--no-optional-locks` to avoid index.lock conflicts with other tools
 - File name coloring based on git status
 
+**Connectivity (Ctrl+T) [experimental]**
+- Browse remote filesystems in the dual-panel file manager
+- 8 protocols: SSH, SFTP, SMB, WebDAV, S3/S3-compatible, GCS, Azure Blob Storage, NFS
+- Unified connection dialog with protocol tabs (Alt+Left/Right to cycle)
+- Cross-panel copy/move between local and any remote (F5/F6)
+- Remote file editing: F3/F4 downloads to temp, edits locally, uploads on save
+- Create files (Shift+F7) and directories (F7) on remote
+- Delete (F8), rename (Shift+F6) on remote
+- Saved connections: F2 in dialog saves for quick reconnect
+- Background connections with progress display and 30-second timeout
+- Auto-disconnect: Ctrl+T on a remote panel returns to local
+- All protocols shell out to system CLI tools (`ssh`, `sftp`, `smbclient`, `curl`, `aws`, `gcloud`, `az`, `mount`)
+- S3-compatible: MinIO, Backblaze B2, Cloudflare R2, DigitalOcean Spaces via `--endpoint-url`
+- Azure: connection string support, container browsing, Azurite-compatible
+- Debug logging: set `MM_DEBUG=1` for shell command tracing
+
+**Session Persistence (--session)**
+- `middle-manager --session <name>` creates/attaches to persistent tmux sessions
+- Survive terminal disconnects; reattach from any device via SSH
+- Session manager dialog (Ctrl+Y): create, attach, kill sessions
+- Detach with backtick then d (tmux prefix set to `` ` `` to avoid conflicts)
+- Nested session detection prevents tmux-in-tmux issues
+
+**Settings (Shift+F1)**
+- Theme switcher: Far Manager (Classic) and QuestDB Dark
+- QuestDB Dark: deep purple-black backgrounds with rose-pink accents
+- Theme persisted across restarts
+
 **CI Panel (F2)**
 - Tree view of CI checks with expand/collapse
 - GitHub Actions and Azure DevOps support
@@ -48,11 +77,16 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Mouse click support for selecting items in the tree
 - Failed checks sorted to top for quick access
 - PR number displayed in panel title
+- **Ctrl+E: Extract all failures** — downloads failed test logs, parses failure patterns (Rust, Java, Go, Python, Jest), writes consolidated Markdown report
+- Azure DevOps test results API (instant, no log download) with PAT auth support
+- GitHub API rate limit monitoring
 
 **Shell Panel (Ctrl+O)**
 - Spawns your default `$SHELL` at the bottom of the active panel
 - Full PTY emulation — colors, cursor, scrollback all work
 - Independent per-side (left and right panels can each have their own shell)
+- Text selection: click-drag, double-click (word), triple-click (line)
+- Ctrl+C copies selection to clipboard (sends SIGINT when no selection)
 - Alt+Up/Down to resize split, Alt+Enter to maximize/restore
 - F1 switches focus back to file panel, Ctrl+O closes
 - Auto-closes when the shell exits
@@ -66,11 +100,11 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Symlink-safe traversal, collision resolution, UTF-8 safe naming
 
 **Parquet Viewer**
-- Auto-detected when opening `.parquet` files (F3 / Enter)
+- Auto-detected when opening `.parquet` files (F4 / Enter)
 - Tree view: file metadata, key-value metadata (JSON pretty-printed), schema, row groups with column details
 - Column statistics: null count, distinct count, min/max values formatted with logical types
 - Tabular alignment for schema fields, column info, and metadata keys
-- Table view (Tab / F4): scrollable data grid with row group lazy loading
+- Table view (Tab): scrollable data grid with row group lazy loading
 - Encoding names displayed as `Plain`, `RleDictionary`, `DeltaBinaryPacked`, etc.
 - Handles pre-epoch timestamps correctly
 
@@ -79,6 +113,8 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Full PTY emulation via custom VT terminal emulator — colors, cursor, alternate screen all work
 - All keystrokes (including Tab) forwarded to Claude Code
 - 10,000-line scrollback buffer with trackpad/mouse scroll (like Ghostty/iTerm2)
+- Text selection: click-drag, double-click (word), triple-click (line)
+- Ctrl+C copies selection to clipboard (sends SIGINT when no selection)
 - F5 opens file:line references from terminal output in the built-in editor
 - F1 switches focus back to file panel, F12 closes
 - Restored on restart with `claude -c` (continues last session)
@@ -86,20 +122,25 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Coalescing wakeup mechanism — terminal output renders immediately without flooding the event loop
 - Zero-allocation render loop with direct buffer writes
 
-**Text Viewer (F3 / Enter)**
-- Sliding buffer: only ~10K lines in memory at a time
-- Sparse line index for instant seeking to any position
-- Opens multi-GB files instantly, scrolls smoothly
-- Go-to-line with `g` — supports `line` or `line:col` format
-- Tab expansion and control character sanitization
-
-**Hex Viewer**
-- Auto-detects binary files (null byte check)
+**Hex Editor (F4 / Enter on binary files)**
+- Auto-detects binary files (null byte check in first 8 KB)
 - VS Code-style layout: offset | hex bytes | ASCII decode
 - 256 KB sliding buffer for arbitrarily large binaries
-- Toggle between text and hex with Tab or F4
+- Cursor navigation with arrow keys, Home/End, PgUp/PgDn
+- Edit hex nibbles (0-9, A-F) or ASCII characters (Tab to switch sides)
+- Modifications stored as in-place overlay — only changed bytes in memory
+- Save writes only modified bytes (sorted sequential I/O)
+- Undo/redo (Ctrl+Z / Ctrl+Shift+Z) per-nibble
+- Search hex patterns (F7) with forward/backward, wrap-around
+- Go to offset (g) with hex address input
+- Selection with Shift+arrows, Ctrl+A select all, Ctrl+C copy
+- Data inspector: select 1/2/4/8 bytes to see decimal values in both endiannesses (u/i/float)
+- Cursor tracking: hex and ASCII panes mirror cursor position
+- Mouse click to position cursor in hex or ASCII pane
+- Unsaved changes prompt on close
+- Zero-allocation render loop with pre-computed lookup tables
 
-**Built-in Editor (F4)**
+**Built-in Editor (F4 / Enter on text files)**
 - Line-level piece table — only edited lines live in memory
 - Opens and navigates multi-GB files with no delay
 - Tree-sitter syntax highlighting for Rust, Java, Python, JavaScript/TypeScript, JSON, Go, C, Bash, TOML
@@ -123,8 +164,9 @@ Designed to handle **very large files** — the viewer, hex viewer, and editor a
 - Shift+F4 opens `$EDITOR` instead
 
 **UI**
-- Far Manager classic blue color scheme
+- Multiple themes: Far Manager (Classic) and QuestDB Dark — switch with Shift+F1
 - Centralized theme system — all colors in one file (`src/theme.rs`), including syntax highlighting and git status colors
+- Thread-local cached theme access for zero-overhead rendering
 - Consistent dialog styling with shared helpers (padding, separators, buttons, checkboxes)
 - Contextual footer — shows relevant key hints for the active panel/mode
 - Panel border titles with path (shortened with `~`), git info, and CI status
@@ -169,6 +211,15 @@ cargo build --release
 ./target/release/middle-manager
 ```
 
+## Usage
+
+```
+middle-manager                       # Normal launch
+middle-manager --session <name>      # Launch in a persistent tmux session
+middle-manager --list-sessions       # List active middle-manager sessions
+MM_DEBUG=1 middle-manager            # Enable debug logging to ~/.config/middle-manager/debug.log
+```
+
 ## Key Bindings
 
 ### Panels
@@ -180,7 +231,7 @@ cargo build --release
 | Insert | Toggle selection on current item |
 | Left / Home | Jump to top |
 | Right / End | Jump to bottom |
-| Enter | Open directory / view file |
+| Enter | Open directory / open file (editor / hex / parquet) |
 | Backspace | Go to parent directory |
 | Tab | Switch panel forward (cycles through CI/terminal panels) |
 | Shift+Tab | Switch panel backward |
@@ -191,19 +242,23 @@ cargo build --release
 | Ctrl+O | Toggle shell panel |
 | Ctrl+P | Copy full path to clipboard |
 | F2 | Toggle CI panel |
-| F3 | View file |
-| F4 | Edit file (built-in) |
+| F3 | Calculate directory / selection size |
+| F4 | Open file (editor / hex / parquet) |
 | Shift+F4 | Edit file ($EDITOR) |
 | F5 | Copy (operates on selection if active) |
 | Shift+F5 | Create archive (tar.zst/gz/xz/zip) |
 | F6 | Move (operates on selection if active) |
 | Shift+F6 | Rename |
 | F7 | Create directory |
+| Shift+F7 | Create (touch) file |
 | F8 | Delete (operates on selection if active) |
 | F9 | Cycle sort |
 | F10 | Quit (with confirmation) |
 | F11 | Open PR in browser |
+| Ctrl+T | Open Connectivity dialog (remote connections) |
+| Ctrl+Y | Open session manager (tmux sessions) |
 | F12 | Toggle Claude Code panel (maximized, opposite side) |
+| Shift+F1 | Open settings (themes) |
 | Type chars | Quick search |
 
 ### CI Panel
@@ -216,6 +271,7 @@ cargo build --release
 | Right | Expand check (load steps) |
 | Left | Collapse check / jump to parent |
 | Enter | Expand/collapse check, or download step log |
+| Ctrl+E | Extract all test failures to Markdown file |
 | o | Open check in browser |
 | Alt+Up / Alt+Down | Resize panel split |
 | Alt+Enter | Maximize / restore panel |
@@ -228,6 +284,9 @@ cargo build --release
 | Key | Action |
 |-----|--------|
 | All keys (incl. Tab) | Forwarded to the shell |
+| Mouse drag | Select text |
+| Double-click / Triple-click | Select word / line |
+| Ctrl+C | Copy selection (or SIGINT if none) |
 | Scroll / Trackpad | Scroll through scrollback buffer |
 | Alt+Up / Alt+Down | Resize panel split |
 | Alt+Enter | Maximize / restore panel |
@@ -240,6 +299,9 @@ cargo build --release
 | Key | Action |
 |-----|--------|
 | All keys (incl. Tab) | Forwarded to Claude Code |
+| Mouse drag | Select text |
+| Double-click / Triple-click | Select word / line |
+| Ctrl+C | Copy selection (or SIGINT if none) |
 | Scroll / Trackpad | Scroll through scrollback buffer |
 | F5 | Open file:line reference in editor |
 | F1 | Switch focus to file panel |
@@ -262,6 +324,39 @@ cargo build --release
 | Mouse click | Select result and focus panel |
 | F10 | Quit (with confirmation) |
 
+### Connectivity Dialog (Ctrl+T)
+
+| Key | Action |
+|-----|--------|
+| Alt+Left / Alt+Right | Cycle protocol (SSH/SFTP/SMB/WebDAV/S3/GCS/Azure/NFS) |
+| Tab | Cycle protocol (SSH/SFTP) or switch fields (others) |
+| Enter | Connect |
+| F2 | Save connection for quick access |
+| Del | Remove saved connection |
+| Esc | Close |
+
+### SSH / SFTP Panel
+
+| Key | Action |
+|-----|--------|
+| All keys (incl. Tab) | Forwarded to SSH session |
+| Scroll / Trackpad | Scroll through scrollback buffer |
+| Alt+Up / Alt+Down | Resize panel split |
+| Alt+Enter | Maximize / restore panel |
+| F1 | Switch focus to file panel |
+| Ctrl+T | Close SSH panel / disconnect SFTP |
+| F10 | Quit (with confirmation) |
+
+### Session Manager (Ctrl+Y)
+
+| Key | Action |
+|-----|--------|
+| Up / Down | Navigate sessions |
+| Enter | Attach to selected session |
+| n | Create new session |
+| d / Delete | Kill selected session |
+| Esc | Close |
+
 ### Dialog Inputs (all dialogs)
 
 | Key | Action |
@@ -276,16 +371,27 @@ cargo build --release
 | Delete | Delete forward |
 | Mouse click | Focus input field |
 
-### Viewer / Hex Viewer
+### Hex Editor
 
 | Key | Action |
 |-----|--------|
-| Up / Down | Scroll |
-| PgUp / PgDn | Scroll by page |
-| Home / End | Top / bottom |
-| g | Go to line |
-| Tab / F4 | Toggle text / hex |
-| q / Esc | Close |
+| Arrow keys | Move cursor |
+| Home / End | Start / end of row |
+| Ctrl+Home / Ctrl+End | Start / end of file |
+| PgUp / PgDn | Page through file |
+| 0-9, A-F | Edit hex nibble |
+| Tab | Switch hex / ASCII editing |
+| Shift+arrows | Select bytes |
+| Ctrl+A | Select all |
+| Ctrl+C | Copy selection |
+| g / Ctrl+G | Go to offset (hex) |
+| F7 / Ctrl+F | Search hex pattern |
+| n / N | Find next / previous |
+| Ctrl+S / F2 | Save |
+| Ctrl+Z / Ctrl+Shift+Z | Undo / Redo |
+| Mouse click | Position cursor (hex or ASCII pane) |
+| q / Esc | Close (prompts if unsaved) |
+| F10 | Quit (with confirmation) |
 
 ### Parquet Viewer
 
@@ -296,7 +402,7 @@ cargo build --release
 | Left | Collapse node / jump to parent |
 | PgUp / PgDn | Page through tree or table |
 | Home / End | Jump to top / bottom |
-| Tab / F4 | Toggle tree / table view |
+| Tab | Toggle tree / table view |
 | g | Go to row |
 | q / Esc | Close |
 
@@ -337,13 +443,24 @@ src/
   parquet_viewer.rs Parquet file viewer: metadata tree, column stats, table data decoding
   file_search.rs    File content search: ripgrep engine (ignore + grep-searcher), streaming results
   text_input.rs     Reusable text input: selection, undo/redo, cut/copy, horizontal scroll
-  ci.rs             CI panel: check/step fetching, log download, tree state
+  ci.rs             CI panel: check/step fetching, log download, failure extraction
+  remote_fs.rs      RemoteFs trait: common interface for all remote protocols
+  sftp.rs           SFTP connection (shells out to sftp CLI)
+  smb_client.rs     SMB connection (shells out to smbclient)
+  webdav.rs         WebDAV connection (shells out to curl + quick-xml)
+  s3.rs             S3 connection (shells out to aws s3api)
+  gcs.rs            GCS connection (shells out to gcloud storage)
+  azure_blob.rs     Azure Blob connection (shells out to az CLI)
+  nfs_client.rs     NFS connection (mount + local FS delegation)
+  ssh.rs            SSH host config, ~/.ssh/config parsing
+  session.rs        tmux session management
+  saved_connections.rs  Saved connection store (JSON)
+  debug_log.rs      Debug logging (MM_DEBUG=1)
   state.rs          Persistent state (JSON, ~/.config/middle-manager/)
   syntax.rs         Tree-sitter syntax highlighting with hybrid caching
   theme.rs          Centralized color scheme (panel, editor, git, syntax, dialog)
   editor.rs         Built-in editor with line-level piece table and streaming search
-  viewer.rs         Text viewer with sliding buffer
-  hex_viewer.rs     Hex viewer with sliding buffer
+  hex_viewer.rs     Hex editor with sliding buffer, modifications overlay, undo/redo, search
   watcher.rs        Filesystem watcher (kqueue/inotify via notify crate)
   panel/
     mod.rs          Panel state, directory reading, navigation, multi-file selection
@@ -377,8 +494,7 @@ src/
     copy_dialog.rs  Far Manager-style copy/move dialog
     search_dialog.rs  Editor search dialog (query, direction, case sensitivity)
     editor_view.rs  Editor rendering with syntax highlighting and selection
-    viewer_view.rs  Text viewer rendering with tab expansion
-    hex_view.rs     Hex viewer rendering
+    hex_view.rs     Hex editor rendering with zero-allocation lookup tables
     parquet_view.rs Parquet viewer rendering (tree + table modes)
     archive_dialog.rs  Archive format picker dialog
     shadow.rs       Transparent dialog drop shadows
@@ -394,9 +510,8 @@ The CI panel fetches data **asynchronously** — check lists, step details, and 
 
 This project is in early development. Things we're considering:
 
-- [ ] Search in viewer (F3)
-- [ ] Syntax highlighting in viewer
 - [x] Undo/redo in editor
+- [x] Hex editor with search, undo/redo, data inspector
 - [ ] File permissions dialog
 - [ ] Configurable key bindings
 - [ ] Multiple color schemes

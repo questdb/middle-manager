@@ -20,7 +20,7 @@ use crate::editor::EditorState;
 use crate::file_search::SearchState;
 use crate::fs_ops;
 use crate::fs_ops::archive::ArchiveFormat;
-use crate::hex_viewer::HexViewerState;
+use crate::hex_viewer::{HexViewerState, BYTES_PER_ROW};
 use crate::panel::git::GitCache;
 use crate::panel::sort::SortField;
 use crate::panel::Panel;
@@ -46,7 +46,6 @@ fn sort_field_to_u8(f: SortField) -> u8 {
         SortField::Date => 2,
     }
 }
-use crate::viewer::ViewerState;
 
 pub struct App {
     pub panels: [Panel; 2],
@@ -56,6 +55,8 @@ pub struct App {
     pub mode: AppMode,
     pub should_quit: bool,
     pub status_message: Option<String>,
+    status_message_prev: Option<String>,
+    status_message_at: Option<std::time::Instant>,
     pub panel_areas: [Rect; 2],
     pub ci_panel_areas: [Option<Rect>; 2],
     pub shell_panel_areas: [Option<Rect>; 2],
@@ -72,6 +73,10 @@ pub struct App {
     pub search_wrap_dialog: Option<SearchWrapDialog>,
     /// Quit confirmation dialog: true = Quit focused, false = Cancel focused.
     pub quit_confirm: Option<bool>,
+    /// Popup overlay: shown centered, dismissed with any key. (title, message)
+    pub popup: Option<(String, String)>,
+    /// Deferred action to execute after the popup is dismissed (e.g. open editor).
+    popup_after: Option<PathBuf>,
     /// Shared git status cache across panels.
     git_cache: GitCache,
     /// Persistent state (search, paths, sort, etc.)
@@ -90,12 +95,30 @@ pub struct App {
     pub fuzzy_search: [Option<FuzzySearchState>; 2],
     /// Help dialog state (scroll + optional search filter).
     pub help_state: Option<HelpState>,
+    /// Menu bar state (F9 Far Manager style menu).
+    pub menu_state: Option<MenuState>,
+    /// Click ranges for menu titles in header bar: (x_start, x_end) per menu.
+    pub menu_title_ranges: Vec<(u16, u16)>,
+    /// Y coordinate of the header/menu bar (for click detection).
+    pub menu_bar_y: u16,
+    /// Settings dialog: selected item index, or None when closed.
+    pub settings_open: Option<usize>,
     /// Shell panels (one per file panel side, like CI panels).
     pub shell_panels: [Option<TerminalPanel>; 2],
     /// Claude Code panels (one per file panel side, like shell panels).
     pub claude_panels: [Option<TerminalPanel>; 2],
     /// Rendered areas for Claude panels (for click detection and resize).
     pub claude_panel_areas: [Option<Rect>; 2],
+    /// SSH panels (one per file panel side, like shell panels).
+    pub ssh_panels: [Option<TerminalPanel>; 2],
+    /// Rendered areas for SSH panels (for click detection and resize).
+    pub ssh_panel_areas: [Option<Rect>; 2],
+    /// SSH host info for each side (for reconnection on disconnect).
+    pub ssh_hosts: [Option<crate::ssh::SshHost>; 2],
+    /// Whether the SSH dialog is open.
+    pub ssh_dialog: Option<SshDialogState>,
+    /// Session management dialog (tmux sessions).
+    pub session_dialog: Option<SessionDialogState>,
     /// Split ratio per side: percentage for file panel (top). Default 60.
     pub bottom_split_pct: [u16; 2],
     /// Per-side maximize toggle for bottom panels.
@@ -106,6 +129,8 @@ pub struct App {
     pub file_search_side: usize,
     /// File content search dialog.
     pub file_search_dialog: Option<FileSearchDialogState>,
+    /// When set, the help dialog shows contextual rg help instead of normal help.
+    pub file_search_help: Option<FileSearchHelp>,
     /// Overwrite confirmation dialog for Ask-mode copy/move.
     pub overwrite_ask: Option<OverwriteAskState>,
     /// Wakeup sender for the event loop (given to terminal reader threads).
@@ -118,10 +143,24 @@ pub struct App {
     pub dialog_content_area: Option<Rect>,
     /// Background archive progress (shown in status bar).
     pub archive_progress: Option<ArchiveProgress>,
+    /// Pending background remote connection (SMB or WebDAV).
+    pending_remote: Option<PendingRemoteConnect>,
     /// Stashed diff viewer context for F4 editor↔diff toggle.
     pub stashed_diff: Option<StashedDiff>,
-    /// Stashed focus to restore when exiting editor (e.g. back to CI panel).
-    pub stashed_focus: Option<PanelFocus>,
+    /// Focus to restore when closing editor (tracks where we came from).
+    pub pre_editor_focus: Option<PanelFocus>,
+}
+
+/// Result of a background remote connection attempt.
+/// Contains either a boxed RemoteFs implementation or an error.
+struct RemoteConnectResult {
+    result: anyhow::Result<Box<dyn crate::remote_fs::RemoteFs + Send>>,
+}
+
+struct PendingRemoteConnect {
+    rx: std::sync::mpsc::Receiver<RemoteConnectResult>,
+    side: usize,
+    started: std::time::Instant,
 }
 
 pub struct StashedDiff {
@@ -134,6 +173,14 @@ pub struct StashedDiff {
 pub struct HelpState {
     pub scroll: usize,
     pub filter: String,
+}
+
+/// Menu bar state (F9 menu, Far Manager style).
+pub struct MenuState {
+    /// Which top-level menu is open (0..MENU_COUNT-1).
+    pub active_menu: usize,
+    /// Selected item index within the dropdown.
+    pub selected_item: usize,
 }
 
 /// Overwrite confirmation dialog shown during Ask-mode copy/move.
@@ -371,7 +418,6 @@ pub enum AppMode {
     MkdirDialog(MkdirDialogState),
     CopyDialog(CopyDialogState),
     ArchiveDialog(ArchiveDialogState),
-    Viewing(Box<ViewerState>),
     HexViewing(Box<HexViewerState>),
     ParquetViewing(Box<ParquetViewerState>),
     DiffViewing(Box<crate::diff_viewer::DiffViewerState>),
@@ -385,6 +431,7 @@ pub enum PanelFocus {
     Diff(usize),
     Shell(usize),
     Claude(usize),
+    Ssh(usize),
     Search,
 }
 
@@ -440,6 +487,7 @@ impl DialogField {
 pub enum DialogKind {
     ConfirmDelete,
     InputRename,
+    InputCreateFile,
 }
 
 // --- Make folder dialog ---
@@ -588,6 +636,8 @@ pub struct CopyDialogState {
     pub symlink_mode: SymlinkMode,
     pub use_filter: bool,
     pub focused: CopyDialogField,
+    /// Panel index that was active when the dialog was opened (source side).
+    pub source_panel: usize,
 }
 
 impl CopyDialogState {
@@ -596,6 +646,7 @@ impl CopyDialogState {
         source_paths: Vec<PathBuf>,
         destination: String,
         is_move: bool,
+        source_panel: usize,
     ) -> Self {
         Self {
             source_name,
@@ -612,6 +663,7 @@ impl CopyDialogState {
             symlink_mode: SymlinkMode::Smart,
             use_filter: false,
             focused: CopyDialogField::Destination,
+            source_panel,
         }
     }
 
@@ -691,12 +743,50 @@ impl SymlinkMode {
 
 // --- File search dialog ---
 
-#[derive(Clone, Copy, PartialEq)]
+/// Which contextual help to show when F1 is pressed in the file search dialog.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FileSearchHelp {
+    FileTypes,
+    Glob,
+    Field(FileSearchField),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FileSearchField {
-    Path,
+    // Text inputs
     Term,
+    Replace,
+    Path,
     Filter,
+    FileType,
+    TypeExclude,
+    // Search option checkboxes
     Regex,
+    CaseInsensitive,
+    SmartCase,
+    WholeWord,
+    WholeLineMatch,
+    InvertMatch,
+    Multiline,
+    MultilineDotAll,
+    Crlf,
+    // Filter checkboxes
+    Hidden,
+    FollowSymlinks,
+    NoGitignore,
+    Binary,
+    SearchZip,
+    GlobCaseInsensitive,
+    OneFileSystem,
+    TrimWhitespace,
+    // Numeric/text inputs
+    BeforeContext,
+    AfterContext,
+    MaxDepth,
+    MaxCount,
+    MaxFileSize,
+    Encoding,
+    // Buttons
     ButtonSearch,
     ButtonCancel,
 }
@@ -704,10 +794,35 @@ pub enum FileSearchField {
 impl FileSearchField {
     pub fn next(self) -> Self {
         match self {
-            Self::Term => Self::Path,
+            Self::Term => Self::Replace,
+            Self::Replace => Self::Path,
             Self::Path => Self::Filter,
-            Self::Filter => Self::Regex,
-            Self::Regex => Self::ButtonSearch,
+            Self::Filter => Self::FileType,
+            Self::FileType => Self::TypeExclude,
+            Self::TypeExclude => Self::Regex,
+            Self::Regex => Self::CaseInsensitive,
+            Self::CaseInsensitive => Self::SmartCase,
+            Self::SmartCase => Self::WholeWord,
+            Self::WholeWord => Self::WholeLineMatch,
+            Self::WholeLineMatch => Self::InvertMatch,
+            Self::InvertMatch => Self::Multiline,
+            Self::Multiline => Self::MultilineDotAll,
+            Self::MultilineDotAll => Self::Crlf,
+            Self::Crlf => Self::Hidden,
+            Self::Hidden => Self::FollowSymlinks,
+            Self::FollowSymlinks => Self::NoGitignore,
+            Self::NoGitignore => Self::Binary,
+            Self::Binary => Self::SearchZip,
+            Self::SearchZip => Self::GlobCaseInsensitive,
+            Self::GlobCaseInsensitive => Self::OneFileSystem,
+            Self::OneFileSystem => Self::TrimWhitespace,
+            Self::TrimWhitespace => Self::BeforeContext,
+            Self::BeforeContext => Self::AfterContext,
+            Self::AfterContext => Self::MaxDepth,
+            Self::MaxDepth => Self::MaxCount,
+            Self::MaxCount => Self::MaxFileSize,
+            Self::MaxFileSize => Self::Encoding,
+            Self::Encoding => Self::ButtonSearch,
             Self::ButtonSearch => Self::ButtonCancel,
             Self::ButtonCancel => Self::Term,
         }
@@ -715,44 +830,208 @@ impl FileSearchField {
     pub fn prev(self) -> Self {
         match self {
             Self::Term => Self::ButtonCancel,
-            Self::Path => Self::Term,
+            Self::Replace => Self::Term,
+            Self::Path => Self::Replace,
             Self::Filter => Self::Path,
-            Self::Regex => Self::Filter,
-            Self::ButtonSearch => Self::Regex,
+            Self::FileType => Self::Filter,
+            Self::TypeExclude => Self::FileType,
+            Self::Regex => Self::TypeExclude,
+            Self::CaseInsensitive => Self::Regex,
+            Self::SmartCase => Self::CaseInsensitive,
+            Self::WholeWord => Self::SmartCase,
+            Self::WholeLineMatch => Self::WholeWord,
+            Self::InvertMatch => Self::WholeLineMatch,
+            Self::Multiline => Self::InvertMatch,
+            Self::MultilineDotAll => Self::Multiline,
+            Self::Crlf => Self::MultilineDotAll,
+            Self::Hidden => Self::Crlf,
+            Self::FollowSymlinks => Self::Hidden,
+            Self::NoGitignore => Self::FollowSymlinks,
+            Self::Binary => Self::NoGitignore,
+            Self::SearchZip => Self::Binary,
+            Self::GlobCaseInsensitive => Self::SearchZip,
+            Self::OneFileSystem => Self::GlobCaseInsensitive,
+            Self::TrimWhitespace => Self::OneFileSystem,
+            Self::BeforeContext => Self::TrimWhitespace,
+            Self::AfterContext => Self::BeforeContext,
+            Self::MaxDepth => Self::AfterContext,
+            Self::MaxCount => Self::MaxDepth,
+            Self::MaxFileSize => Self::MaxCount,
+            Self::Encoding => Self::MaxFileSize,
+            Self::ButtonSearch => Self::Encoding,
             Self::ButtonCancel => Self::ButtonSearch,
         }
     }
     pub fn is_input(self) -> bool {
-        matches!(self, Self::Path | Self::Term | Self::Filter)
+        matches!(
+            self,
+            Self::Term
+                | Self::Replace
+                | Self::Path
+                | Self::Filter
+                | Self::FileType
+                | Self::TypeExclude
+                | Self::BeforeContext
+                | Self::AfterContext
+                | Self::MaxDepth
+                | Self::MaxCount
+                | Self::MaxFileSize
+                | Self::Encoding
+        )
     }
 }
 
 pub struct FileSearchDialogState {
-    pub path: crate::text_input::TextInput,
+    // Text inputs
     pub term: crate::text_input::TextInput,
+    pub replace: crate::text_input::TextInput,
+    pub path: crate::text_input::TextInput,
     pub filter: crate::text_input::TextInput,
+    pub file_type: crate::text_input::TextInput,
+    pub type_exclude: crate::text_input::TextInput,
+    // Search options
     pub is_regex: bool,
+    pub case_insensitive: bool,
+    pub smart_case: bool,
+    pub whole_word: bool,
+    pub whole_line_match: bool,
+    pub invert_match: bool,
+    pub multiline: bool,
+    pub multiline_dotall: bool,
+    pub crlf: bool,
+    // Filter options
+    pub hidden: bool,
+    pub follow_symlinks: bool,
+    pub no_gitignore: bool,
+    pub binary: bool,
+    pub search_zip: bool,
+    pub glob_case_insensitive: bool,
+    pub one_file_system: bool,
+    pub trim_whitespace: bool,
+    // Numeric/text inputs
+    pub before_context: crate::text_input::TextInput,
+    pub after_context: crate::text_input::TextInput,
+    pub max_depth: crate::text_input::TextInput,
+    pub max_count: crate::text_input::TextInput,
+    pub max_filesize: crate::text_input::TextInput,
+    pub encoding: crate::text_input::TextInput,
+    // Focus
     pub focused: FileSearchField,
+    // Auto-complete for file type fields
+    pub completion_matches: Vec<usize>,
+    pub completion_selected: usize,
+    pub show_completions: bool,
 }
 
 impl FileSearchDialogState {
-    pub fn new(path: String, term: String, filter: String, is_regex: bool) -> Self {
-        Self {
-            path: crate::text_input::TextInput::new(path),
-            term: crate::text_input::TextInput::new(term),
-            filter: crate::text_input::TextInput::new(filter),
-            is_regex,
-            focused: FileSearchField::Term,
+    /// Whether the focused field has an active completion popup.
+    pub fn has_completions(&self) -> bool {
+        self.show_completions
+            && !self.completion_matches.is_empty()
+            && matches!(
+                self.focused,
+                FileSearchField::FileType | FileSearchField::TypeExclude
+            )
+    }
+
+    /// Extract the current token being typed (after the last comma).
+    fn current_token(text: &str) -> &str {
+        text.rsplit(',').next().unwrap_or("").trim()
+    }
+
+    /// Update completion matches based on the current input.
+    pub fn update_completions(&mut self) {
+        let text = match self.focused {
+            FileSearchField::FileType => &self.file_type.text,
+            FileSearchField::TypeExclude => &self.type_exclude.text,
+            _ => {
+                self.show_completions = false;
+                return;
+            }
+        };
+        let token = Self::current_token(text).to_lowercase();
+        if token.is_empty() {
+            self.show_completions = false;
+            self.completion_matches.clear();
+            return;
         }
+        let types = crate::file_search::rg_file_types();
+        self.completion_matches = types
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.name.starts_with(&token))
+            .map(|(i, _)| i)
+            .collect();
+        self.completion_selected = 0;
+        self.show_completions = !self.completion_matches.is_empty();
+    }
+
+    /// Accept the currently selected completion and insert it into the input.
+    pub fn accept_completion(&mut self) {
+        if !self.has_completions() {
+            return;
+        }
+        let types = crate::file_search::rg_file_types();
+        let idx = self.completion_matches[self.completion_selected];
+        let name = &types[idx].name;
+
+        let input = match self.focused {
+            FileSearchField::FileType => &mut self.file_type,
+            FileSearchField::TypeExclude => &mut self.type_exclude,
+            _ => return,
+        };
+
+        // Replace the current token with the selected type name
+        let text = &input.text;
+        let last_comma = text.rfind(',').map(|i| i + 1);
+        let prefix = match last_comma {
+            Some(pos) => {
+                let before = &text[..pos];
+                // Preserve spacing after comma
+                format!("{} ", before.trim_end())
+            }
+            None => String::new(),
+        };
+        let new_text = format!("{}{}", prefix, name);
+        let new_cursor = new_text.len();
+        input.text = new_text;
+        input.cursor = new_cursor;
+        input.anchor = None;
+        self.show_completions = false;
+        self.completion_matches.clear();
     }
 
     pub fn active_input(&mut self) -> Option<&mut crate::text_input::TextInput> {
         match self.focused {
-            FileSearchField::Path => Some(&mut self.path),
             FileSearchField::Term => Some(&mut self.term),
+            FileSearchField::Replace => Some(&mut self.replace),
+            FileSearchField::Path => Some(&mut self.path),
             FileSearchField::Filter => Some(&mut self.filter),
+            FileSearchField::FileType => Some(&mut self.file_type),
+            FileSearchField::TypeExclude => Some(&mut self.type_exclude),
+            FileSearchField::BeforeContext => Some(&mut self.before_context),
+            FileSearchField::AfterContext => Some(&mut self.after_context),
+            FileSearchField::MaxDepth => Some(&mut self.max_depth),
+            FileSearchField::MaxCount => Some(&mut self.max_count),
+            FileSearchField::MaxFileSize => Some(&mut self.max_filesize),
+            FileSearchField::Encoding => Some(&mut self.encoding),
             _ => None,
         }
+    }
+
+    pub fn clear_all_selections(&mut self) {
+        self.term.clear_selection();
+        self.replace.clear_selection();
+        self.path.clear_selection();
+        self.filter.clear_selection();
+        self.file_type.clear_selection();
+        self.type_exclude.clear_selection();
+        self.before_context.clear_selection();
+        self.after_context.clear_selection();
+        self.max_depth.clear_selection();
+        self.max_count.clear_selection();
+        self.max_filesize.clear_selection();
+        self.encoding.clear_selection();
     }
 
     /// Select all text in the newly focused input field.
@@ -760,6 +1039,305 @@ impl FileSearchDialogState {
         if let Some(input) = self.active_input() {
             input.select_all();
         }
+    }
+
+    pub fn toggle_focused(&mut self) {
+        match self.focused {
+            FileSearchField::Regex => self.is_regex = !self.is_regex,
+            FileSearchField::CaseInsensitive => self.case_insensitive = !self.case_insensitive,
+            FileSearchField::SmartCase => self.smart_case = !self.smart_case,
+            FileSearchField::WholeWord => self.whole_word = !self.whole_word,
+            FileSearchField::WholeLineMatch => self.whole_line_match = !self.whole_line_match,
+            FileSearchField::InvertMatch => self.invert_match = !self.invert_match,
+            FileSearchField::Multiline => self.multiline = !self.multiline,
+            FileSearchField::MultilineDotAll => self.multiline_dotall = !self.multiline_dotall,
+            FileSearchField::Crlf => self.crlf = !self.crlf,
+            FileSearchField::Hidden => self.hidden = !self.hidden,
+            FileSearchField::FollowSymlinks => self.follow_symlinks = !self.follow_symlinks,
+            FileSearchField::NoGitignore => self.no_gitignore = !self.no_gitignore,
+            FileSearchField::Binary => self.binary = !self.binary,
+            FileSearchField::SearchZip => self.search_zip = !self.search_zip,
+            FileSearchField::GlobCaseInsensitive => {
+                self.glob_case_insensitive = !self.glob_case_insensitive;
+            }
+            FileSearchField::OneFileSystem => self.one_file_system = !self.one_file_system,
+            FileSearchField::TrimWhitespace => self.trim_whitespace = !self.trim_whitespace,
+            _ => {}
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum RemoteProtocol {
+    Ssh,
+    Sftp,
+    Smb,
+    WebDav,
+    S3,
+    Gcs,
+    AzureBlob,
+    Nfs,
+}
+
+impl RemoteProtocol {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Ssh => "SSH",
+            Self::Sftp => "SFTP",
+            Self::Smb => "SMB",
+            Self::WebDav => "WebDAV",
+            Self::S3 => "S3",
+            Self::Gcs => "GCS",
+            Self::AzureBlob => "Azure",
+            Self::Nfs => "NFS",
+        }
+    }
+    pub fn next(&self) -> Self {
+        match self {
+            Self::Ssh => Self::Sftp,
+            Self::Sftp => Self::Smb,
+            Self::Smb => Self::WebDav,
+            Self::WebDav => Self::S3,
+            Self::S3 => Self::Gcs,
+            Self::Gcs => Self::AzureBlob,
+            Self::AzureBlob => Self::Nfs,
+            Self::Nfs => Self::Ssh,
+        }
+    }
+    pub fn prev(&self) -> Self {
+        match self {
+            Self::Ssh => Self::Nfs,
+            Self::Sftp => Self::Ssh,
+            Self::Smb => Self::Sftp,
+            Self::WebDav => Self::Smb,
+            Self::S3 => Self::WebDav,
+            Self::Gcs => Self::S3,
+            Self::AzureBlob => Self::Gcs,
+            Self::Nfs => Self::AzureBlob,
+        }
+    }
+}
+
+pub struct SshDialogState {
+    pub protocol: RemoteProtocol,
+    /// Input field: for SSH/SFTP = user@host, for SMB = host, for WebDAV = URL.
+    pub input: crate::text_input::TextInput,
+    /// SSH host list (for SSH/SFTP modes).
+    pub hosts: Vec<crate::ssh::SshHost>,
+    /// Pre-lowercased searchable text per host (avoids per-keystroke allocations).
+    hosts_lower: Vec<String>,
+    pub filtered: Vec<usize>,
+    pub selected: usize,
+    /// Saved connections (all protocols). Shown at the top of the dialog.
+    pub saved_connections: Vec<crate::saved_connections::SavedConnection>,
+    /// Index into saved_connections for saved connection selection. None = not in saved mode.
+    pub saved_selected: Option<usize>,
+    /// SMB-specific fields.
+    pub smb_share: crate::text_input::TextInput,
+    pub smb_user: crate::text_input::TextInput,
+    pub smb_pass: crate::text_input::TextInput,
+    /// WebDAV-specific fields.
+    pub webdav_user: crate::text_input::TextInput,
+    pub webdav_pass: crate::text_input::TextInput,
+    /// Focus zone: 0 = protocol selector bar, 1.. = form fields (1-indexed).
+    /// For SSH/SFTP: 1 = input, 2 = host list.
+    /// For SMB: 1 = host, 2 = share, 3 = user, 4 = pass.
+    /// etc.
+    pub field_focus: usize,
+    // S3 fields
+    pub s3_bucket: crate::text_input::TextInput,
+    pub s3_profile: crate::text_input::TextInput,
+    pub s3_endpoint: crate::text_input::TextInput,
+    pub s3_region: crate::text_input::TextInput,
+    // GCS fields
+    pub gcs_bucket: crate::text_input::TextInput,
+    pub gcs_project: crate::text_input::TextInput,
+    // Azure Blob fields
+    pub azure_account: crate::text_input::TextInput,
+    pub azure_container: crate::text_input::TextInput,
+    pub azure_sas: crate::text_input::TextInput,
+    pub azure_conn_str: crate::text_input::TextInput,
+    // NFS fields
+    pub nfs_host: crate::text_input::TextInput,
+    pub nfs_export: crate::text_input::TextInput,
+    pub nfs_options: crate::text_input::TextInput,
+}
+
+impl SshDialogState {
+    pub fn new() -> Self {
+        let hosts = crate::ssh::load_all_hosts();
+        let hosts_lower: Vec<String> = hosts
+            .iter()
+            .map(|h| {
+                let mut s = String::with_capacity(
+                    h.name.len()
+                        + h.hostname.len()
+                        + h.user.as_ref().map(|u| u.len()).unwrap_or(0)
+                        + h.group.as_ref().map(|g| g.len()).unwrap_or(0)
+                        + 3, // separators
+                );
+                s.push_str(&h.name.to_lowercase());
+                s.push(' ');
+                s.push_str(&h.hostname.to_lowercase());
+                if let Some(ref u) = h.user {
+                    s.push(' ');
+                    s.push_str(&u.to_lowercase());
+                }
+                if let Some(ref g) = h.group {
+                    s.push(' ');
+                    s.push_str(&g.to_lowercase());
+                }
+                s
+            })
+            .collect();
+        let filtered: Vec<usize> = (0..hosts.len()).collect();
+        let saved_connections = crate::saved_connections::load_connections();
+        let has_saved = !saved_connections.is_empty();
+        Self {
+            protocol: RemoteProtocol::Ssh,
+            input: crate::text_input::TextInput::new(String::new()),
+            hosts,
+            hosts_lower,
+            filtered,
+            selected: 0,
+            saved_connections,
+            saved_selected: if has_saved { Some(0) } else { None },
+            smb_share: crate::text_input::TextInput::new(String::new()),
+            smb_user: crate::text_input::TextInput::new(String::new()),
+            smb_pass: crate::text_input::TextInput::new(String::new()),
+            webdav_user: crate::text_input::TextInput::new(String::new()),
+            webdav_pass: crate::text_input::TextInput::new(String::new()),
+            field_focus: 1, // Start on first form field (0 = protocol bar)
+            s3_bucket: crate::text_input::TextInput::new(String::new()),
+            s3_profile: crate::text_input::TextInput::new(String::new()),
+            s3_endpoint: crate::text_input::TextInput::new(String::new()),
+            s3_region: crate::text_input::TextInput::new(String::new()),
+            gcs_bucket: crate::text_input::TextInput::new(String::new()),
+            gcs_project: crate::text_input::TextInput::new(String::new()),
+            azure_account: crate::text_input::TextInput::new(String::new()),
+            azure_container: crate::text_input::TextInput::new(String::new()),
+            azure_sas: crate::text_input::TextInput::new(String::new()),
+            azure_conn_str: crate::text_input::TextInput::new(String::new()),
+            nfs_host: crate::text_input::TextInput::new(String::new()),
+            nfs_export: crate::text_input::TextInput::new(String::new()),
+            nfs_options: crate::text_input::TextInput::new(String::new()),
+        }
+    }
+
+    pub fn update_filter(&mut self) {
+        let query = self.input.text.to_lowercase();
+        if query.is_empty() {
+            self.filtered = (0..self.hosts.len()).collect();
+        } else {
+            self.filtered = self
+                .hosts_lower
+                .iter()
+                .enumerate()
+                .filter(|(_, lower)| lower.contains(&*query))
+                .map(|(i, _)| i)
+                .collect();
+        }
+        self.selected = 0;
+    }
+
+    pub fn selected_host(&self) -> Option<&crate::ssh::SshHost> {
+        self.filtered
+            .get(self.selected)
+            .and_then(|&i| self.hosts.get(i))
+    }
+
+    /// Get the active text input for the current protocol/field (mutable).
+    /// When field_focus == 0 (protocol bar), returns the first form field.
+    pub fn active_input_mut(&mut self) -> &mut crate::text_input::TextInput {
+        let f = self.field_focus.saturating_sub(1); // 0-based form field index
+        match self.protocol {
+            RemoteProtocol::Ssh | RemoteProtocol::Sftp => &mut self.input,
+            RemoteProtocol::Smb => match f {
+                0 => &mut self.input,
+                1 => &mut self.smb_share,
+                2 => &mut self.smb_user,
+                _ => &mut self.smb_pass,
+            },
+            RemoteProtocol::WebDav => match f {
+                0 => &mut self.input,
+                1 => &mut self.webdav_user,
+                _ => &mut self.webdav_pass,
+            },
+            RemoteProtocol::S3 => match f {
+                0 => &mut self.s3_bucket,
+                1 => &mut self.s3_profile,
+                2 => &mut self.s3_endpoint,
+                _ => &mut self.s3_region,
+            },
+            RemoteProtocol::Gcs => match f {
+                0 => &mut self.gcs_bucket,
+                _ => &mut self.gcs_project,
+            },
+            RemoteProtocol::AzureBlob => match f {
+                0 => &mut self.azure_account,
+                1 => &mut self.azure_container,
+                2 => &mut self.azure_sas,
+                _ => &mut self.azure_conn_str,
+            },
+            RemoteProtocol::Nfs => match f {
+                0 => &mut self.nfs_host,
+                1 => &mut self.nfs_export,
+                _ => &mut self.nfs_options,
+            },
+        }
+    }
+
+    /// Total number of focus zones: 1 (protocol bar) + N (form fields).
+    pub fn max_fields(&self) -> usize {
+        1 + match self.protocol {
+            RemoteProtocol::Ssh | RemoteProtocol::Sftp => {
+                // input + host list (skip host list if empty)
+                if self.filtered.is_empty() {
+                    1
+                } else {
+                    2
+                }
+            }
+            RemoteProtocol::Smb | RemoteProtocol::AzureBlob | RemoteProtocol::S3 => 4,
+            RemoteProtocol::WebDav | RemoteProtocol::Nfs => 3,
+            RemoteProtocol::Gcs => 2,
+        }
+    }
+
+    /// Whether the protocol selector bar has focus.
+    pub fn on_protocol_bar(&self) -> bool {
+        self.field_focus == 0
+    }
+}
+
+pub struct SessionDialogState {
+    pub sessions: Vec<crate::session::MmSession>,
+    pub selected: usize,
+    pub input: crate::text_input::TextInput,
+    /// True when the user is in "create new session" input mode.
+    pub creating: bool,
+}
+
+impl SessionDialogState {
+    pub fn new() -> Self {
+        let sessions = crate::session::list_sessions();
+        Self {
+            sessions,
+            selected: 0,
+            input: crate::text_input::TextInput::new(String::new()),
+            creating: false,
+        }
+    }
+
+    pub fn refresh(&mut self) {
+        self.sessions = crate::session::list_sessions();
+        if self.selected >= self.sessions.len() && !self.sessions.is_empty() {
+            self.selected = self.sessions.len() - 1;
+        }
+    }
+
+    pub fn selected_session(&self) -> Option<&crate::session::MmSession> {
+        self.sessions.get(self.selected)
     }
 }
 
@@ -920,6 +1498,12 @@ pub struct ArchiveProgress {
 impl App {
     pub fn new() -> Self {
         let persisted = AppState::load();
+
+        // Clean up stale temp files from previous remote editing sessions
+        let tmp_edit_dir = std::env::temp_dir().join("middle-manager-edit");
+        if tmp_edit_dir.exists() {
+            let _ = std::fs::remove_dir_all(&tmp_edit_dir);
+        }
         let cwd = env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
 
         // Restore panel paths from saved state, fall back to cwd
@@ -962,6 +1546,8 @@ impl App {
             mode: AppMode::Normal,
             should_quit: false,
             status_message: None,
+            status_message_prev: None,
+            status_message_at: None,
             panel_areas: [Rect::default(); 2],
             ci_panel_areas: [None, None],
             shell_panel_areas: [None, None],
@@ -978,25 +1564,38 @@ impl App {
             diff_panels: [None, None],
             diff_panel_areas: [None, None],
             quit_confirm: None,
+            popup: None,
+            popup_after: None,
             goto_path: [None, None],
             fuzzy_search: [None, None],
             help_state: None,
+            menu_state: None,
+            menu_title_ranges: Vec::new(),
+            menu_bar_y: 0,
+            settings_open: None,
             shell_panels: [None, None],
             claude_panels: [None, None],
             claude_panel_areas: [None, None],
+            ssh_panels: [None, None],
+            ssh_panel_areas: [None, None],
+            ssh_hosts: [None, None],
+            ssh_dialog: None,
+            session_dialog: None,
             bottom_split_pct: [SPLIT_DEFAULT_PCT, SPLIT_DEFAULT_PCT],
             bottom_maximized: [false, false],
             file_search: None,
             file_search_side: 1,
             file_search_dialog: None,
+            file_search_help: None,
             overwrite_ask: None,
             wakeup_sender: None,
             last_cursor_pos: None,
             dirty: true,
             dialog_content_area: None,
             archive_progress: None,
+            pending_remote: None,
             stashed_diff: None,
-            stashed_focus: None,
+            pre_editor_focus: None,
         }
     }
 
@@ -1071,6 +1670,31 @@ impl App {
                             self.bottom_split_pct[side] = self.persisted.split_pct_claude;
                         }
                     }
+                    "ssh" => {
+                        // Restore SSH host info (panel stays None until user reconnects)
+                        let host_name = if side == 0 {
+                            self.persisted.ssh_host_left.as_deref()
+                        } else {
+                            self.persisted.ssh_host_right.as_deref()
+                        };
+                        if let Some(name) = host_name {
+                            // Try to find the host in saved/config hosts
+                            let hosts = crate::ssh::load_all_hosts();
+                            if let Some(host) = hosts.into_iter().find(|h| h.name == name) {
+                                // Auto-connect on restore
+                                if let Ok(tp) = TerminalPanel::spawn_ssh(
+                                    &host,
+                                    area_width,
+                                    area_height,
+                                    wakeup.clone(),
+                                ) {
+                                    self.ssh_panels[side] = Some(tp);
+                                    self.ssh_hosts[side] = Some(host);
+                                    self.bottom_split_pct[side] = self.persisted.split_pct_ssh;
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1111,6 +1735,16 @@ impl App {
                     self.persisted.claude_dir_left = dir;
                 } else {
                     self.persisted.claude_dir_right = dir;
+                }
+            }
+            if self.ssh_panels[side].is_some() || self.ssh_hosts[side].is_some() {
+                self.persisted.split_pct_ssh = pct;
+                panels.push("ssh");
+                let host_name = self.ssh_hosts[side].as_ref().map(|h| h.name.clone());
+                if side == 0 {
+                    self.persisted.ssh_host_left = host_name;
+                } else {
+                    self.persisted.ssh_host_right = host_name;
                 }
             }
             if side == 0 {
@@ -1178,13 +1812,109 @@ impl App {
         &mut self.panels[self.active_panel]
     }
 
+    /// Delete a path using the appropriate backend for the active panel.
+    fn remote_delete(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        match &self.panels[self.active_panel].source {
+            crate::panel::PanelSource::Local => fs_ops::delete_entry(path),
+            crate::panel::PanelSource::Remote { connection } => connection.remove_recursive(path),
+        }
+    }
+
+    /// Create a directory using the appropriate backend for the active panel.
+    /// Create an empty file using the appropriate backend.
+    fn remote_create_file(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        match &self.panels[self.active_panel].source {
+            crate::panel::PanelSource::Local => {
+                std::fs::File::create(path)?;
+                Ok(())
+            }
+            crate::panel::PanelSource::Remote { connection } => {
+                // For remote: create a temp empty file, upload it, delete the temp
+                let tmp = std::env::temp_dir().join(format!(
+                    "mm-touch-{}-{}",
+                    std::process::id(),
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_nanos()
+                ));
+                std::fs::File::create(&tmp)?;
+                let result = connection.upload(&tmp, path);
+                let _ = std::fs::remove_file(&tmp);
+                result.map(|_| ())
+            }
+        }
+    }
+
+    fn remote_mkdir(&self, path: &std::path::Path) -> anyhow::Result<()> {
+        match &self.panels[self.active_panel].source {
+            crate::panel::PanelSource::Local => {
+                std::fs::create_dir_all(path)?;
+                Ok(())
+            }
+            crate::panel::PanelSource::Remote { connection } => connection.mkdir(path),
+        }
+    }
+
+    /// Rename a path using the appropriate backend for the active panel.
+    fn remote_rename(&self, src: &std::path::Path, dst: &std::path::Path) -> anyhow::Result<()> {
+        match &self.panels[self.active_panel].source {
+            crate::panel::PanelSource::Local => {
+                std::fs::rename(src, dst)?;
+                Ok(())
+            }
+            crate::panel::PanelSource::Remote { connection } => connection.rename(src, dst),
+        }
+    }
+
+    /// Download a remote file/dir to local. Returns bytes transferred.
+    fn remote_download(
+        &self,
+        side: usize,
+        remote: &std::path::Path,
+        local: &std::path::Path,
+        is_dir: bool,
+    ) -> anyhow::Result<u64> {
+        match &self.panels[side].source {
+            crate::panel::PanelSource::Remote { connection } => {
+                if is_dir {
+                    connection.download_dir(remote, local)
+                } else {
+                    connection.download(remote, local)
+                }
+            }
+            _ => anyhow::bail!("Not a remote panel"),
+        }
+    }
+
+    /// Upload a local file/dir to remote. Returns bytes transferred.
+    fn remote_upload(
+        &self,
+        side: usize,
+        local: &std::path::Path,
+        remote: &std::path::Path,
+        is_dir: bool,
+    ) -> anyhow::Result<u64> {
+        match &self.panels[side].source {
+            crate::panel::PanelSource::Remote { connection } => {
+                if is_dir {
+                    connection.upload_dir(local, remote)
+                } else {
+                    connection.upload(local, remote)
+                }
+            }
+            _ => anyhow::bail!("Not a remote panel"),
+        }
+    }
+
     /// Which side (0 or 1) the focused bottom panel is on, or active_panel if no bottom panel focused.
     fn focused_side(&self) -> usize {
         match self.focus {
             PanelFocus::Ci(s)
             | PanelFocus::Diff(s)
             | PanelFocus::Shell(s)
-            | PanelFocus::Claude(s) => s,
+            | PanelFocus::Claude(s)
+            | PanelFocus::Ssh(s) => s,
             _ => self.active_panel,
         }
     }
@@ -1251,6 +1981,21 @@ impl App {
             };
         }
 
+        // Menu bar intercepts keys
+        if self.menu_state.is_some() {
+            return match key.code {
+                KeyCode::Esc | KeyCode::F(9) => Action::DialogCancel,
+                KeyCode::Left => Action::CursorLeft,
+                KeyCode::Right => Action::CursorRight,
+                KeyCode::Up => Action::MoveUp,
+                KeyCode::Down => Action::MoveDown,
+                KeyCode::Home => Action::MoveToTop,
+                KeyCode::End => Action::MoveToBottom,
+                KeyCode::Enter => Action::DialogConfirm,
+                _ => Action::None,
+            };
+        }
+
         // Goto-line prompt intercepts keys
         if self.goto_line_input.is_some() {
             return match key.code {
@@ -1311,21 +2056,28 @@ impl App {
         // File content search dialog intercepts keys
         if let Some(ref state) = self.file_search_dialog {
             let focused = state.focused;
+            let has_comp = state.has_completions();
             let on_buttons = matches!(
                 focused,
                 FileSearchField::ButtonSearch | FileSearchField::ButtonCancel
             );
             return match key.code {
+                // F1 shows contextual help for the focused field
+                KeyCode::F(1) if !on_buttons => Action::ShowHelp,
+                // When completion popup is visible, intercept nav keys
+                KeyCode::Esc if has_comp => Action::Toggle, // dismiss completions
+                KeyCode::Up if has_comp => Action::MoveUp,
+                KeyCode::Down if has_comp => Action::MoveDown,
+                KeyCode::Tab if has_comp => Action::DialogConfirm,
+                KeyCode::Enter if has_comp => Action::DialogConfirm,
+                // Normal dialog keys
                 KeyCode::Esc => Action::DialogCancel,
                 KeyCode::Enter => Action::DialogConfirm,
-                KeyCode::Tab => Action::MoveDown,
-                KeyCode::BackTab => Action::MoveUp,
-                KeyCode::Up if !focused.is_input() || on_buttons => Action::MoveUp,
-                KeyCode::Down if on_buttons => Action::None,
-                KeyCode::Down if !focused.is_input() => Action::MoveDown,
+                KeyCode::Tab | KeyCode::Down => Action::MoveDown,
+                KeyCode::BackTab | KeyCode::Up => Action::MoveUp,
                 KeyCode::Left if on_buttons => Action::SwitchPanel,
                 KeyCode::Right if on_buttons => Action::SwitchPanel,
-                KeyCode::Char(' ') if focused == FileSearchField::Regex => Action::Toggle,
+                KeyCode::Char(' ') if !focused.is_input() && !on_buttons => Action::Toggle,
                 // Text input with selection, undo/redo, cut support
                 KeyCode::Char('z')
                     if focused.is_input()
@@ -1465,11 +2217,42 @@ impl App {
             };
         }
 
+        // Settings dialog intercepts keys when open
+        if self.settings_open.is_some() {
+            return match key.code {
+                KeyCode::F(1) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Action::ToggleSettings
+                }
+                KeyCode::Esc => Action::DialogCancel,
+                KeyCode::Up => Action::MoveUp,
+                KeyCode::Down => Action::MoveDown,
+                KeyCode::Left => Action::CursorLeft,
+                KeyCode::Right => Action::CursorRight,
+                KeyCode::Char(' ') => Action::Toggle,
+                KeyCode::Enter => Action::Enter,
+                _ => Action::None,
+            };
+        }
+
         // Bottom panel focus intercepts only in normal/quick-search modes
         // (full-screen modes like DiffViewing/Editing map their own keys via AppMode match below)
         if matches!(self.mode, AppMode::Normal | AppMode::QuickSearch) {
+            // Shift+F1 opens settings from any panel
+            if key.code == KeyCode::F(1) && key.modifiers.contains(KeyModifiers::SHIFT) {
+                return Action::ToggleSettings;
+            }
+
             // Claude panel intercepts keys when focused
-            if matches!(self.focus, PanelFocus::Claude(_)) {
+            if let PanelFocus::Claude(side) = self.focus {
+                // Ctrl+C copies selection if any, otherwise sends SIGINT
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    let has_sel = self.claude_panels[side]
+                        .as_ref()
+                        .is_some_and(|tp| tp.selection_range().is_some());
+                    if has_sel {
+                        return Action::CopySelection;
+                    }
+                }
                 return match key.code {
                     KeyCode::F(5) => Action::TerminalOpenFile,
                     KeyCode::F(12) => Action::ToggleClaude,
@@ -1483,7 +2266,7 @@ impl App {
             if self.focus == PanelFocus::Search && self.file_search.is_some() {
                 return match key.code {
                     KeyCode::Esc => Action::DialogCancel,
-                    KeyCode::Enter => Action::DialogConfirm,
+                    KeyCode::Enter | KeyCode::F(4) => Action::DialogConfirm,
                     KeyCode::Up => Action::MoveUp,
                     KeyCode::Down => Action::MoveDown,
                     KeyCode::PageUp => Action::PageUp,
@@ -1495,17 +2278,53 @@ impl App {
                     KeyCode::Tab => Action::SwitchPanel,
                     KeyCode::BackTab => Action::SwitchPanelReverse,
                     KeyCode::F(10) => Action::Quit,
+                    // Type to filter within results
+                    KeyCode::Char(c) => Action::DialogInput(c),
+                    KeyCode::Backspace => Action::DialogBackspace,
                     _ => Action::None,
                 };
             }
 
             // Shell panel intercepts keys when focused
-            if matches!(self.focus, PanelFocus::Shell(_)) {
+            if let PanelFocus::Shell(side) = self.focus {
+                // Ctrl+C copies selection if any, otherwise sends SIGINT
+                if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
+                    let has_sel = self.shell_panels[side]
+                        .as_ref()
+                        .is_some_and(|sp| sp.selection_range().is_some());
+                    if has_sel {
+                        return Action::CopySelection;
+                    }
+                }
                 return match key.code {
                     KeyCode::F(1) => Action::SwitchPanel,
                     KeyCode::F(10) => Action::Quit,
                     KeyCode::Char('o') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                         Action::ToggleShell
+                    }
+                    KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                        Action::BottomResizeUp
+                    }
+                    KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                        Action::BottomResizeDown
+                    }
+                    KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                        Action::BottomMaximize
+                    }
+                    _ => Action::TerminalInput(crate::terminal::encode_key_event(key)),
+                };
+            }
+
+            // SSH panel intercepts keys when focused
+            if matches!(self.focus, PanelFocus::Ssh(_)) {
+                return match key.code {
+                    KeyCode::F(1) => Action::SwitchPanel,
+                    KeyCode::F(10) => Action::Quit,
+                    KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Action::ToggleSsh
+                    }
+                    KeyCode::F(2) if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                        Action::ToggleSsh
                     }
                     KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
                         Action::BottomResizeUp
@@ -1542,9 +2361,18 @@ impl App {
                     KeyCode::Right => Action::CursorRight,
                     KeyCode::Left => Action::GoUp,
                     KeyCode::Char('o') => Action::OpenPr,
+                    KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        Action::ExtractCiFailures
+                    }
                     KeyCode::Tab => Action::SwitchPanel,
                     KeyCode::BackTab => Action::SwitchPanelReverse,
-                    KeyCode::F(2) => Action::ToggleCi,
+                    KeyCode::F(2) => {
+                        if key.modifiers.contains(KeyModifiers::SHIFT) {
+                            Action::ToggleSsh
+                        } else {
+                            Action::ToggleCi
+                        }
+                    }
                     KeyCode::F(10) => Action::Quit,
                     _ => Action::None,
                 };
@@ -1587,6 +2415,110 @@ impl App {
             }
         }
 
+        // Session dialog intercepts keys when open
+        if let Some(ref dialog) = self.session_dialog {
+            if dialog.creating {
+                return match key.code {
+                    KeyCode::Esc => Action::DialogCancel,
+                    KeyCode::Enter => Action::DialogConfirm,
+                    KeyCode::Backspace => Action::DialogBackspace,
+                    KeyCode::Char(c) => Action::DialogInput(c),
+                    _ => Action::None,
+                };
+            }
+            return match key.code {
+                KeyCode::Esc => Action::DialogCancel,
+                KeyCode::Enter => Action::DialogConfirm,
+                KeyCode::Up => Action::MoveUp,
+                KeyCode::Down => Action::MoveDown,
+                KeyCode::Char('n') => Action::CreateDir, // reuse as "new"
+                KeyCode::Char('d') | KeyCode::Delete => Action::Delete,
+                _ => Action::None,
+            };
+        }
+
+        // Remote connect dialog intercepts keys when open
+        if let Some(ref dialog) = self.ssh_dialog {
+            // Saved connections browsing mode
+            if dialog.saved_selected.is_some() {
+                return match key.code {
+                    KeyCode::Esc => Action::DialogCancel,
+                    KeyCode::Enter => Action::DialogConfirm,
+                    KeyCode::Up => Action::MoveUp,
+                    KeyCode::Down => Action::MoveDown,
+                    KeyCode::Tab => Action::Toggle, // Switch to protocol input mode
+                    KeyCode::Delete => Action::Delete, // Delete saved connection
+                    KeyCode::F(2) => Action::EditorSave, // Save current fields
+                    _ => Action::None,
+                };
+            }
+
+            let on_bar = dialog.on_protocol_bar();
+
+            let in_form = !on_bar;
+            return match key.code {
+                KeyCode::Esc => Action::DialogCancel,
+                KeyCode::Enter => Action::DialogConfirm,
+                // On protocol bar: Left/Right switch protocol
+                KeyCode::Left if on_bar => Action::SwitchPanelReverse,
+                KeyCode::Right if on_bar => Action::SwitchPanel,
+                // Alt+Left/Right always switch protocol
+                KeyCode::Left if key.modifiers.contains(KeyModifiers::ALT) => {
+                    Action::SwitchPanelReverse
+                }
+                KeyCode::Right if key.modifiers.contains(KeyModifiers::ALT) => Action::SwitchPanel,
+                // Text editing: undo/redo, cut, select-all, copy
+                KeyCode::Char('z')
+                    if in_form
+                        && key.modifiers.contains(KeyModifiers::CONTROL)
+                        && key.modifiers.contains(KeyModifiers::SHIFT) =>
+                {
+                    Action::EditorRedo
+                }
+                KeyCode::Char('z') if in_form && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::EditorUndo
+                }
+                KeyCode::Char('x') if in_form && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::EditorDeleteLine
+                }
+                KeyCode::Char('a') if in_form && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::SelectAll
+                }
+                KeyCode::Char('c') if in_form && key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    Action::CopySelection
+                }
+                // Selection: Shift+arrow/Home/End
+                KeyCode::Left if in_form && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Action::SelectLeft
+                }
+                KeyCode::Right if in_form && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Action::SelectRight
+                }
+                KeyCode::Home if in_form && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Action::SelectLineStart
+                }
+                KeyCode::End if in_form && key.modifiers.contains(KeyModifiers::SHIFT) => {
+                    Action::SelectLineEnd
+                }
+                // Cursor movement
+                KeyCode::Left => Action::CursorLeft,
+                KeyCode::Right => Action::CursorRight,
+                KeyCode::Home if in_form => Action::CursorLineStart,
+                KeyCode::End if in_form => Action::CursorLineEnd,
+                KeyCode::Delete if in_form => Action::EditorDeleteForward,
+                // Tab/BackTab cycle focus zones: protocol bar → form fields → back to bar
+                KeyCode::Tab => Action::Toggle,
+                KeyCode::BackTab => Action::ToggleReverse,
+                // Up/Down: navigate within current zone (host list for SSH/SFTP)
+                KeyCode::Up => Action::MoveUp,
+                KeyCode::Down => Action::MoveDown,
+                KeyCode::Backspace => Action::DialogBackspace,
+                KeyCode::F(2) => Action::EditorSave, // Save current fields
+                KeyCode::Char(c) => Action::DialogInput(c),
+                _ => Action::None,
+            };
+        }
+
         // Search wrap dialog intercepts keys when active
         if self.search_wrap_dialog.is_some() {
             return match key.code {
@@ -1611,7 +2543,7 @@ impl App {
             AppMode::MkdirDialog(state) => Self::map_mkdir_dialog_key(key, state.focused),
             AppMode::CopyDialog(state) => Self::map_copy_dialog_key(key, state.focused),
             AppMode::ArchiveDialog(state) => Self::map_archive_dialog_key(key, state.focused),
-            AppMode::Viewing(_) | AppMode::HexViewing(_) => self.map_viewer_key(key),
+            AppMode::HexViewing(_) => Self::map_hex_editor_key(key),
             AppMode::ParquetViewing(_) => self.map_parquet_key(key),
             AppMode::DiffViewing(ref d) => {
                 if d.search_input.is_some() {
@@ -1644,8 +2576,20 @@ impl App {
             KeyCode::Backspace => Action::GoUp,
             KeyCode::Tab => Action::SwitchPanel,
             KeyCode::BackTab => Action::SwitchPanelReverse,
-            KeyCode::F(1) => Action::ShowHelp,
-            KeyCode::F(3) => Action::ViewFile,
+            KeyCode::F(1) => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    Action::ToggleSettings
+                } else {
+                    Action::ShowHelp
+                }
+            }
+            KeyCode::F(3) => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    Action::ViewFile
+                } else {
+                    Action::CalcSize
+                }
+            }
             KeyCode::F(4) => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
                     Action::EditFile // external $EDITOR
@@ -1667,11 +2611,29 @@ impl App {
                     Action::Move
                 }
             }
-            KeyCode::F(7) => Action::CreateDir,
+            KeyCode::F(7) => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    Action::CreateFile
+                } else {
+                    Action::CreateDir
+                }
+            }
             KeyCode::F(8) => Action::Delete,
-            KeyCode::F(9) => Action::CycleSort,
+            KeyCode::F(9) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    Action::CycleSort
+                } else {
+                    Action::OpenMenu
+                }
+            }
             KeyCode::F(10) => Action::Quit,
-            KeyCode::F(2) => Action::ToggleCi,
+            KeyCode::F(2) => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    Action::ToggleSsh
+                } else {
+                    Action::ToggleCi
+                }
+            }
             KeyCode::F(11) => Action::OpenPr,
             KeyCode::F(12) => Action::ToggleClaude,
             KeyCode::Char('q') if key.modifiers.contains(KeyModifiers::CONTROL) => Action::Quit,
@@ -1688,6 +2650,12 @@ impl App {
             }
             KeyCode::Char('s') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::FileSearchPrompt
+            }
+            KeyCode::Char('t') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::ToggleSsh
+            }
+            KeyCode::Char('y') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                Action::ToggleSessions
             }
             KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 Action::ToggleDiff
@@ -2100,24 +3068,50 @@ impl App {
         }
     }
 
-    fn map_viewer_key(&self, key: KeyEvent) -> Action {
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
+    fn map_hex_editor_key(key: KeyEvent) -> Action {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        if ctrl {
+            return match key.code {
+                KeyCode::Char('s') => Action::EditorSave,
+                KeyCode::Char('c') => Action::CopySelection,
+                KeyCode::Char('a') => Action::SelectAll,
+                KeyCode::Char('f') => Action::SearchPrompt,
+                KeyCode::Char('g') => Action::GotoLinePrompt,
+                KeyCode::Char('z') if shift => Action::EditorRedo,
+                KeyCode::Char('z') => Action::EditorUndo,
+                KeyCode::Char('q') => Action::DialogCancel,
+                KeyCode::Home | KeyCode::Up => Action::MoveToTop,
+                KeyCode::End | KeyCode::Down => Action::MoveToBottom,
+                _ => Action::None,
+            };
+        }
         match key.code {
-            // Opt+a/e on Mac → top/bottom of file (reliable across all terminals)
-            KeyCode::Char('a') if alt => Action::MoveToTop,
-            KeyCode::Char('e') if alt => Action::MoveToBottom,
+            KeyCode::Up if shift => Action::SelectUp,
+            KeyCode::Down if shift => Action::SelectDown,
+            KeyCode::Left if shift => Action::SelectLeft,
+            KeyCode::Right if shift => Action::SelectRight,
+            KeyCode::PageUp if shift => Action::SelectPageUp,
+            KeyCode::PageDown if shift => Action::SelectPageDown,
             KeyCode::Up => Action::MoveUp,
             KeyCode::Down => Action::MoveDown,
+            KeyCode::Left => Action::CursorLeft,
+            KeyCode::Right => Action::CursorRight,
+            KeyCode::Home => Action::CursorLineStart,
+            KeyCode::End => Action::CursorLineEnd,
             KeyCode::PageUp => Action::PageUp,
             KeyCode::PageDown => Action::PageDown,
-            KeyCode::Home => Action::MoveToTop,
-            KeyCode::End => Action::MoveToBottom,
-            KeyCode::Tab | KeyCode::F(4) => Action::Toggle, // switch text <-> hex
+            KeyCode::Tab => Action::Toggle,
+            KeyCode::F(2) => Action::EditorSave,
+            KeyCode::F(1) if shift => Action::ToggleSettings,
+            KeyCode::F(7) if shift => Action::FindNext,
+            KeyCode::F(7) => Action::SearchPrompt,
+            KeyCode::F(10) => Action::Quit,
             KeyCode::Char('g') => Action::GotoLinePrompt,
-            KeyCode::Char('f') => Action::SearchPrompt,
             KeyCode::Char('n') => Action::FindNext,
-            KeyCode::Char('b') => Action::FindPrev,
-            KeyCode::Char('q') | KeyCode::Esc => Action::DialogCancel,
+            KeyCode::Char('N') => Action::WordLeft, // reuse for find-prev
+            KeyCode::Esc | KeyCode::Char('q') => Action::DialogCancel,
+            KeyCode::Char(c) => Action::DialogInput(c),
             _ => Action::None,
         }
     }
@@ -2154,6 +3148,7 @@ impl App {
             KeyCode::Char('N') => Action::WordLeft,
             KeyCode::Char('g') => Action::GotoLinePrompt,
             KeyCode::Tab => Action::SwitchPanel,
+            KeyCode::F(1) if shift => Action::ToggleSettings,
             KeyCode::F(4) => Action::EditBuiltin,
             KeyCode::Char('q') | KeyCode::Esc => Action::DialogCancel,
             _ => Action::None,
@@ -2175,7 +3170,7 @@ impl App {
             KeyCode::PageDown => Action::PageDown,
             KeyCode::Home => Action::MoveToTop,
             KeyCode::End => Action::MoveToBottom,
-            KeyCode::Tab | KeyCode::F(4) => Action::Toggle,
+            KeyCode::Tab => Action::Toggle,
             KeyCode::Char('g') => Action::GotoLinePrompt,
             KeyCode::Char('q') | KeyCode::Esc => Action::DialogCancel,
             _ => Action::None,
@@ -2250,6 +3245,23 @@ impl App {
 
     /// Poll all async data sources. Called once per tick/resize, before input dispatch.
     fn poll_async(&mut self) {
+        // Auto-clear status messages after 5 seconds of no update.
+        // Reset timer when message content changes (for progress updates).
+        if self.status_message != self.status_message_prev {
+            self.status_message_at = self
+                .status_message
+                .as_ref()
+                .map(|_| std::time::Instant::now());
+            self.status_message_prev = self.status_message.clone();
+        }
+        if let Some(at) = self.status_message_at {
+            if at.elapsed() > std::time::Duration::from_secs(5) {
+                self.status_message = None;
+                self.status_message_prev = None;
+                self.status_message_at = None;
+            }
+        }
+
         // Mark dirty if any async data sources are active
         let has_active_async = self.ci_panels.iter().any(|c| c.is_some())
             || self.diff_panels.iter().any(|d| d.is_some())
@@ -2259,9 +3271,20 @@ impl App {
                 .map(|s| s.searching)
                 .unwrap_or(false)
             || self.git_cache.has_pending()
-            || self.archive_progress.is_some();
+            || self.archive_progress.is_some()
+            || self.pending_remote.is_some()
+            || self.panels[0].has_pending_size_calcs()
+            || self.panels[1].has_pending_size_calcs();
         if has_active_async {
             self.dirty = true;
+        }
+
+        // Poll directory size calculations
+        for panel in &mut self.panels {
+            panel.poll_dir_sizes();
+            if let Some(msg) = panel.check_size_total() {
+                self.status_message = Some(msg);
+            }
         }
         if let Some(ref w) = self.dir_watcher {
             if w.has_changes() {
@@ -2269,7 +3292,7 @@ impl App {
             }
         }
 
-        // Poll CI panels for async results and downloads
+        // Poll CI panels for async results, downloads, and failure extraction
         for (side, ci) in self.ci_panels.iter_mut().enumerate() {
             let Some(ci) = ci else { continue };
             ci.poll();
@@ -2277,7 +3300,7 @@ impl App {
                 match result {
                     Ok(path) => {
                         // Remember the CI focus so we can restore it when the editor closes.
-                        self.stashed_focus = Some(PanelFocus::Ci(side));
+                        self.pre_editor_focus = Some(PanelFocus::Ci(side));
                         self.focus = PanelFocus::FilePanel;
                         self.mode =
                             AppMode::Editing(Box::new(crate::editor::EditorState::open(path)));
@@ -2286,6 +3309,69 @@ impl App {
                     Err(e) => {
                         self.status_message = Some(format!("Download failed: {}", e));
                     }
+                }
+            }
+            // Poll failure extraction
+            if let Some(ref mut extraction) = ci.failure_extraction {
+                if let Some(result) = extraction.poll() {
+                    let repo = ci.repo.clone();
+                    let pr_number = ci.pr_number;
+                    ci.failure_extraction = None;
+                    match result {
+                        Ok(failures) => {
+                            let output_path = std::env::temp_dir()
+                                .join(format!("mm-ci-failures-{}.md", std::process::id()));
+                            match crate::ci::write_failures_file(
+                                &output_path,
+                                &failures,
+                                &repo,
+                                pr_number,
+                            ) {
+                                Ok(()) => {
+                                    // Build a summary for the popup
+                                    let unique: std::collections::HashSet<&str> =
+                                        failures.iter().map(|f| f.test_name.as_str()).collect();
+                                    let mut by_check: std::collections::BTreeMap<&str, usize> =
+                                        std::collections::BTreeMap::new();
+                                    for f in &failures {
+                                        *by_check.entry(&f.check_name).or_default() += 1;
+                                    }
+                                    let mut summary = String::new();
+                                    if failures.is_empty() {
+                                        summary.push_str("No test failures found in the logs.\n\nThe failed checks may not contain\nrecognizable test output.");
+                                    } else {
+                                        summary.push_str(&format!(
+                                            "{} unique failure(s) across {} check(s):\n",
+                                            unique.len(),
+                                            by_check.len()
+                                        ));
+                                        for (check, count) in &by_check {
+                                            summary.push_str(&format!(
+                                                "\n  {} ({} failure{})",
+                                                check,
+                                                count,
+                                                if *count == 1 { "" } else { "s" }
+                                            ));
+                                        }
+                                        summary.push_str("\n\nPress any key to view full report.");
+                                    }
+                                    self.popup =
+                                        Some(("CI Failure Extraction".to_string(), summary));
+                                    self.popup_after = Some(output_path);
+                                    return;
+                                }
+                                Err(e) => {
+                                    self.status_message = Some(format!("Failed to write: {}", e));
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            self.status_message = Some(format!("Extraction failed: {}", e));
+                        }
+                    }
+                } else {
+                    // Still in progress -- show status
+                    self.status_message = Some(extraction.progress.clone());
                 }
             }
         }
@@ -2319,6 +3405,17 @@ impl App {
                 }
             }
         }
+        // Poll SSH panels (keep alive on exit for reconnect)
+        for side in 0..2 {
+            if let Some(ref mut sp) = self.ssh_panels[side] {
+                sp.poll();
+                // Don't remove on exit — keep panel alive with scrollback for reconnect.
+                // The title is updated to show "[Disconnected]".
+                if sp.exited && !sp.title.contains("[Disconnected]") {
+                    sp.title = format!(" {} [Disconnected - Enter to reconnect] ", sp.title.trim());
+                }
+            }
+        }
         // Poll file search results
         if let Some(ref mut state) = self.file_search {
             state.poll();
@@ -2333,6 +3430,41 @@ impl App {
         if let Some(ref w) = self.dir_watcher {
             if w.has_changes() {
                 self.reload_panels();
+            }
+        }
+        // Poll pending remote connections (background threads)
+        if let Some(ref pending) = self.pending_remote {
+            let elapsed = pending.started.elapsed();
+            // Timeout after 30 seconds
+            if elapsed > std::time::Duration::from_secs(30) {
+                crate::debug_log::log("Connection timed out after 30s");
+                self.popup = Some(("Error".to_string(), "Connection timed out after 30 seconds.\n\nPress any key, then Ctrl+T to retry.".to_string()));
+                self.pending_remote = None;
+                self.dirty = true;
+            } else if let Ok(result) = pending.rx.try_recv() {
+                let side = pending.side;
+                match result.result {
+                    Ok(conn) => {
+                        let label = conn.display_label();
+                        crate::debug_log::log(&format!("Connection result received: {}", label));
+                        let boxed: Box<dyn crate::remote_fs::RemoteFs> = conn;
+                        let connection: std::rc::Rc<dyn crate::remote_fs::RemoteFs> =
+                            std::rc::Rc::from(boxed);
+                        self.panels[side].switch_to_remote(connection);
+                        self.status_message = Some(format!("Connected to {}", label));
+                    }
+                    Err(e) => {
+                        crate::debug_log::log_error("connect_result", &format!("{}", e));
+                        self.popup =
+                            Some(("Error".to_string(), format!("Connection failed:\n\n{}", e)));
+                    }
+                }
+                self.pending_remote = None;
+                self.dirty = true;
+            } else {
+                // Still waiting -- show progress with elapsed time
+                let secs = elapsed.as_secs();
+                self.status_message = Some(format!("Connecting... ({}s)", secs));
             }
         }
         // Poll archive progress
@@ -2364,6 +3496,10 @@ impl App {
         // Mark dirty for any action that changes state (not idle ticks)
         if !matches!(action, Action::Tick | Action::None) {
             self.dirty = true;
+            // Clear status message on any user action
+            if !matches!(action, Action::Resize(_, _)) {
+                self.status_message = None;
+            }
         }
 
         // Global tick: poll all async sources regardless of focus
@@ -2375,10 +3511,24 @@ impl App {
             return;
         }
 
+        // Error popup: any key dismisses it
+        if self.popup.is_some() {
+            self.popup = None;
+            // Execute deferred action (e.g. open editor after extraction summary)
+            if let Some(path) = self.popup_after.take() {
+                self.focus = PanelFocus::FilePanel;
+                self.mode = AppMode::Editing(Box::new(crate::editor::EditorState::open(path)));
+            }
+            return;
+        }
+
         // Help dialog intercepts when active
         if self.help_state.is_some() {
             match action {
-                Action::DialogCancel => self.help_state = None,
+                Action::DialogCancel => {
+                    self.help_state = None;
+                    self.file_search_help = None;
+                }
                 Action::MoveUp => {
                     if let Some(ref mut h) = self.help_state {
                         h.scroll = h.scroll.saturating_sub(1);
@@ -2426,6 +3576,94 @@ impl App {
             return;
         }
 
+        // Menu bar intercepts when active
+        if let Some(ref mut m) = self.menu_state {
+            let menu_count = crate::ui::menu::MENUS.len();
+            match action {
+                Action::DialogCancel => self.menu_state = None,
+                Action::CursorLeft => {
+                    m.active_menu = if m.active_menu == 0 {
+                        menu_count - 1
+                    } else {
+                        m.active_menu - 1
+                    };
+                    m.selected_item = 0;
+                }
+                Action::CursorRight => {
+                    m.active_menu = (m.active_menu + 1) % menu_count;
+                    m.selected_item = 0;
+                }
+                Action::MoveUp => {
+                    let count = crate::ui::menu::selectable_count(m.active_menu);
+                    m.selected_item = if m.selected_item == 0 {
+                        count.saturating_sub(1)
+                    } else {
+                        m.selected_item - 1
+                    };
+                }
+                Action::MoveDown => {
+                    let count = crate::ui::menu::selectable_count(m.active_menu);
+                    m.selected_item = (m.selected_item + 1) % count;
+                }
+                Action::MoveToTop => m.selected_item = 0,
+                Action::MoveToBottom => {
+                    m.selected_item =
+                        crate::ui::menu::selectable_count(m.active_menu).saturating_sub(1);
+                }
+                Action::DialogConfirm => {
+                    if let Some(action) = crate::ui::menu::selected_action(m) {
+                        self.menu_state = None;
+                        self.handle_action(action);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        // Settings dialog intercepts when active
+        if self.settings_open.is_some() {
+            match action {
+                Action::DialogCancel => self.settings_open = None,
+                Action::MoveUp => {
+                    if let Some(ref mut sel) = self.settings_open {
+                        *sel = sel.saturating_sub(1);
+                    }
+                }
+                Action::MoveDown => {
+                    if let Some(ref mut sel) = self.settings_open {
+                        let max_setting = 0; // Number of settings - 1
+                        *sel = (*sel + 1).min(max_setting);
+                    }
+                }
+                Action::Enter | Action::DialogConfirm | Action::CursorRight | Action::Toggle => {
+                    // Cycle the selected setting
+                    if let Some(0) = self.settings_open {
+                        // Theme: cycle to next
+                        let next = crate::theme::current_theme_name().next();
+                        crate::theme::set_theme(next);
+                        self.persisted.theme = next.to_str().to_string();
+                        self.persisted.save();
+                        self.needs_clear = true;
+                        self.status_message = Some(format!("Theme: {}", next.label()));
+                    }
+                }
+                Action::CursorLeft => {
+                    // Cycle backward
+                    if let Some(0) = self.settings_open {
+                        let prev = crate::theme::current_theme_name().prev();
+                        crate::theme::set_theme(prev);
+                        self.persisted.theme = prev.to_str().to_string();
+                        self.persisted.save();
+                        self.needs_clear = true;
+                        self.status_message = Some(format!("Theme: {}", prev.label()));
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Go-to-line prompt intercepts all input when active
         if self.goto_line_input.is_some() {
             self.handle_goto_line_action(action);
@@ -2443,7 +3681,8 @@ impl App {
             && self.unsaved_dialog.is_none()
             && self.quit_confirm.is_none()
         {
-            let has_unsaved = matches!(self.mode, AppMode::Editing(ref e) if e.modified);
+            let has_unsaved = matches!(self.mode, AppMode::Editing(ref e) if e.modified)
+                || matches!(self.mode, AppMode::HexViewing(ref h) if h.modified);
             if has_unsaved {
                 self.unsaved_dialog = Some(UnsavedDialogField::Save);
             } else {
@@ -2491,13 +3730,20 @@ impl App {
                                     }
                                 }
                             }
+                            if let AppMode::HexViewing(ref mut h) = self.mode {
+                                if let Err(err) = h.save() {
+                                    h.status_msg = Some(format!("Save failed: {}", err));
+                                    self.unsaved_dialog = None;
+                                    return;
+                                }
+                            }
                             self.unsaved_dialog = None;
-                            self.restore_or_close_editor();
+                            self.close_hex_or_editor();
                             self.reload_panels();
                         }
                         UnsavedDialogField::Discard => {
                             self.unsaved_dialog = None;
-                            self.restore_or_close_editor();
+                            self.close_hex_or_editor();
                         }
                         UnsavedDialogField::Cancel => {
                             self.unsaved_dialog = None;
@@ -2599,6 +3845,16 @@ impl App {
             return;
         }
 
+        // ToggleSettings works from any panel/mode
+        if matches!(action, Action::ToggleSettings) {
+            if self.settings_open.is_some() {
+                self.settings_open = None;
+            } else {
+                self.settings_open = Some(0);
+            }
+            return;
+        }
+
         // Bottom panel focus intercepts only apply in normal/quick-search modes
         // (full-screen modes like DiffViewing/Editing handle their own keys)
         if matches!(self.mode, AppMode::Normal | AppMode::QuickSearch) {
@@ -2627,6 +3883,24 @@ impl App {
             }
         }
 
+        // SSH panel intercepts when focused
+        if matches!(self.focus, PanelFocus::Ssh(_)) {
+            self.handle_ssh_action(action);
+            return;
+        }
+
+        // SSH dialog intercepts when open
+        if self.ssh_dialog.is_some() {
+            self.handle_ssh_dialog_action(action);
+            return;
+        }
+
+        // Session dialog intercepts when open
+        if self.session_dialog.is_some() {
+            self.handle_session_dialog_action(action);
+            return;
+        }
+
         // Dialog, mkdir dialog, copy dialog, and editor have their own dispatch
         if matches!(self.mode, AppMode::Dialog(_)) {
             self.handle_dialog_action(action);
@@ -2642,6 +3916,10 @@ impl App {
         }
         if matches!(self.mode, AppMode::ArchiveDialog(_)) {
             self.handle_archive_dialog_action(action);
+            return;
+        }
+        if matches!(self.mode, AppMode::HexViewing(_)) {
+            self.handle_hex_editor_action(action);
             return;
         }
         if matches!(self.mode, AppMode::Editing(_)) {
@@ -2873,14 +4151,8 @@ impl App {
             Action::Quit => self.should_quit = true,
             Action::Toggle => self.handle_toggle_viewer(),
             Action::GotoLinePrompt => {
-                // Only works in viewer/hex/editor/parquet modes
-                if matches!(
-                    self.mode,
-                    AppMode::Viewing(_)
-                        | AppMode::HexViewing(_)
-                        | AppMode::ParquetViewing(_)
-                        | AppMode::Editing(_)
-                ) {
+                // Only works in hex/editor/parquet modes
+                if matches!(self.mode, AppMode::ParquetViewing(_) | AppMode::Editing(_)) {
                     self.goto_line_input = Some(String::new());
                 }
             }
@@ -2916,48 +4188,7 @@ impl App {
             | Action::EditorUndo
             | Action::EditorRedo => {}
 
-            Action::SearchPrompt => {
-                if let AppMode::Viewing(ref v) = self.mode {
-                    let (query, direction, case_sensitive) = if let Some(ref s) = v.search {
-                        (s.query.clone(), SearchDirection::Forward, s.case_sensitive)
-                    } else if !self.persisted.search_query.is_empty() {
-                        let dir = if self.persisted.search_direction_forward {
-                            SearchDirection::Forward
-                        } else {
-                            SearchDirection::Backward
-                        };
-                        (
-                            self.persisted.search_query.clone(),
-                            dir,
-                            self.persisted.search_case_sensitive,
-                        )
-                    } else {
-                        (String::new(), SearchDirection::Forward, false)
-                    };
-                    let mut q = TextInput::new(query);
-                    q.select_all();
-                    self.search_dialog = Some(SearchDialogState {
-                        query: q,
-                        direction,
-                        case_sensitive,
-                        focused: SearchDialogField::Query,
-                    });
-                }
-            }
-            Action::FindNext => {
-                if let AppMode::Viewing(ref mut v) = self.mode {
-                    if v.search.is_some() {
-                        v.find_next();
-                    }
-                }
-            }
-            Action::FindPrev => {
-                if let AppMode::Viewing(ref mut v) = self.mode {
-                    if v.search.is_some() {
-                        v.find_prev();
-                    }
-                }
-            }
+            Action::SearchPrompt | Action::FindNext | Action::FindPrev => {}
 
             // Panel multi-file selection
             Action::ToggleSelect => self.active_panel_mut().toggle_select_current(),
@@ -2982,7 +4213,9 @@ impl App {
             Action::Move => self.handle_move(),
             Action::Rename => self.handle_rename(),
             Action::CreateDir => self.handle_create_dir(),
+            Action::CreateFile => self.handle_create_file(),
             Action::Delete => self.handle_delete(),
+            Action::CalcSize => self.handle_calc_size(),
             Action::ViewFile => self.handle_view_file(),
             Action::EditFile => self.handle_edit_file(),
 
@@ -3027,6 +4260,19 @@ impl App {
                 });
             }
 
+            // Menu
+            Action::OpenMenu => {
+                self.menu_state = Some(MenuState {
+                    active_menu: 0,
+                    selected_item: 0,
+                });
+            }
+
+            Action::ToggleSettings => {} // handled early, before bottom-panel dispatch
+
+            // CI failure extraction (only works when CI panel is focused, handled above)
+            Action::ExtractCiFailures => {}
+
             // File content search dialog
             Action::FileSearchPrompt => {
                 let path = self
@@ -3034,12 +4280,43 @@ impl App {
                     .current_dir
                     .to_string_lossy()
                     .to_string();
-                let mut dlg = FileSearchDialogState::new(
-                    path,
-                    self.persisted.file_search_term.clone(),
-                    self.persisted.file_search_filter.clone(),
-                    self.persisted.file_search_regex,
-                );
+                let p = &self.persisted;
+                let ti = crate::text_input::TextInput::new;
+                let mut dlg = FileSearchDialogState {
+                    term: ti(p.file_search_term.clone()),
+                    replace: ti(p.file_search_replace.clone()),
+                    path: ti(path),
+                    filter: ti(p.file_search_filter.clone()),
+                    file_type: ti(p.file_search_file_type.clone()),
+                    type_exclude: ti(p.file_search_type_exclude.clone()),
+                    is_regex: p.file_search_regex,
+                    case_insensitive: p.file_search_case_insensitive,
+                    smart_case: p.file_search_smart_case,
+                    whole_word: p.file_search_whole_word,
+                    whole_line_match: p.file_search_whole_line,
+                    invert_match: p.file_search_invert_match,
+                    multiline: p.file_search_multiline,
+                    multiline_dotall: p.file_search_multiline_dotall,
+                    crlf: p.file_search_crlf,
+                    hidden: p.file_search_hidden,
+                    follow_symlinks: p.file_search_follow_symlinks,
+                    no_gitignore: p.file_search_no_gitignore,
+                    binary: p.file_search_binary,
+                    search_zip: p.file_search_search_zip,
+                    glob_case_insensitive: p.file_search_glob_case_insensitive,
+                    one_file_system: p.file_search_one_file_system,
+                    trim_whitespace: p.file_search_trim,
+                    before_context: ti(p.file_search_before_context.clone()),
+                    after_context: ti(p.file_search_after_context.clone()),
+                    max_depth: ti(p.file_search_max_depth.clone()),
+                    max_count: ti(p.file_search_max_count.clone()),
+                    max_filesize: ti(p.file_search_max_filesize.clone()),
+                    encoding: ti(p.file_search_encoding.clone()),
+                    focused: FileSearchField::Term,
+                    completion_matches: Vec::new(),
+                    completion_selected: 0,
+                    show_completions: false,
+                };
                 dlg.select_focused();
                 self.file_search_dialog = Some(dlg);
             }
@@ -3054,6 +4331,15 @@ impl App {
             // Sorting
             Action::CycleSort => {
                 self.active_panel_mut().cycle_sort();
+            }
+            Action::SortByName(side) => {
+                self.panels[side].set_sort(SortField::Name);
+            }
+            Action::SortBySize(side) => {
+                self.panels[side].set_sort(SortField::Size);
+            }
+            Action::SortByDate(side) => {
+                self.panels[side].set_sort(SortField::Date);
             }
 
             // CI / GitHub
@@ -3140,6 +4426,18 @@ impl App {
             // Shell
             Action::ToggleShell => self.toggle_shell(),
 
+            // SSH
+            Action::ToggleSsh => self.toggle_ssh(),
+
+            // Sessions
+            Action::ToggleSessions => {
+                if self.session_dialog.is_some() {
+                    self.session_dialog = None;
+                } else {
+                    self.session_dialog = Some(SessionDialogState::new());
+                }
+            }
+
             // Bottom panel resize/maximize
             Action::BottomResizeUp => {
                 let side = self.focused_side();
@@ -3174,7 +4472,7 @@ impl App {
             Action::DialogCancel => self.handle_dialog_cancel(),
             Action::DialogBackspace => self.handle_dialog_backspace(),
             Action::DialogConfirm | Action::DialogInput(_) => {}
-            Action::TerminalInput(_) | Action::TerminalOpenFile => {} // handled by intercepts above
+            Action::TerminalInput(_) | Action::TerminalOpenFile | Action::ToggleReverse => {} // handled by intercepts above
         }
     }
 
@@ -3182,8 +4480,6 @@ impl App {
 
     fn handle_move_up(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => v.scroll_up(1),
-            AppMode::HexViewing(h) => h.scroll_up(1),
             AppMode::ParquetViewing(p) => p.move_up(1),
             AppMode::DiffViewing(d) => d.scroll_up(1),
             _ => self.active_panel_mut().move_selection(-1),
@@ -3192,8 +4488,6 @@ impl App {
 
     fn handle_move_down(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => v.scroll_down(1),
-            AppMode::HexViewing(h) => h.scroll_down(1),
             AppMode::ParquetViewing(p) => p.move_down(1),
             AppMode::DiffViewing(d) => d.scroll_down(1),
             _ => self.active_panel_mut().move_selection(1),
@@ -3202,8 +4496,6 @@ impl App {
 
     fn handle_move_to_top(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => v.scroll_to_top(),
-            AppMode::HexViewing(h) => h.scroll_to_top(),
             AppMode::ParquetViewing(p) => p.move_to_top(),
             AppMode::DiffViewing(d) => d.scroll_to_top(),
             _ => self.active_panel_mut().move_to_top(),
@@ -3212,8 +4504,6 @@ impl App {
 
     fn handle_move_to_bottom(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => v.scroll_to_bottom(),
-            AppMode::HexViewing(h) => h.scroll_to_bottom(),
             AppMode::ParquetViewing(p) => p.move_to_bottom(),
             AppMode::DiffViewing(d) => d.scroll_to_bottom(),
             _ => self.active_panel_mut().move_to_bottom(),
@@ -3222,14 +4512,6 @@ impl App {
 
     fn handle_page_up(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => {
-                let page = v.visible_lines.max(1);
-                v.scroll_up(page);
-            }
-            AppMode::HexViewing(h) => {
-                let page = h.visible_rows.max(1);
-                h.scroll_up(page);
-            }
             AppMode::ParquetViewing(p) => p.page_up(),
             AppMode::DiffViewing(d) => d.page_up(),
             _ => self.active_panel_mut().move_selection(-20),
@@ -3238,14 +4520,6 @@ impl App {
 
     fn handle_page_down(&mut self) {
         match &mut self.mode {
-            AppMode::Viewing(v) => {
-                let page = v.visible_lines.max(1);
-                v.scroll_down(page);
-            }
-            AppMode::HexViewing(h) => {
-                let page = h.visible_rows.max(1);
-                h.scroll_down(page);
-            }
             AppMode::ParquetViewing(p) => p.page_down(),
             AppMode::DiffViewing(d) => d.page_down(),
             _ => self.active_panel_mut().move_selection(20),
@@ -3273,7 +4547,7 @@ impl App {
                 self.update_watched_dirs();
                 self.check_ci_panels();
             } else {
-                self.open_file(entry.path);
+                self.open_file_for_edit(entry.path);
             }
         }
     }
@@ -3301,6 +4575,7 @@ impl App {
             Diff(usize),
             Shell(usize),
             Claude(usize),
+            Ssh(usize),
             Search(usize),
         }
 
@@ -3323,6 +4598,9 @@ impl App {
         if self.claude_panels[0].is_some() {
             order.push(Target::Claude(0));
         }
+        if self.ssh_panels[0].is_some() {
+            order.push(Target::Ssh(0));
+        }
         if has_search && self.file_search_side == 0 {
             order.push(Target::Search(0));
         }
@@ -3342,6 +4620,9 @@ impl App {
         }
         if self.claude_panels[1].is_some() {
             order.push(Target::Claude(1));
+        }
+        if self.ssh_panels[1].is_some() {
+            order.push(Target::Ssh(1));
         }
         if has_search && self.file_search_side == 1 {
             order.push(Target::Search(1));
@@ -3364,6 +4645,7 @@ impl App {
             PanelFocus::Search => order
                 .iter()
                 .position(|t| *t == Target::Search(self.file_search_side)),
+            PanelFocus::Ssh(side) => order.iter().position(|t| *t == Target::Ssh(side)),
             PanelFocus::Claude(side) => order.iter().position(|t| *t == Target::Claude(side)),
             PanelFocus::Shell(side) => order.iter().position(|t| *t == Target::Shell(side)),
             PanelFocus::Diff(side) => order.iter().position(|t| *t == Target::Diff(side)),
@@ -3384,6 +4666,7 @@ impl App {
             })
             .unwrap_or(0);
 
+        self.unfocus_all();
         match &order[next] {
             Target::Panel(side) => {
                 self.active_panel = *side;
@@ -3401,25 +4684,49 @@ impl App {
             Target::Claude(side) => {
                 self.focus = PanelFocus::Claude(*side);
             }
+            Target::Ssh(side) => {
+                self.focus = PanelFocus::Ssh(*side);
+            }
             Target::Search(_) => {
                 self.focus = PanelFocus::Search;
             }
         }
     }
 
+    /// Clear all bottom-panel focus flags.
+    fn unfocus_all(&mut self) {
+        self.focus = PanelFocus::FilePanel;
+    }
+
     fn handle_goto_line_action(&mut self, action: Action) {
+        let is_hex = matches!(self.mode, AppMode::HexViewing(_));
         match action {
             Action::DialogCancel => {
                 self.goto_line_input = None;
             }
             Action::DialogConfirm | Action::EditorNewline | Action::Enter => {
                 if let Some(input) = self.goto_line_input.take() {
-                    self.goto_line_col(&input);
+                    if is_hex {
+                        if let AppMode::HexViewing(ref mut h) = self.mode {
+                            if let Err(e) = h.goto_offset(&input) {
+                                h.status_msg = Some(e);
+                            }
+                        }
+                    } else {
+                        self.goto_line_col(&input);
+                    }
                 }
             }
-            Action::DialogInput(c) if c.is_ascii_digit() || c == ':' => {
-                if let Some(ref mut input) = self.goto_line_input {
-                    input.push(c);
+            Action::DialogInput(c) => {
+                let valid = if is_hex {
+                    c.is_ascii_hexdigit() || c == 'x' || c == 'X'
+                } else {
+                    c.is_ascii_digit() || c == ':'
+                };
+                if valid {
+                    if let Some(ref mut input) = self.goto_line_input {
+                        input.push(c);
+                    }
                 }
             }
             Action::DialogBackspace => {
@@ -3649,9 +4956,7 @@ impl App {
                         let full_path = self.panels[side].current_dir.join(rel_path);
                         if full_path.is_file() {
                             self.fuzzy_search[side] = None;
-                            self.mode = AppMode::Editing(Box::new(
-                                crate::editor::EditorState::open(full_path),
-                            ));
+                            self.open_file_for_edit(full_path);
                             return;
                         }
                     }
@@ -3687,7 +4992,65 @@ impl App {
     }
 
     fn handle_file_search_dialog(&mut self, action: Action) {
+        // Check if completion popup is active
+        let has_comp = self
+            .file_search_dialog
+            .as_ref()
+            .is_some_and(|s| s.has_completions());
+
         match action {
+            // F1: show contextual help for the focused field
+            Action::ShowHelp => {
+                if let Some(ref state) = self.file_search_dialog {
+                    let help = match state.focused {
+                        FileSearchField::FileType | FileSearchField::TypeExclude => {
+                            FileSearchHelp::FileTypes
+                        }
+                        FileSearchField::Filter => FileSearchHelp::Glob,
+                        f => FileSearchHelp::Field(f),
+                    };
+                    self.file_search_help = Some(help);
+                    self.help_state = Some(HelpState {
+                        scroll: 0,
+                        filter: String::new(),
+                    });
+                }
+            }
+
+            // When completions are visible, intercept navigation
+            Action::MoveUp if has_comp => {
+                if let Some(ref mut state) = self.file_search_dialog {
+                    if state.completion_selected > 0 {
+                        state.completion_selected -= 1;
+                    } else {
+                        state.completion_selected =
+                            state.completion_matches.len().saturating_sub(1);
+                    }
+                }
+            }
+            Action::MoveDown if has_comp => {
+                if let Some(ref mut state) = self.file_search_dialog {
+                    if state.completion_selected + 1 < state.completion_matches.len() {
+                        state.completion_selected += 1;
+                    } else {
+                        state.completion_selected = 0;
+                    }
+                }
+            }
+            Action::DialogConfirm if has_comp => {
+                if let Some(ref mut state) = self.file_search_dialog {
+                    state.accept_completion();
+                }
+            }
+            // Toggle is used as "dismiss completions" when Esc pressed with popup open
+            Action::Toggle if has_comp => {
+                if let Some(ref mut state) = self.file_search_dialog {
+                    state.show_completions = false;
+                    state.completion_matches.clear();
+                }
+            }
+
+            // Normal dialog actions
             Action::DialogCancel => {
                 self.file_search_dialog = None;
             }
@@ -3697,19 +5060,70 @@ impl App {
                         return;
                     }
                     if !state.term.text.is_empty() {
-                        // Persist search params
-                        self.persisted.file_search_term = state.term.text.clone();
-                        self.persisted.file_search_filter = state.filter.text.clone();
-                        self.persisted.file_search_regex = state.is_regex;
+                        // Persist all search params
+                        let p = &mut self.persisted;
+                        p.file_search_term = state.term.text.clone();
+                        p.file_search_replace = state.replace.text.clone();
+                        p.file_search_filter = state.filter.text.clone();
+                        p.file_search_file_type = state.file_type.text.clone();
+                        p.file_search_type_exclude = state.type_exclude.text.clone();
+                        p.file_search_regex = state.is_regex;
+                        p.file_search_case_insensitive = state.case_insensitive;
+                        p.file_search_smart_case = state.smart_case;
+                        p.file_search_whole_word = state.whole_word;
+                        p.file_search_whole_line = state.whole_line_match;
+                        p.file_search_invert_match = state.invert_match;
+                        p.file_search_multiline = state.multiline;
+                        p.file_search_multiline_dotall = state.multiline_dotall;
+                        p.file_search_crlf = state.crlf;
+                        p.file_search_hidden = state.hidden;
+                        p.file_search_follow_symlinks = state.follow_symlinks;
+                        p.file_search_no_gitignore = state.no_gitignore;
+                        p.file_search_binary = state.binary;
+                        p.file_search_search_zip = state.search_zip;
+                        p.file_search_glob_case_insensitive = state.glob_case_insensitive;
+                        p.file_search_one_file_system = state.one_file_system;
+                        p.file_search_trim = state.trim_whitespace;
+                        p.file_search_before_context = state.before_context.text.clone();
+                        p.file_search_after_context = state.after_context.text.clone();
+                        p.file_search_max_depth = state.max_depth.text.clone();
+                        p.file_search_max_count = state.max_count.text.clone();
+                        p.file_search_max_filesize = state.max_filesize.text.clone();
+                        p.file_search_encoding = state.encoding.text.clone();
 
-                        let dir = PathBuf::from(&state.path.text);
+                        let config = crate::file_search::SearchConfig {
+                            root: PathBuf::from(&state.path.text),
+                            query: state.term.text.clone(),
+                            filter: state.filter.text.clone(),
+                            file_type: state.file_type.text.clone(),
+                            type_exclude: state.type_exclude.text.clone(),
+                            is_regex: state.is_regex,
+                            case_insensitive: state.case_insensitive,
+                            smart_case: state.smart_case,
+                            whole_word: state.whole_word,
+                            whole_line: state.whole_line_match,
+                            invert_match: state.invert_match,
+                            multiline: state.multiline,
+                            multiline_dotall: state.multiline_dotall,
+                            crlf: state.crlf,
+                            hidden: state.hidden,
+                            follow_symlinks: state.follow_symlinks,
+                            no_gitignore: state.no_gitignore,
+                            binary: state.binary,
+                            glob_case_insensitive: state.glob_case_insensitive,
+                            one_file_system: state.one_file_system,
+                            trim_whitespace: state.trim_whitespace,
+                            before_context: state.before_context.text.trim().parse().unwrap_or(0),
+                            after_context: state.after_context.text.trim().parse().unwrap_or(0),
+                            max_depth: state.max_depth.text.trim().parse().ok(),
+                            max_count: state.max_count.text.trim().parse().ok(),
+                            max_filesize: crate::file_search::parse_filesize(
+                                &state.max_filesize.text,
+                            ),
+                            encoding: state.encoding.text.clone(),
+                        };
                         let search_side = 1 - self.active_panel;
-                        let mut search = SearchState::new(
-                            dir,
-                            state.term.text.clone(),
-                            state.filter.text.clone(),
-                            state.is_regex,
-                        );
+                        let mut search = SearchState::new(config);
                         search.poll(); // get initial results
                         self.file_search = Some(search);
                         self.file_search_side = search_side;
@@ -3719,27 +5133,24 @@ impl App {
             }
             Action::MoveDown => {
                 if let Some(ref mut state) = self.file_search_dialog {
-                    state.term.clear_selection();
-                    state.path.clear_selection();
-                    state.filter.clear_selection();
+                    state.clear_all_selections();
+                    state.show_completions = false;
                     state.focused = state.focused.next();
                     state.select_focused();
                 }
             }
             Action::MoveUp => {
                 if let Some(ref mut state) = self.file_search_dialog {
-                    state.term.clear_selection();
-                    state.path.clear_selection();
-                    state.filter.clear_selection();
+                    state.clear_all_selections();
+                    state.show_completions = false;
                     state.focused = state.focused.prev();
                     state.select_focused();
                 }
             }
             Action::SwitchPanel | Action::SwitchPanelReverse => {
                 if let Some(ref mut state) = self.file_search_dialog {
-                    state.term.clear_selection();
-                    state.path.clear_selection();
-                    state.filter.clear_selection();
+                    state.clear_all_selections();
+                    state.show_completions = false;
                     state.focused = match state.focused {
                         FileSearchField::ButtonSearch => FileSearchField::ButtonCancel,
                         FileSearchField::ButtonCancel => FileSearchField::ButtonSearch,
@@ -3750,9 +5161,7 @@ impl App {
             }
             Action::Toggle => {
                 if let Some(ref mut state) = self.file_search_dialog {
-                    if state.focused == FileSearchField::Regex {
-                        state.is_regex = !state.is_regex;
-                    }
+                    state.toggle_focused();
                 }
             }
             Action::MouseClick(col, row) => self.handle_dialog_click_at(col, row),
@@ -3760,6 +5169,13 @@ impl App {
                 if let Some(ref mut state) = self.file_search_dialog {
                     if let Some(input) = state.active_input() {
                         input.handle_action(&action);
+                    }
+                    // Update completions after text changes in type fields
+                    if matches!(
+                        state.focused,
+                        FileSearchField::FileType | FileSearchField::TypeExclude
+                    ) {
+                        state.update_completions();
                     }
                 }
             }
@@ -3769,14 +5185,35 @@ impl App {
     fn handle_file_search_results(&mut self, action: Action) {
         match action {
             Action::DialogCancel => {
+                // First Esc clears filter, second Esc closes search
+                if let Some(ref mut state) = self.file_search {
+                    if !state.filter.is_empty() {
+                        state.filter.clear();
+                        state.clamp_selected();
+                        return;
+                    }
+                }
                 self.file_search = None;
                 self.focus = PanelFocus::FilePanel;
+            }
+            Action::DialogInput(c) => {
+                if let Some(ref mut state) = self.file_search {
+                    state.filter.push(c);
+                    state.clamp_selected();
+                }
+            }
+            Action::DialogBackspace => {
+                if let Some(ref mut state) = self.file_search {
+                    state.filter.pop();
+                    state.clamp_selected();
+                }
             }
             Action::DialogConfirm => {
                 // Open selected match in editor and highlight search term
                 if let Some(ref state) = self.file_search {
                     let query = state.query.clone();
                     if let Some((path, line)) = state.selected_location() {
+                        self.pre_editor_focus = Some(self.focus);
                         let mut editor = EditorState::open(path);
                         let target_line = (line as usize).saturating_sub(1);
                         if !editor.scan_complete {
@@ -3923,16 +5360,6 @@ impl App {
         };
 
         match &mut self.mode {
-            AppMode::Viewing(v) => {
-                // Scan ahead if needed
-                v.scroll_offset = line;
-                v.scroll_down(0); // clamps and loads buffer
-            }
-            AppMode::HexViewing(h) => {
-                // Each row = 16 bytes, interpret line as a row number
-                h.scroll_offset = line;
-                h.scroll_down(0);
-            }
             AppMode::ParquetViewing(p) => {
                 p.goto_row(line);
             }
@@ -3959,10 +5386,358 @@ impl App {
 
     fn handle_edit_builtin(&mut self) {
         if let Some(entry) = self.active_panel().selected_entry().cloned() {
-            if !entry.is_dir {
-                self.mode = AppMode::Editing(Box::new(EditorState::open(entry.path)));
+            if entry.is_dir {
+                return;
+            }
+            if self.active_panel().source.is_remote() {
+                // Download to temp file, edit, upload on save
+                match self.download_for_edit(&entry.path) {
+                    Ok(tmp_path) => {
+                        let mut editor = EditorState::open(tmp_path.clone());
+                        // Store the remote path for upload-on-save
+                        editor.remote_source = Some((entry.path.clone(), self.active_panel));
+                        self.mode = AppMode::Editing(Box::new(editor));
+                    }
+                    Err(e) => {
+                        self.popup = Some((
+                            "Error".to_string(),
+                            format!("Failed to download file:\n\n{}", e),
+                        ));
+                    }
+                }
+            } else {
+                self.open_file_for_edit(entry.path);
             }
         }
+    }
+
+    /// Open a file with the appropriate mode: parquet viewer, hex viewer, or text editor.
+    fn open_file_for_edit(&mut self, path: PathBuf) {
+        // Parquet files → read-only parquet viewer
+        if path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
+        {
+            if let Ok(pq) = ParquetViewerState::open(path.clone()) {
+                self.mode = AppMode::ParquetViewing(Box::new(pq));
+                return;
+            }
+            // Fall through to binary/text on parse failure
+        }
+
+        // Binary files → read-only hex viewer
+        if HexViewerState::is_binary(&path) {
+            self.mode = AppMode::HexViewing(Box::new(HexViewerState::open(path)));
+            return;
+        }
+
+        // Text files → editor
+        self.mode = AppMode::Editing(Box::new(EditorState::open(path)));
+    }
+
+    fn handle_hex_editor_action(&mut self, action: Action) {
+        // Clear selection on non-selection movement and editing actions
+        let clears_selection = matches!(
+            action,
+            Action::MoveUp
+                | Action::MoveDown
+                | Action::CursorLeft
+                | Action::CursorRight
+                | Action::CursorLineStart
+                | Action::CursorLineEnd
+                | Action::MoveToTop
+                | Action::MoveToBottom
+                | Action::PageUp
+                | Action::PageDown
+                | Action::DialogInput(_)
+        );
+        if clears_selection {
+            if let AppMode::HexViewing(ref mut h) = self.mode {
+                h.clear_selection();
+            }
+        }
+
+        match action {
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
+            Action::Quit => {
+                let modified = matches!(self.mode, AppMode::HexViewing(ref h) if h.modified);
+                if modified {
+                    self.unsaved_dialog = Some(UnsavedDialogField::Save);
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            Action::DialogCancel => {
+                let modified = matches!(self.mode, AppMode::HexViewing(ref h) if h.modified);
+                if modified {
+                    self.unsaved_dialog = Some(UnsavedDialogField::Save);
+                } else {
+                    self.mode = AppMode::Normal;
+                    self.focus = PanelFocus::FilePanel;
+                    self.needs_clear = true;
+                }
+            }
+            Action::MoveUp => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.cursor_up();
+                }
+            }
+            Action::MoveDown => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.cursor_down();
+                }
+            }
+            Action::CursorLeft => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.cursor_left();
+                }
+            }
+            Action::CursorRight => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.cursor_right();
+                }
+            }
+            Action::CursorLineStart => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.cursor_row_start();
+                }
+            }
+            Action::CursorLineEnd => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.cursor_row_end();
+                }
+            }
+            Action::MoveToTop => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.scroll_to_top();
+                }
+            }
+            Action::MoveToBottom => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.scroll_to_bottom();
+                }
+            }
+            Action::PageUp => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.page_up();
+                }
+            }
+            Action::PageDown => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.page_down();
+                }
+            }
+            Action::Toggle => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.toggle_ascii();
+                }
+            }
+            // Selection
+            Action::SelectUp => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.select_up();
+                }
+            }
+            Action::SelectDown => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.select_down();
+                }
+            }
+            Action::SelectLeft => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.select_left();
+                }
+            }
+            Action::SelectRight => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.select_right();
+                }
+            }
+            Action::SelectPageUp => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.select_page_up();
+                }
+            }
+            Action::SelectPageDown => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.select_page_down();
+                }
+            }
+            Action::SelectAll => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.select_all();
+                }
+            }
+            Action::CopySelection => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    if let Some(len) = h.copy_to_clipboard() {
+                        h.status_msg = Some(format!("Copied {} chars", len));
+                    }
+                }
+            }
+            Action::EditorSave => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    if let Err(e) = h.save() {
+                        h.status_msg = Some(e);
+                    }
+                    self.reload_panels();
+                }
+            }
+            Action::EditorUndo => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.undo();
+                }
+            }
+            Action::EditorRedo => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.redo();
+                }
+            }
+            Action::GotoLinePrompt => {
+                self.goto_line_input = Some(String::new());
+            }
+            Action::SearchPrompt => {
+                // Open search dialog with last hex search pre-filled
+                let query = if let AppMode::HexViewing(ref h) = self.mode {
+                    h.last_search_pattern
+                        .as_ref()
+                        .map(|p| {
+                            p.iter()
+                                .map(|b| format!("{:02X}", b))
+                                .collect::<Vec<_>>()
+                                .join(" ")
+                        })
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                };
+                let mut q = TextInput::new(query);
+                q.select_all();
+                self.search_dialog = Some(SearchDialogState {
+                    query: q,
+                    direction: SearchDirection::Forward,
+                    case_sensitive: false,
+                    focused: SearchDialogField::Query,
+                });
+            }
+            Action::FindNext => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    if let Some(pat) = h.last_search_pattern.clone() {
+                        h.find_next(&pat);
+                    }
+                }
+            }
+            Action::WordLeft => {
+                // Reused as find-prev
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    if let Some(pat) = h.last_search_pattern.clone() {
+                        h.find_prev(&pat);
+                    }
+                }
+            }
+            Action::DialogInput(c) => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    if h.editing_ascii {
+                        if c.is_ascii() && !c.is_control() {
+                            h.input_ascii(c as u8);
+                        }
+                    } else if let Some(nibble) = c.to_digit(16) {
+                        h.input_hex_nibble(nibble as u8);
+                    }
+                }
+            }
+            Action::MouseClick(col, row) => {
+                self.handle_hex_click(col, row);
+            }
+            Action::MouseScrollUp(_, _) => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.scroll_up(3);
+                }
+            }
+            Action::MouseScrollDown(_, _) => {
+                if let AppMode::HexViewing(ref mut h) = self.mode {
+                    h.scroll_down(3);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Handle mouse click in hex editor — position cursor at clicked byte.
+    fn handle_hex_click(&mut self, col: u16, row: u16) {
+        let AppMode::HexViewing(ref mut h) = self.mode else {
+            return;
+        };
+        // Layout: border(1) + header(1) = data starts at row offset 2 from area top.
+        // Full-screen hex editor: area.y=0, inner starts at y=1, header at y=1, data at y=2
+        let data_start_row: u16 = 2;
+        let data_start_col: u16 = 1; // left border
+
+        if row < data_start_row || row >= data_start_row + h.visible_rows as u16 {
+            return;
+        }
+        let screen_row = (row - data_start_row) as usize;
+        let file_row = h.scroll_offset + screen_row;
+        // The col within the inner area
+        let inner_col = col.saturating_sub(data_start_col) as usize;
+
+        // Layout per row: " XXXXXXXX  " (11 chars for offset) then hex bytes then "  " then ASCII
+        let offset_width = 11; // " {:08X}  "
+        let hex_region_start = offset_width;
+        // Each byte is "XX " (3 chars), with an extra " " separator after byte 8
+        // Total hex region = 16*3 + 1 = 49 chars
+        let hex_region_end = hex_region_start + 49;
+        let ascii_region_start = hex_region_end + 2; // "  " separator
+
+        if inner_col >= hex_region_start && inner_col < hex_region_end {
+            // Clicked in hex region — figure out which byte
+            let rel = inner_col - hex_region_start;
+            // rel 0..24: bytes 0-7 (each "XX " = 3 chars), rel 24 = separator
+            // rel 25..49: bytes 8-15
+            if rel == 24 {
+                return; // clicked on the separator between byte groups
+            }
+            let byte_idx = if rel > 24 { (rel - 1) / 3 } else { rel / 3 };
+            if byte_idx < BYTES_PER_ROW {
+                let offset = (file_row * BYTES_PER_ROW + byte_idx) as u64;
+                if offset < h.file_size {
+                    h.cursor_offset = offset;
+                    h.cursor_nibble = 0;
+                    h.editing_ascii = false;
+                    h.scroll_to_cursor();
+                }
+            }
+        } else if inner_col >= ascii_region_start {
+            // Clicked in ASCII region
+            let byte_idx = inner_col - ascii_region_start;
+            if byte_idx < BYTES_PER_ROW {
+                let offset = (file_row * BYTES_PER_ROW + byte_idx) as u64;
+                if offset < h.file_size {
+                    h.cursor_offset = offset;
+                    h.cursor_nibble = 0;
+                    h.editing_ascii = true;
+                    h.scroll_to_cursor();
+                }
+            }
+        }
+    }
+
+    fn download_for_edit(&self, remote_path: &std::path::Path) -> anyhow::Result<PathBuf> {
+        let filename = remote_path
+            .file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_else(|| "untitled".to_string());
+        let tmp_dir = std::env::temp_dir().join("middle-manager-edit");
+        std::fs::create_dir_all(&tmp_dir)?;
+        let tmp_path = tmp_dir.join(&filename);
+
+        match &self.panels[self.active_panel].source {
+            crate::panel::PanelSource::Remote { connection } => {
+                connection.download(remote_path, &tmp_path)?;
+            }
+            _ => anyhow::bail!("Not a remote panel"),
+        }
+        Ok(tmp_path)
     }
 
     fn handle_editor_action(&mut self, action: Action) {
@@ -4173,7 +5948,28 @@ impl App {
             Action::EditorSave => {
                 if let AppMode::Editing(ref mut e) = self.mode {
                     match e.save() {
-                        Ok(()) => {}
+                        Ok(()) => {
+                            // If editing a remote file, upload it back
+                            if let Some((ref remote_path, panel_side)) = e.remote_source {
+                                let local_path = e.path.clone();
+                                let remote_path = remote_path.clone();
+                                if let crate::panel::PanelSource::Remote { connection } =
+                                    &self.panels[panel_side].source
+                                {
+                                    match connection.upload(&local_path, &remote_path) {
+                                        Ok(_) => {
+                                            e.status_msg = Some("Saved and uploaded".to_string());
+                                        }
+                                        Err(err) => {
+                                            e.status_msg = Some(format!(
+                                                "Saved locally, upload failed: {}",
+                                                err
+                                            ));
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         Err(err) => e.status_msg = Some(format!("Save failed: {}", err)),
                     }
                 }
@@ -4278,39 +6074,8 @@ impl App {
     }
 
     fn handle_toggle_viewer(&mut self) {
-        match &mut self.mode {
-            AppMode::Viewing(v) => {
-                let path = v.path.clone();
-                self.mode = AppMode::HexViewing(Box::new(HexViewerState::open(path)));
-            }
-            AppMode::HexViewing(h) => {
-                let path = h.path.clone();
-                self.mode = AppMode::Viewing(Box::new(ViewerState::open(path)));
-            }
-            AppMode::ParquetViewing(p) => {
-                p.switch_view();
-            }
-            _ => {}
-        }
-    }
-
-    fn open_file(&mut self, path: PathBuf) {
-        // Try parquet viewer for .parquet files
-        if path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("parquet"))
-        {
-            if let Ok(pq) = ParquetViewerState::open(path.clone()) {
-                self.mode = AppMode::ParquetViewing(Box::new(pq));
-                return;
-            }
-            // Fall through to binary/text viewer on parse failure
-        }
-
-        if HexViewerState::is_binary(&path) {
-            self.mode = AppMode::HexViewing(Box::new(HexViewerState::open(path)));
-        } else {
-            self.mode = AppMode::Viewing(Box::new(ViewerState::open(path)));
+        if let AppMode::ParquetViewing(p) = &mut self.mode {
+            p.switch_view();
         }
     }
 
@@ -4337,7 +6102,7 @@ impl App {
         } else {
             format!("{} items", paths.len())
         };
-        let mut dlg = CopyDialogState::new(display_name, paths, dest, false);
+        let mut dlg = CopyDialogState::new(display_name, paths, dest, false, self.active_panel);
         dlg.destination.select_all();
         self.mode = AppMode::CopyDialog(dlg);
     }
@@ -4363,7 +6128,7 @@ impl App {
         } else {
             format!("{} items", paths.len())
         };
-        let mut dlg = CopyDialogState::new(display_name, paths, dest, true);
+        let mut dlg = CopyDialogState::new(display_name, paths, dest, true, self.active_panel);
         dlg.destination.select_all();
         self.mode = AppMode::CopyDialog(dlg);
     }
@@ -4390,6 +6155,17 @@ impl App {
 
     fn handle_create_dir(&mut self) {
         self.mode = AppMode::MkdirDialog(MkdirDialogState::new());
+    }
+
+    fn handle_create_file(&mut self) {
+        self.mode = AppMode::Dialog(DialogState {
+            kind: DialogKind::InputCreateFile,
+            title: "New File".to_string(),
+            message: "Create new file:".to_string(),
+            has_input: true,
+            input: TextInput::new(String::new()),
+            focused: DialogField::Input,
+        });
     }
 
     fn handle_delete(&mut self) {
@@ -4424,15 +6200,107 @@ impl App {
     fn handle_view_file(&mut self) {
         if let Some(entry) = self.active_panel().selected_entry().cloned() {
             if !entry.is_dir {
-                self.open_file(entry.path);
+                if self.active_panel().source.is_remote() {
+                    match self.download_for_edit(&entry.path) {
+                        Ok(tmp_path) => self.open_file_for_edit(tmp_path),
+                        Err(e) => {
+                            self.popup = Some((
+                                "Error".to_string(),
+                                format!("Failed to download:\n\n{}", e),
+                            ));
+                        }
+                    }
+                } else {
+                    self.open_file_for_edit(entry.path);
+                }
             }
+        }
+    }
+
+    fn handle_calc_size(&mut self) {
+        let panel = &self.panels[self.active_panel];
+
+        // Gather entries to calculate: multi-selection or cursor item
+        // Each tuple: (key_path, scan_path, is_dir, size)
+        // key_path is used for dir_sizes lookup; scan_path is the directory to scan.
+        // They differ only for ".." where we scan current_dir but key by entry.path.
+        let entries: Vec<(PathBuf, PathBuf, bool, u64)> = if !panel.selected_indices.is_empty() {
+            panel
+                .selected_indices
+                .iter()
+                .filter_map(|&i| panel.entries.get(i))
+                .filter(|e| e.name != "..")
+                .map(|e| (e.path.clone(), e.path.clone(), e.is_dir, e.size))
+                .collect()
+        } else if let Some(entry) = panel.selected_entry() {
+            if entry.name == ".." {
+                vec![(
+                    entry.path.clone(),
+                    panel.current_dir.clone(),
+                    true,
+                    entry.size,
+                )]
+            } else {
+                vec![(
+                    entry.path.clone(),
+                    entry.path.clone(),
+                    entry.is_dir,
+                    entry.size,
+                )]
+            }
+        } else {
+            return;
+        };
+
+        let panel = &mut self.panels[self.active_panel];
+        let mut file_total: u64 = 0;
+        let mut dir_count = 0usize;
+        let mut file_count = 0usize;
+
+        for (key, scan_path, is_dir, size) in &entries {
+            if *is_dir {
+                // Cancel and remove existing calculation (allows re-scan on repeated F3)
+                if let Some(crate::panel::DirSizeState::Calculating { cancelled, .. }) =
+                    panel.dir_sizes.get(key)
+                {
+                    cancelled.store(true, std::sync::atomic::Ordering::Release);
+                }
+                panel.dir_sizes.remove(key);
+                panel.start_size_calc_at(key.clone(), scan_path.clone());
+                dir_count += 1;
+            } else {
+                file_total += size;
+                file_count += 1;
+            }
+        }
+
+        // Show immediate status for file-only selections
+        if dir_count == 0 && file_count > 0 {
+            self.status_message = Some(format!(
+                "{} file{}: {}",
+                file_count,
+                if file_count == 1 { "" } else { "s" },
+                crate::panel::format_size_short(file_total),
+            ));
+        } else if dir_count > 0 {
+            // Track pending total for when all dir scans finish
+            let dir_paths: Vec<PathBuf> = entries
+                .iter()
+                .filter(|(_, _, is_dir, _)| *is_dir)
+                .map(|(key, _, _, _)| key.clone())
+                .collect();
+            panel.pending_size_total = Some((dir_paths, file_total, file_count, dir_count));
         }
     }
 
     fn handle_edit_file(&mut self) {
         if let Some(entry) = self.active_panel().selected_entry().cloned() {
             if !entry.is_dir {
-                self.status_message = Some(format!("__EDIT__{}", entry.path.to_string_lossy()));
+                if self.active_panel().source.is_remote() {
+                    self.popup = Some(("Info".to_string(), "Use F4 (built-in editor) for remote files.\nExternal editor not supported for remote.".to_string()));
+                } else {
+                    self.status_message = Some(format!("__EDIT__{}", entry.path.to_string_lossy()));
+                }
             }
         }
     }
@@ -4521,6 +6389,24 @@ impl App {
             return;
         }
 
+        // Hex editor: parse as hex pattern and search
+        if let AppMode::HexViewing(ref mut h) = self.mode {
+            match HexViewerState::parse_hex_pattern(&state.query.text) {
+                Ok(pattern) => {
+                    let reverse = matches!(state.direction, SearchDirection::Backward);
+                    if reverse {
+                        h.find_prev(&pattern);
+                    } else {
+                        h.find_next(&pattern);
+                    }
+                }
+                Err(e) => {
+                    h.status_msg = Some(e);
+                }
+            }
+            return;
+        }
+
         use crate::editor::SearchParams;
         let params = SearchParams {
             query: state.query.text,
@@ -4533,19 +6419,6 @@ impl App {
         self.persisted.search_direction_forward =
             matches!(params.direction, SearchDirection::Forward);
         self.persisted.search_case_sensitive = params.case_sensitive;
-
-        // Viewer mode: use viewer search
-        if let AppMode::Viewing(ref mut v) = self.mode {
-            v.set_search(params.query.clone(), params.case_sensitive);
-            let found = match params.direction {
-                SearchDirection::Forward => v.find_next(),
-                SearchDirection::Backward => v.find_prev(),
-            };
-            if !found {
-                self.status_message = Some(format!("\"{}\" not found", params.query));
-            }
-            return;
-        }
 
         self.do_find(params, true);
     }
@@ -4685,6 +6558,9 @@ impl App {
                     }
                 }
             }
+            Action::ExtractCiFailures => {
+                self.start_failure_extraction(side);
+            }
             Action::BottomResizeUp => {
                 self.bottom_split_pct[side] = self.bottom_split_pct[side]
                     .saturating_sub(SPLIT_RESIZE_STEP)
@@ -4802,10 +6678,10 @@ impl App {
                 }
             }
             Action::EditBuiltin => {
-                // F4: open file in editor
+                // F4: open file in editor/hex/parquet
                 let file_path = self.diff_panels[side].as_mut().and_then(|d| d.enter());
                 if let Some(path) = file_path {
-                    self.mode = AppMode::Editing(Box::new(crate::editor::EditorState::open(path)));
+                    self.open_file_for_edit(path);
                 }
             }
             Action::CursorRight => {
@@ -4872,9 +6748,16 @@ impl App {
             Action::None | Action::Tick | Action::Resize(_, _) => {}
             Action::TerminalInput(bytes) => {
                 if let Some(ref mut tp) = self.claude_panels[side] {
-                    // Auto-scroll to bottom when user types
+                    tp.clear_selection();
                     tp.scroll_to_bottom();
                     tp.write_bytes(&bytes);
+                }
+            }
+            Action::CopySelection => {
+                if let Some(ref tp) = self.claude_panels[side] {
+                    if let Some(len) = tp.copy_selection() {
+                        self.status_message = Some(format!("Copied {} chars", len));
+                    }
                 }
             }
             Action::SwitchPanel => self.handle_switch_panel(),
@@ -4890,7 +6773,18 @@ impl App {
             }
             Action::MouseClick(col, row) => {
                 if self.click_in_claude(col, row) {
-                    // Click inside Claude panel — stay focused
+                    // Copy any existing drag selection before starting new one
+                    if let Some(ref tp) = self.claude_panels[side] {
+                        if tp.selection_range().is_some() {
+                            tp.copy_selection();
+                        }
+                    }
+                    let coords = self.claude_screen_coords(side, col, row);
+                    if let Some(ref mut tp) = self.claude_panels[side] {
+                        if let Some((sr, sc)) = coords {
+                            tp.click_select(sr, sc);
+                        }
+                    }
                 } else {
                     self.focus = PanelFocus::FilePanel;
                     self.handle_mouse_click(col, row);
@@ -4898,24 +6792,109 @@ impl App {
             }
             Action::MouseDoubleClick(col, row) => {
                 if self.click_in_claude(col, row) {
-                    // Double-click inside Claude panel — absorb
+                    let coords = self.claude_screen_coords(side, col, row);
+                    if let Some(ref mut tp) = self.claude_panels[side] {
+                        if let Some((sr, sc)) = coords {
+                            tp.select_word_at(sr, sc);
+                            tp.copy_selection();
+                        }
+                    }
                 } else {
                     self.focus = PanelFocus::FilePanel;
                     self.handle_mouse_double_click(col, row);
                 }
             }
-            Action::MouseScrollUp(_, _) => {
-                if let Some(ref mut tp) = self.claude_panels[side] {
-                    tp.scroll_up(3);
+            Action::MouseTripleClick(col, row) => {
+                if self.click_in_claude(col, row) {
+                    let coords = self.claude_screen_coords(side, col, row);
+                    if let Some(ref mut tp) = self.claude_panels[side] {
+                        if let Some((sr, _)) = coords {
+                            tp.select_line_at(sr);
+                            tp.copy_selection();
+                        }
+                    }
+                } else {
+                    self.focus = PanelFocus::FilePanel;
+                    self.handle_mouse_click(col, row);
                 }
             }
-            Action::MouseScrollDown(_, _) => {
+            Action::MouseDrag(col, row) => {
+                let coords = self.claude_screen_coords_clamped(side, col, row);
                 if let Some(ref mut tp) = self.claude_panels[side] {
-                    tp.scroll_down(3);
+                    if let Some((sr, sc)) = coords {
+                        tp.drag_select(sr, sc);
+                    }
+                }
+            }
+            Action::MouseShiftClick(col, row) => {
+                if self.click_in_claude(col, row) {
+                    let coords = self.claude_screen_coords(side, col, row);
+                    if let Some(ref mut tp) = self.claude_panels[side] {
+                        if let Some((sr, sc)) = coords {
+                            tp.drag_select(sr, sc);
+                        }
+                    }
+                }
+            }
+            Action::MouseScrollUp(_, _) | Action::PageUp => {
+                if let Some(ref mut tp) = self.claude_panels[side] {
+                    tp.clear_selection();
+                    let lines = if matches!(action, Action::PageUp) {
+                        20
+                    } else {
+                        3
+                    };
+                    tp.scroll_up(lines);
+                }
+            }
+            Action::MouseScrollDown(_, _) | Action::PageDown => {
+                if let Some(ref mut tp) = self.claude_panels[side] {
+                    tp.clear_selection();
+                    let lines = if matches!(action, Action::PageDown) {
+                        20
+                    } else {
+                        3
+                    };
+                    tp.scroll_down(lines);
                 }
             }
             _ => {}
         }
+    }
+
+    /// Convert global screen coordinates to Claude panel inner (screen) coordinates.
+    /// Returns None if the position is outside the panel's inner area.
+    fn claude_screen_coords(&self, side: usize, col: u16, row: u16) -> Option<(u16, u16)> {
+        let area = self.claude_panel_areas[side]?;
+        let inner_x = area.x + 1;
+        let inner_y = area.y + 1;
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = area.height.saturating_sub(2);
+        if col < inner_x || row < inner_y {
+            return None;
+        }
+        let screen_col = col - inner_x;
+        let screen_row = row - inner_y;
+        if screen_col >= inner_w || screen_row >= inner_h {
+            return None;
+        }
+        Some((screen_row, screen_col))
+    }
+
+    /// Convert global screen coordinates to Claude panel inner coordinates, clamped to bounds.
+    /// Used for drag selection so the mouse can extend beyond the panel edge.
+    fn claude_screen_coords_clamped(&self, side: usize, col: u16, row: u16) -> Option<(u16, u16)> {
+        let area = self.claude_panel_areas[side]?;
+        let inner_x = area.x + 1;
+        let inner_y = area.y + 1;
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = area.height.saturating_sub(2);
+        if inner_w == 0 || inner_h == 0 {
+            return None;
+        }
+        let screen_col = col.saturating_sub(inner_x).min(inner_w - 1);
+        let screen_row = row.saturating_sub(inner_y).min(inner_h - 1);
+        Some((screen_row, screen_col))
     }
 
     fn click_in_claude(&self, col: u16, row: u16) -> bool {
@@ -4980,6 +6959,7 @@ impl App {
     pub fn resize_all_bottom_panels(&mut self) {
         self.resize_claude_panels();
         self.resize_shells();
+        self.resize_ssh_panels();
     }
 
     fn toggle_shell(&mut self) {
@@ -5018,6 +6998,7 @@ impl App {
             Action::None | Action::Tick | Action::Resize(_, _) => {}
             Action::TerminalInput(bytes) => {
                 if let Some(ref mut sp) = self.shell_panels[side] {
+                    sp.clear_selection();
                     sp.scroll_to_bottom();
                     sp.write_bytes(&bytes);
                 }
@@ -5040,20 +7021,138 @@ impl App {
             Action::BottomMaximize => {
                 self.bottom_maximized[side] = !self.bottom_maximized[side];
             }
-            Action::MouseClick(col, row) => self.handle_mouse_click(col, row),
-            Action::MouseDoubleClick(col, row) => self.handle_mouse_double_click(col, row),
+            Action::CopySelection => {
+                if let Some(ref sp) = self.shell_panels[side] {
+                    if let Some(len) = sp.copy_selection() {
+                        self.status_message = Some(format!("Copied {} chars", len));
+                    }
+                }
+            }
+            Action::MouseClick(col, row) => {
+                if self.click_in_shell(col, row) {
+                    // Copy any existing drag selection before starting new one
+                    if let Some(ref sp) = self.shell_panels[side] {
+                        if sp.selection_range().is_some() {
+                            sp.copy_selection();
+                        }
+                    }
+                    let coords = self.shell_screen_coords(side, col, row);
+                    if let Some(ref mut sp) = self.shell_panels[side] {
+                        if let Some((sr, sc)) = coords {
+                            sp.click_select(sr, sc);
+                        }
+                    }
+                } else {
+                    self.focus = PanelFocus::FilePanel;
+                    self.handle_mouse_click(col, row);
+                }
+            }
+            Action::MouseDoubleClick(col, row) => {
+                if self.click_in_shell(col, row) {
+                    let coords = self.shell_screen_coords(side, col, row);
+                    if let Some(ref mut sp) = self.shell_panels[side] {
+                        if let Some((sr, sc)) = coords {
+                            sp.select_word_at(sr, sc);
+                            sp.copy_selection();
+                        }
+                    }
+                } else {
+                    self.focus = PanelFocus::FilePanel;
+                    self.handle_mouse_double_click(col, row);
+                }
+            }
+            Action::MouseTripleClick(col, row) => {
+                if self.click_in_shell(col, row) {
+                    let coords = self.shell_screen_coords(side, col, row);
+                    if let Some(ref mut sp) = self.shell_panels[side] {
+                        if let Some((sr, _)) = coords {
+                            sp.select_line_at(sr);
+                            sp.copy_selection();
+                        }
+                    }
+                } else {
+                    self.focus = PanelFocus::FilePanel;
+                    self.handle_mouse_click(col, row);
+                }
+            }
+            Action::MouseDrag(col, row) => {
+                let coords = self.shell_screen_coords_clamped(side, col, row);
+                if let Some(ref mut sp) = self.shell_panels[side] {
+                    if let Some((sr, sc)) = coords {
+                        sp.drag_select(sr, sc);
+                    }
+                }
+            }
+            Action::MouseShiftClick(col, row) => {
+                if self.click_in_shell(col, row) {
+                    let coords = self.shell_screen_coords(side, col, row);
+                    if let Some(ref mut sp) = self.shell_panels[side] {
+                        if let Some((sr, sc)) = coords {
+                            sp.drag_select(sr, sc);
+                        }
+                    }
+                }
+            }
             Action::MouseScrollUp(_, _) => {
                 if let Some(ref mut sp) = self.shell_panels[side] {
+                    sp.clear_selection();
                     sp.scroll_up(3);
                 }
             }
             Action::MouseScrollDown(_, _) => {
                 if let Some(ref mut sp) = self.shell_panels[side] {
+                    sp.clear_selection();
                     sp.scroll_down(3);
                 }
             }
             _ => {}
         }
+    }
+
+    fn shell_screen_coords(&self, side: usize, col: u16, row: u16) -> Option<(u16, u16)> {
+        let area = self.shell_panel_areas[side]?;
+        let inner_x = area.x + 1;
+        let inner_y = area.y + 1;
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = area.height.saturating_sub(2);
+        if col < inner_x || row < inner_y {
+            return None;
+        }
+        let screen_col = col - inner_x;
+        let screen_row = row - inner_y;
+        if screen_col >= inner_w || screen_row >= inner_h {
+            return None;
+        }
+        Some((screen_row, screen_col))
+    }
+
+    fn shell_screen_coords_clamped(&self, side: usize, col: u16, row: u16) -> Option<(u16, u16)> {
+        let area = self.shell_panel_areas[side]?;
+        let inner_x = area.x + 1;
+        let inner_y = area.y + 1;
+        let inner_w = area.width.saturating_sub(2);
+        let inner_h = area.height.saturating_sub(2);
+        if inner_w == 0 || inner_h == 0 {
+            return None;
+        }
+        let screen_col = col.saturating_sub(inner_x).min(inner_w - 1);
+        let screen_row = row.saturating_sub(inner_y).min(inner_h - 1);
+        Some((screen_row, screen_col))
+    }
+
+    fn click_in_shell(&self, col: u16, row: u16) -> bool {
+        for side in 0..2 {
+            if let Some(area) = self.shell_panel_areas[side] {
+                if col >= area.x
+                    && col < area.x + area.width
+                    && row >= area.y
+                    && row < area.y + area.height
+                {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     fn resize_shells(&mut self) {
@@ -5066,6 +7165,983 @@ impl App {
                 }
             }
         }
+    }
+
+    fn resize_ssh_panels(&mut self) {
+        for side in 0..2 {
+            if let Some(ref mut sp) = self.ssh_panels[side] {
+                if let Some(area) = self.ssh_panel_areas[side] {
+                    let cols = area.width.saturating_sub(2).max(1);
+                    let rows = area.height.saturating_sub(2).max(1);
+                    sp.resize(cols, rows);
+                }
+            }
+        }
+    }
+
+    fn toggle_ssh(&mut self) {
+        let side = self.active_panel;
+
+        // If the file panel is remote, disconnect and return to local
+        if self.panels[side].source.is_remote() {
+            let label = self.panels[side].source.label().unwrap_or_default();
+            let local_path = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            self.panels[side].switch_to_local(local_path);
+            self.status_message = Some(format!("{} disconnected", label));
+            return;
+        }
+
+        if self.ssh_panels[side].is_some() {
+            // Close SSH panel
+            self.ssh_panels[side] = None;
+            self.ssh_hosts[side] = None;
+            if self.focus == PanelFocus::Ssh(side) {
+                self.focus = PanelFocus::FilePanel;
+            }
+        } else {
+            // Open SSH dialog to pick a host
+            self.ssh_dialog = Some(SshDialogState::new());
+        }
+    }
+
+    fn handle_ssh_action(&mut self, action: Action) {
+        let side = match self.focus {
+            PanelFocus::Ssh(s) => s,
+            _ => return,
+        };
+
+        match action {
+            Action::None | Action::Tick | Action::Resize(_, _) => {}
+            Action::TerminalInput(ref bytes) => {
+                let is_exited = self.ssh_panels[side]
+                    .as_ref()
+                    .map(|sp| sp.exited)
+                    .unwrap_or(false);
+                if is_exited {
+                    // On Enter, reconnect to the same host
+                    if bytes == b"\r" {
+                        if let Some(host) = self.ssh_hosts[side].clone() {
+                            self.ssh_panels[side] = None;
+                            self.connect_ssh(host);
+                        }
+                    }
+                    // Ignore other input when disconnected
+                } else if let Some(ref mut sp) = self.ssh_panels[side] {
+                    sp.scroll_to_bottom();
+                    sp.write_bytes(bytes);
+                }
+            }
+            Action::SwitchPanel => self.handle_switch_panel(),
+            Action::SwitchPanelReverse => self.handle_switch_panel_reverse(),
+            Action::ToggleSsh => {
+                self.ssh_panels[side] = None;
+                self.ssh_hosts[side] = None;
+                self.focus = PanelFocus::FilePanel;
+            }
+            Action::Quit => {
+                self.quit_confirm = Some(true);
+            }
+            Action::BottomResizeUp => {
+                self.bottom_split_pct[side] = self.bottom_split_pct[side]
+                    .saturating_sub(SPLIT_RESIZE_STEP)
+                    .max(SPLIT_MIN_PCT);
+            }
+            Action::BottomResizeDown => {
+                self.bottom_split_pct[side] =
+                    (self.bottom_split_pct[side] + SPLIT_RESIZE_STEP).min(SPLIT_MAX_PCT);
+            }
+            Action::BottomMaximize => {
+                self.bottom_maximized[side] = !self.bottom_maximized[side];
+            }
+            Action::MouseClick(col, row) => {
+                if self.click_in_ssh(col, row) {
+                    // Click inside SSH panel — stay focused
+                } else {
+                    self.focus = PanelFocus::FilePanel;
+                    self.handle_mouse_click(col, row);
+                }
+            }
+            Action::MouseDoubleClick(col, row) => {
+                if self.click_in_ssh(col, row) {
+                    // absorb
+                } else {
+                    self.focus = PanelFocus::FilePanel;
+                    self.handle_mouse_double_click(col, row);
+                }
+            }
+            Action::MouseScrollUp(_, _) => {
+                if let Some(ref mut sp) = self.ssh_panels[side] {
+                    sp.scroll_up(3);
+                }
+            }
+            Action::MouseScrollDown(_, _) => {
+                if let Some(ref mut sp) = self.ssh_panels[side] {
+                    sp.scroll_down(3);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn click_in_ssh(&self, col: u16, row: u16) -> bool {
+        for side in 0..2 {
+            if let Some(area) = self.ssh_panel_areas[side] {
+                if col >= area.x
+                    && col < area.x + area.width
+                    && row >= area.y
+                    && row < area.y + area.height
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn handle_ssh_dialog_action(&mut self, action: Action) {
+        // Handle saved connections browsing mode
+        if let Some(ref d) = self.ssh_dialog {
+            if d.saved_selected.is_some() {
+                match action {
+                    Action::DialogCancel => {
+                        self.ssh_dialog = None;
+                        return;
+                    }
+                    Action::MoveUp => {
+                        if let Some(ref mut d) = self.ssh_dialog {
+                            if let Some(ref mut sel) = d.saved_selected {
+                                *sel = sel.saturating_sub(1);
+                            }
+                        }
+                        return;
+                    }
+                    Action::MoveDown => {
+                        if let Some(ref mut d) = self.ssh_dialog {
+                            let max = d.saved_connections.len().saturating_sub(1);
+                            if let Some(ref mut sel) = d.saved_selected {
+                                *sel = (*sel + 1).min(max);
+                            }
+                        }
+                        return;
+                    }
+                    Action::Toggle | Action::ToggleReverse => {
+                        // Switch from saved mode to protocol input mode
+                        if let Some(ref mut d) = self.ssh_dialog {
+                            d.saved_selected = None;
+                        }
+                        return;
+                    }
+                    Action::Delete => {
+                        // Delete the selected saved connection
+                        if let Some(ref mut d) = self.ssh_dialog {
+                            if let Some(sel) = d.saved_selected {
+                                if sel < d.saved_connections.len() {
+                                    d.saved_connections.remove(sel);
+                                    crate::saved_connections::save_connections(
+                                        &d.saved_connections,
+                                    );
+                                    if d.saved_connections.is_empty() {
+                                        d.saved_selected = None;
+                                    } else if sel >= d.saved_connections.len() {
+                                        d.saved_selected = Some(d.saved_connections.len() - 1);
+                                    }
+                                    self.status_message = Some("Connection deleted".to_string());
+                                }
+                            }
+                        }
+                        return;
+                    }
+                    Action::DialogConfirm => {
+                        // Connect using saved connection
+                        let conn = self
+                            .ssh_dialog
+                            .as_ref()
+                            .and_then(|d| d.saved_selected)
+                            .and_then(|sel| {
+                                self.ssh_dialog
+                                    .as_ref()?
+                                    .saved_connections
+                                    .get(sel)
+                                    .cloned()
+                            });
+                        self.ssh_dialog = None;
+                        if let Some(c) = conn {
+                            self.connect_saved(&c);
+                        }
+                        return;
+                    }
+                    _ => return,
+                }
+            }
+        }
+
+        // Handle F2 (save current connection)
+        if matches!(action, Action::EditorSave) {
+            self.save_dialog_as_connection();
+            return;
+        }
+
+        match action {
+            Action::DialogCancel => {
+                self.ssh_dialog = None;
+            }
+            // Alt+Left/Right cycle protocol
+            Action::SwitchPanelReverse => {
+                if let Some(ref mut d) = self.ssh_dialog {
+                    d.protocol = d.protocol.prev();
+                    d.field_focus = 0;
+                }
+            }
+            Action::SwitchPanel => {
+                if let Some(ref mut d) = self.ssh_dialog {
+                    d.protocol = d.protocol.next();
+                    d.field_focus = 0;
+                }
+            }
+            Action::Toggle => {
+                // Tab cycles focus zones forward
+                if let Some(ref mut d) = self.ssh_dialog {
+                    let max = d.max_fields();
+                    d.field_focus = (d.field_focus + 1) % max;
+                }
+            }
+            Action::ToggleReverse => {
+                // BackTab cycles focus zones backward
+                if let Some(ref mut d) = self.ssh_dialog {
+                    let max = d.max_fields();
+                    d.field_focus = (d.field_focus + max - 1) % max;
+                }
+            }
+            Action::DialogConfirm | Action::Enter => {
+                let protocol = self.ssh_dialog.as_ref().map(|d| d.protocol);
+                crate::debug_log::log(&format!("DialogConfirm: protocol={:?}", protocol));
+                match protocol {
+                    Some(RemoteProtocol::Ssh) | Some(RemoteProtocol::Sftp) => {
+                        let (host, is_sftp) = if let Some(ref dialog) = self.ssh_dialog {
+                            let h = dialog.selected_host().cloned().or_else(|| {
+                                crate::ssh::SshHost::from_quick_connect(&dialog.input.text)
+                            });
+                            (h, dialog.protocol == RemoteProtocol::Sftp)
+                        } else {
+                            (None, false)
+                        };
+                        let had_input = self
+                            .ssh_dialog
+                            .as_ref()
+                            .map(|d| !d.input.text.trim().is_empty())
+                            .unwrap_or(false);
+                        self.ssh_dialog = None;
+                        if let Some(host) = host {
+                            if is_sftp {
+                                self.connect_sftp(host);
+                            } else {
+                                self.connect_ssh(host);
+                            }
+                        } else if had_input {
+                            self.status_message =
+                                Some("Invalid host format. Use: user@host[:port]".to_string());
+                        }
+                    }
+                    Some(RemoteProtocol::Smb) => {
+                        let (host, share, user, pass) = if let Some(ref d) = self.ssh_dialog {
+                            (
+                                d.input.text.clone(),
+                                d.smb_share.text.clone(),
+                                d.smb_user.text.clone(),
+                                d.smb_pass.text.clone(),
+                            )
+                        } else {
+                            (String::new(), String::new(), String::new(), String::new())
+                        };
+                        self.ssh_dialog = None;
+                        if host.is_empty() || share.is_empty() {
+                            self.status_message =
+                                Some("Host and share name are required".to_string());
+                        } else {
+                            self.connect_smb(&host, &share, &user, &pass);
+                        }
+                    }
+                    Some(RemoteProtocol::WebDav) => {
+                        let (url, user, pass) = if let Some(ref d) = self.ssh_dialog {
+                            (
+                                d.input.text.clone(),
+                                d.webdav_user.text.clone(),
+                                d.webdav_pass.text.clone(),
+                            )
+                        } else {
+                            (String::new(), String::new(), String::new())
+                        };
+                        self.ssh_dialog = None;
+                        if url.is_empty() {
+                            self.status_message = Some("URL is required".to_string());
+                        } else {
+                            self.connect_webdav(&url, &user, &pass);
+                        }
+                    }
+                    Some(RemoteProtocol::S3) => {
+                        let (bucket, profile, endpoint, region) =
+                            if let Some(ref d) = self.ssh_dialog {
+                                (
+                                    d.s3_bucket.text.clone(),
+                                    d.s3_profile.text.clone(),
+                                    d.s3_endpoint.text.clone(),
+                                    d.s3_region.text.clone(),
+                                )
+                            } else {
+                                (String::new(), String::new(), String::new(), String::new())
+                            };
+                        self.ssh_dialog = None;
+                        if bucket.is_empty() {
+                            self.status_message = Some("Bucket name is required".to_string());
+                        } else {
+                            self.connect_s3(&bucket, &profile, &endpoint, &region);
+                        }
+                    }
+                    Some(RemoteProtocol::Gcs) => {
+                        let (bucket, project) = if let Some(ref d) = self.ssh_dialog {
+                            (d.gcs_bucket.text.clone(), d.gcs_project.text.clone())
+                        } else {
+                            (String::new(), String::new())
+                        };
+                        self.ssh_dialog = None;
+                        if bucket.is_empty() {
+                            self.status_message = Some("Bucket name is required".to_string());
+                        } else {
+                            self.connect_gcs(&bucket, &project);
+                        }
+                    }
+                    Some(RemoteProtocol::AzureBlob) => {
+                        let (account, container, sas, conn_str) =
+                            if let Some(ref d) = self.ssh_dialog {
+                                crate::debug_log::log(&format!(
+                                    "Azure fields: account={:?} container={:?} sas={} conn_str={}",
+                                    d.azure_account.text,
+                                    d.azure_container.text,
+                                    if d.azure_sas.text.is_empty() {
+                                        "(empty)"
+                                    } else {
+                                        "(set)"
+                                    },
+                                    if d.azure_conn_str.text.is_empty() {
+                                        "(empty)"
+                                    } else {
+                                        "(set)"
+                                    },
+                                ));
+                                (
+                                    d.azure_account.text.clone(),
+                                    d.azure_container.text.clone(),
+                                    d.azure_sas.text.clone(),
+                                    d.azure_conn_str.text.clone(),
+                                )
+                            } else {
+                                (String::new(), String::new(), String::new(), String::new())
+                            };
+                        self.ssh_dialog = None;
+                        // Extract account name from connection string if account field is empty
+                        let account = if account.is_empty() && !conn_str.is_empty() {
+                            conn_str
+                                .split(';')
+                                .find_map(|part| part.strip_prefix("AccountName="))
+                                .unwrap_or("azure")
+                                .to_string()
+                        } else {
+                            account
+                        };
+                        // Container is now optional -- when empty, lists containers at account level
+                        if !conn_str.is_empty() || !account.is_empty() {
+                            self.connect_azure_blob(&account, &container, &sas, &conn_str);
+                        } else {
+                            self.status_message =
+                                Some("Account name or connection string is required".to_string());
+                            self.dirty = true;
+                        }
+                    }
+                    Some(RemoteProtocol::Nfs) => {
+                        let (host, export, options) = if let Some(ref d) = self.ssh_dialog {
+                            (
+                                d.nfs_host.text.clone(),
+                                d.nfs_export.text.clone(),
+                                d.nfs_options.text.clone(),
+                            )
+                        } else {
+                            (String::new(), String::new(), String::new())
+                        };
+                        self.ssh_dialog = None;
+                        if host.is_empty() || export.is_empty() {
+                            self.status_message =
+                                Some("Host and export path are required".to_string());
+                        } else {
+                            self.connect_nfs(&host, &export, &options);
+                        }
+                    }
+                    None => {
+                        self.ssh_dialog = None;
+                    }
+                }
+            }
+            Action::MoveUp => {
+                // Up arrow: navigate within the current focus zone
+                if let Some(ref mut d) = self.ssh_dialog {
+                    let is_ssh = matches!(d.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp);
+                    if is_ssh && d.field_focus >= 1 {
+                        // SSH/SFTP: navigate host list (field_focus 1=input, 2=host list)
+                        d.selected = d.selected.saturating_sub(1);
+                    }
+                }
+            }
+            Action::MoveDown => {
+                if let Some(ref mut d) = self.ssh_dialog {
+                    let is_ssh = matches!(d.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp);
+                    if is_ssh && d.field_focus >= 1 && !d.filtered.is_empty() {
+                        d.selected = (d.selected + 1).min(d.filtered.len() - 1);
+                    }
+                }
+            }
+            _ => {
+                // Delegate text input actions (type, backspace, delete, cursor,
+                // selection, undo/redo, copy, cut) to TextInput::handle_action.
+                if let Some(ref mut d) = self.ssh_dialog {
+                    let is_ssh = matches!(d.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp);
+                    if d.active_input_mut().handle_action(&action) && is_ssh {
+                        d.update_filter();
+                    }
+                }
+            }
+        }
+    }
+
+    fn connect_ssh(&mut self, host: crate::ssh::SshHost) {
+        let side = self.active_panel;
+        if let Some(ref wakeup) = self.wakeup_sender {
+            let area = self.panel_areas[side];
+            let cols = area.width.saturating_sub(2).max(1);
+            let rows = (area.height * 40 / 100).saturating_sub(2).max(1);
+            match TerminalPanel::spawn_ssh(&host, cols, rows, wakeup.clone()) {
+                Ok(tp) => {
+                    self.ssh_panels[side] = Some(tp);
+                    self.ssh_hosts[side] = Some(host);
+                    self.focus = PanelFocus::Ssh(side);
+                    self.bottom_split_pct[side] = self.persisted.split_pct_ssh;
+                }
+                Err(e) => {
+                    self.status_message = Some(format!("SSH failed: {}", e));
+                }
+            }
+        }
+    }
+
+    fn connect_sftp(&mut self, host: crate::ssh::SshHost) {
+        self.status_message = Some(format!("Connecting SFTP to {}...", host.display_label()));
+        self.spawn_remote_connect(move || {
+            crate::sftp::SftpConnection::connect(&host)
+                .map(|c| Box::new(c) as Box<dyn crate::remote_fs::RemoteFs + Send>)
+        });
+    }
+
+    fn connect_smb(&mut self, host: &str, share: &str, user: &str, pass: &str) {
+        self.status_message = Some(format!("Connecting SMB to {}\\{}...", host, share));
+        let host = host.to_string();
+        let share = share.to_string();
+        let user = user.to_string();
+        let pass = pass.to_string();
+        self.spawn_remote_connect(move || {
+            crate::smb_client::SmbConnection::connect(&host, &share, &user, &pass)
+                .map(|c| Box::new(c) as Box<dyn crate::remote_fs::RemoteFs + Send>)
+        });
+    }
+
+    fn connect_webdav(&mut self, url: &str, user: &str, pass: &str) {
+        self.status_message = Some(format!("Connecting WebDAV to {}...", url));
+        let url = url.to_string();
+        let user = user.to_string();
+        let pass = pass.to_string();
+        self.spawn_remote_connect(move || {
+            crate::webdav::WebDavConnection::connect(&url, &user, &pass)
+                .map(|c| Box::new(c) as Box<dyn crate::remote_fs::RemoteFs + Send>)
+        });
+    }
+
+    fn connect_s3(&mut self, bucket: &str, profile: &str, endpoint: &str, region: &str) {
+        self.status_message = Some(format!("Connecting S3 to {}...", bucket));
+        let bucket = bucket.to_string();
+        let profile = if profile.is_empty() {
+            None
+        } else {
+            Some(profile.to_string())
+        };
+        let endpoint = if endpoint.is_empty() {
+            None
+        } else {
+            Some(endpoint.to_string())
+        };
+        let region = if region.is_empty() {
+            None
+        } else {
+            Some(region.to_string())
+        };
+        self.spawn_remote_connect(move || {
+            crate::s3::S3Connection::connect(
+                &bucket,
+                profile.as_deref(),
+                endpoint.as_deref(),
+                region.as_deref(),
+            )
+            .map(|c| Box::new(c) as Box<dyn crate::remote_fs::RemoteFs + Send>)
+        });
+    }
+
+    fn connect_gcs(&mut self, bucket: &str, project: &str) {
+        self.status_message = Some(format!("Connecting GCS to {}...", bucket));
+        let bucket = bucket.to_string();
+        let project = if project.is_empty() {
+            None
+        } else {
+            Some(project.to_string())
+        };
+        self.spawn_remote_connect(move || {
+            crate::gcs::GcsConnection::connect(&bucket, project.as_deref())
+                .map(|c| Box::new(c) as Box<dyn crate::remote_fs::RemoteFs + Send>)
+        });
+    }
+
+    fn connect_azure_blob(&mut self, account: &str, container: &str, sas: &str, conn_str: &str) {
+        self.status_message = Some(format!("Connecting Azure to {}/{}...", account, container));
+        let account = account.to_string();
+        let container = container.to_string();
+        let sas = if sas.is_empty() {
+            None
+        } else {
+            Some(sas.to_string())
+        };
+        let conn_str = if conn_str.is_empty() {
+            None
+        } else {
+            Some(conn_str.to_string())
+        };
+        self.spawn_remote_connect(move || {
+            crate::azure_blob::AzureBlobConnection::connect(
+                &account,
+                &container,
+                sas.as_deref(),
+                conn_str.as_deref(),
+            )
+            .map(|c| Box::new(c) as Box<dyn crate::remote_fs::RemoteFs + Send>)
+        });
+    }
+
+    fn connect_nfs(&mut self, host: &str, export: &str, options: &str) {
+        self.status_message = Some(format!("Mounting NFS {}:{}...", host, export));
+        let host = host.to_string();
+        let export = export.to_string();
+        let options = options.to_string();
+        self.spawn_remote_connect(move || {
+            crate::nfs_client::NfsConnection::connect(&host, &export, &options)
+                .map(|c| Box::new(c) as Box<dyn crate::remote_fs::RemoteFs + Send>)
+        });
+    }
+
+    /// Spawn a background thread to establish a remote connection.
+    fn connect_saved(&mut self, conn: &crate::saved_connections::SavedConnection) {
+        match conn.protocol.as_str() {
+            "ssh" => {
+                if let Some(host) = crate::ssh::SshHost::from_quick_connect(
+                    conn.display_label()
+                        .strip_prefix("SSH: ")
+                        .unwrap_or(&conn.name),
+                ) {
+                    self.connect_ssh(host);
+                }
+            }
+            "sftp" => {
+                let host = crate::ssh::SshHost {
+                    name: conn.name.clone(),
+                    hostname: conn.host.clone().unwrap_or_default(),
+                    port: conn.port,
+                    user: conn.user.clone(),
+                    identity_file: conn.identity_file.clone(),
+                    group: None,
+                    jump_host: conn.jump_host.clone(),
+                    extra_args: vec![],
+                    source: crate::ssh::HostSource::Saved,
+                };
+                self.connect_sftp(host);
+            }
+            "smb" => {
+                self.connect_smb(
+                    conn.host.as_deref().unwrap_or(""),
+                    conn.share.as_deref().unwrap_or(""),
+                    conn.user.as_deref().unwrap_or(""),
+                    conn.password.as_deref().unwrap_or(""),
+                );
+            }
+            "webdav" => {
+                self.connect_webdav(
+                    conn.url.as_deref().unwrap_or(""),
+                    conn.user.as_deref().unwrap_or(""),
+                    conn.password.as_deref().unwrap_or(""),
+                );
+            }
+            "s3" => {
+                self.connect_s3(
+                    conn.bucket.as_deref().unwrap_or(""),
+                    conn.profile.as_deref().unwrap_or(""),
+                    conn.endpoint_url.as_deref().unwrap_or(""),
+                    conn.region.as_deref().unwrap_or(""),
+                );
+            }
+            "gcs" => {
+                self.connect_gcs(
+                    conn.bucket.as_deref().unwrap_or(""),
+                    conn.project.as_deref().unwrap_or(""),
+                );
+            }
+            "azure" => {
+                self.connect_azure_blob(
+                    conn.account.as_deref().unwrap_or(""),
+                    conn.container.as_deref().unwrap_or(""),
+                    conn.sas_token.as_deref().unwrap_or(""),
+                    conn.connection_string.as_deref().unwrap_or(""),
+                );
+            }
+            "nfs" => {
+                self.connect_nfs(
+                    conn.host.as_deref().unwrap_or(""),
+                    conn.export.as_deref().unwrap_or(""),
+                    conn.mount_options.as_deref().unwrap_or(""),
+                );
+            }
+            _ => {
+                self.status_message = Some(format!("Unknown protocol: {}", conn.protocol));
+            }
+        }
+    }
+
+    fn save_dialog_as_connection(&mut self) {
+        crate::debug_log::log("save_dialog_as_connection called");
+        let conn = if let Some(ref d) = self.ssh_dialog {
+            let protocol = match d.protocol {
+                RemoteProtocol::Ssh => "ssh",
+                RemoteProtocol::Sftp => "sftp",
+                RemoteProtocol::Smb => "smb",
+                RemoteProtocol::WebDav => "webdav",
+                RemoteProtocol::S3 => "s3",
+                RemoteProtocol::Gcs => "gcs",
+                RemoteProtocol::AzureBlob => "azure",
+                RemoteProtocol::Nfs => "nfs",
+            };
+            let mut c = crate::saved_connections::SavedConnection {
+                name: String::new(),
+                protocol: protocol.to_string(),
+                host: None,
+                port: None,
+                user: None,
+                password: None,
+                share: None,
+                url: None,
+                bucket: None,
+                profile: None,
+                endpoint_url: None,
+                region: None,
+                project: None,
+                account: None,
+                container: None,
+                sas_token: None,
+                connection_string: None,
+                export: None,
+                mount_options: None,
+                identity_file: None,
+                jump_host: None,
+            };
+            match d.protocol {
+                RemoteProtocol::Ssh | RemoteProtocol::Sftp => {
+                    c.host = Some(d.input.text.clone());
+                }
+                RemoteProtocol::Smb => {
+                    c.host = Some(d.input.text.clone());
+                    c.share = Some(d.smb_share.text.clone());
+                    c.user = Some(d.smb_user.text.clone());
+                    c.password = Some(d.smb_pass.text.clone());
+                }
+                RemoteProtocol::WebDav => {
+                    c.url = Some(d.input.text.clone());
+                    c.user = Some(d.webdav_user.text.clone());
+                    c.password = Some(d.webdav_pass.text.clone());
+                }
+                RemoteProtocol::S3 => {
+                    c.bucket = Some(d.s3_bucket.text.clone());
+                    c.profile = Some(d.s3_profile.text.clone());
+                    c.endpoint_url = Some(d.s3_endpoint.text.clone());
+                    c.region = Some(d.s3_region.text.clone());
+                }
+                RemoteProtocol::Gcs => {
+                    c.bucket = Some(d.gcs_bucket.text.clone());
+                    c.project = Some(d.gcs_project.text.clone());
+                }
+                RemoteProtocol::AzureBlob => {
+                    c.account = Some(d.azure_account.text.clone());
+                    c.container = Some(d.azure_container.text.clone());
+                    c.sas_token = Some(d.azure_sas.text.clone());
+                    c.connection_string = Some(d.azure_conn_str.text.clone());
+                }
+                RemoteProtocol::Nfs => {
+                    c.host = Some(d.nfs_host.text.clone());
+                    c.export = Some(d.nfs_export.text.clone());
+                    c.mount_options = Some(d.nfs_options.text.clone());
+                }
+            }
+            c.name = c.display_label();
+            Some(c)
+        } else {
+            None
+        };
+
+        if let Some(mut c) = conn {
+            // Auto-extract account from connection string if name is unhelpful
+            if c.name.ends_with(": /") || c.name.ends_with(": ?/?") {
+                if let Some(ref cs) = c.connection_string {
+                    if let Some(acct) = cs.split(';').find_map(|p| p.strip_prefix("AccountName=")) {
+                        c.name = format!("Azure: {}", acct);
+                    }
+                }
+            }
+            if let Some(ref mut d) = self.ssh_dialog {
+                let name = c.name.clone();
+                d.saved_connections.push(c);
+                crate::saved_connections::save_connections(&d.saved_connections);
+                // Show popup over the dialog so user can see it
+                self.popup = Some((
+                    "Saved".to_string(),
+                    format!("{}\n\nConnection saved for quick access.", name),
+                ));
+            }
+        }
+    }
+
+    fn spawn_remote_connect<F>(&mut self, f: F)
+    where
+        F: FnOnce() -> anyhow::Result<Box<dyn crate::remote_fs::RemoteFs + Send>> + Send + 'static,
+    {
+        crate::debug_log::log("spawn_remote_connect: starting background thread");
+        self.dirty = true;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let side = self.active_panel;
+        std::thread::spawn(move || {
+            let result = f();
+            match &result {
+                Ok(conn) => crate::debug_log::log(&format!(
+                    "Connection succeeded: {}",
+                    conn.display_label()
+                )),
+                Err(e) => crate::debug_log::log_error("connect", &format!("{}", e)),
+            }
+            let _ = tx.send(RemoteConnectResult { result });
+        });
+        self.pending_remote = Some(PendingRemoteConnect {
+            rx,
+            side,
+            started: std::time::Instant::now(),
+        });
+    }
+
+    fn handle_session_dialog_action(&mut self, action: Action) {
+        // Check if we're in "create new" input mode
+        let creating = self
+            .session_dialog
+            .as_ref()
+            .map(|d| d.creating)
+            .unwrap_or(false);
+
+        if creating {
+            match action {
+                Action::DialogCancel => {
+                    // Cancel creation, go back to list
+                    if let Some(ref mut d) = self.session_dialog {
+                        d.creating = false;
+                        d.input = crate::text_input::TextInput::new(String::new());
+                    }
+                }
+                Action::DialogConfirm => {
+                    let name = self
+                        .session_dialog
+                        .as_ref()
+                        .map(|d| d.input.text.trim().to_string())
+                        .unwrap_or_default();
+                    if !name.is_empty() {
+                        match crate::session::create_session(&name) {
+                            Ok(()) => {
+                                self.status_message = Some(format!(
+                                    "Created session '{}'. Use --session {} to attach.",
+                                    name, name
+                                ));
+                            }
+                            Err(e) => {
+                                self.status_message =
+                                    Some(format!("Failed to create session: {}", e));
+                            }
+                        }
+                    }
+                    if let Some(ref mut d) = self.session_dialog {
+                        d.creating = false;
+                        d.input = crate::text_input::TextInput::new(String::new());
+                        d.refresh();
+                    }
+                }
+                Action::DialogInput(c) => {
+                    if let Some(ref mut d) = self.session_dialog {
+                        d.input.insert_char(c);
+                    }
+                }
+                Action::DialogBackspace => {
+                    if let Some(ref mut d) = self.session_dialog {
+                        d.input.backspace();
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match action {
+            Action::DialogCancel => {
+                self.session_dialog = None;
+            }
+            Action::DialogConfirm => {
+                // Attach to selected session (spawn tmux attach in a terminal panel)
+                let session_name = self
+                    .session_dialog
+                    .as_ref()
+                    .and_then(|d| d.selected_session())
+                    .map(|s| s.name.clone());
+                self.session_dialog = None;
+
+                if let Some(name) = session_name {
+                    self.attach_tmux_session(&name);
+                }
+            }
+            Action::MoveUp => {
+                if let Some(ref mut d) = self.session_dialog {
+                    d.selected = d.selected.saturating_sub(1);
+                }
+            }
+            Action::MoveDown => {
+                if let Some(ref mut d) = self.session_dialog {
+                    if !d.sessions.is_empty() {
+                        d.selected = (d.selected + 1).min(d.sessions.len() - 1);
+                    }
+                }
+            }
+            Action::CreateDir => {
+                // 'n' key = new session
+                if let Some(ref mut d) = self.session_dialog {
+                    d.creating = true;
+                }
+            }
+            Action::Delete => {
+                // 'd' or Delete = kill session
+                let session_name = self
+                    .session_dialog
+                    .as_ref()
+                    .and_then(|d| d.selected_session())
+                    .map(|s| s.name.clone());
+                if let Some(name) = session_name {
+                    match crate::session::kill_session(&name) {
+                        Ok(()) => {
+                            self.status_message = Some(format!("Killed session '{}'", name));
+                        }
+                        Err(e) => {
+                            self.status_message = Some(format!("Failed to kill session: {}", e));
+                        }
+                    }
+                    if let Some(ref mut d) = self.session_dialog {
+                        d.refresh();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn attach_tmux_session(&mut self, session_name: &str) {
+        let side = self.active_panel;
+        if let Some(ref wakeup) = self.wakeup_sender {
+            let area = self.panel_areas[side];
+            let cols = area.width.saturating_sub(2).max(1);
+            let rows = (area.height * 40 / 100).saturating_sub(2).max(1);
+            let (cmd, args) = crate::session::attach_command(session_name);
+            let args_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            let dir = std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from("/"));
+            match TerminalPanel::spawn_cmd(
+                &cmd,
+                &args_refs,
+                &dir,
+                cols,
+                rows,
+                format!(" tmux: {} ", session_name),
+                true,
+                wakeup.clone(),
+            ) {
+                Ok(tp) => {
+                    self.shell_panels[side] = Some(tp);
+                    self.focus = PanelFocus::Shell(side);
+                    self.bottom_split_pct[side] = self.persisted.split_pct_shell;
+                }
+                Err(e) => {
+                    self.status_message = Some(format!("tmux attach failed: {}", e));
+                }
+            }
+        }
+    }
+
+    fn start_failure_extraction(&mut self, side: usize) {
+        let ci = match &mut self.ci_panels[side] {
+            Some(ci) => ci,
+            None => return,
+        };
+
+        if ci.failure_extraction.is_some() {
+            self.status_message = Some("Extraction already in progress...".to_string());
+            return;
+        }
+
+        let failed_checks: Vec<crate::ci::CiCheck> = match &ci.view {
+            crate::ci::CiView::Tree { checks, .. } => checks
+                .iter()
+                .filter(|c| c.status == crate::ci::CiStatus::Failure)
+                .cloned()
+                .collect(),
+            _ => return,
+        };
+
+        if failed_checks.is_empty() {
+            self.status_message = Some("No failed checks to extract".to_string());
+            return;
+        }
+
+        // Check auth requirements before starting
+        let has_github = failed_checks
+            .iter()
+            .any(|c| c.details_url.contains("github.com"));
+        let has_azure = failed_checks.iter().any(|c| c.azure_info.is_some());
+        let mut warnings = Vec::new();
+
+        if has_github && !crate::ci::check_gh_auth() {
+            warnings.push("GitHub: `gh auth login` required for log access.");
+        }
+        if has_azure && !crate::ci::has_azure_pat() {
+            warnings.push("Azure DevOps: PAT required. Set AZURE_DEVOPS_PAT\nor store via: secret-tool store --label 'mm azure'\n  service middle-manager account azure-pat");
+        }
+
+        if !warnings.is_empty() {
+            self.popup = Some(("Authentication Required".to_string(), warnings.join("\n\n")));
+            return;
+        }
+
+        let repo = ci.repo.clone();
+        ci.failure_extraction = Some(crate::ci::FailureExtraction::start(repo, failed_checks));
+        self.status_message = Some("Extracting test failures from CI logs...".to_string());
     }
 
     fn start_ci_log_download(&mut self, side: usize, run_id: u64, step: &crate::ci::CiStep) {
@@ -5124,7 +8200,10 @@ impl App {
                 .unwrap_or(0);
 
             if job_id > 0 {
-                let ci = self.ci_panels[side].as_mut().unwrap();
+                let ci = match self.ci_panels[side].as_mut() {
+                    Some(ci) => ci,
+                    None => return,
+                };
                 ci.download = Some(crate::ci::LogDownload::start_github(
                     &repo,
                     run_id,
@@ -5231,7 +8310,8 @@ impl App {
 
         let mut first_err: Option<anyhow::Error> = None;
         for name in &names {
-            if let Err(e) = fs_ops::create_directory(&dir, name) {
+            let result = self.remote_mkdir(&dir.join(name));
+            if let Err(e) = result {
                 first_err = Some(e);
                 break;
             }
@@ -5346,7 +8426,7 @@ impl App {
     }
 
     fn confirm_copy_dialog(&mut self) {
-        let (source_paths, dests, is_move, opts, is_ask) = {
+        let (source_paths, dests, is_move, source_panel, opts, is_ask) = {
             let state = match &self.mode {
                 AppMode::CopyDialog(s) => s,
                 _ => return,
@@ -5371,15 +8451,97 @@ impl App {
                 state.source_paths.clone(),
                 dests,
                 state.is_move,
+                state.source_panel,
                 opts,
                 is_ask,
             )
         };
 
+        // Determine source and dest filesystem types using the panel that was
+        // active when the dialog was opened, not the currently active panel.
+        let src_remote = self.panels[source_panel].source.is_remote();
+        let dst_remote = self.panels[1 - source_panel].source.is_remote();
+        let src_side = source_panel;
+        let dst_side = 1 - source_panel;
+
         self.mode = AppMode::Normal;
 
+        // Remote operations use a simpler path (no copy options / ask mode)
+        if src_remote || dst_remote {
+            let mut first_err: Option<anyhow::Error> = None;
+            let total_files = source_paths.len();
+            for dest in &dests {
+                for (i, source_path) in source_paths.iter().enumerate() {
+                    let file_name = source_path
+                        .file_name()
+                        .map(|n| n.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    let dest_path = dest.join(&file_name);
+
+                    let op = if is_move { "Moving" } else { "Copying" };
+                    self.status_message =
+                        Some(format!("{} {}/{}: {}", op, i + 1, total_files, file_name));
+                    self.dirty = true;
+
+                    let result = match (src_remote, dst_remote) {
+                        (true, false) => {
+                            let is_dir = self.panels[src_side]
+                                .entries
+                                .iter()
+                                .find(|e| e.path == *source_path)
+                                .map(|e| e.is_dir)
+                                .unwrap_or(false);
+                            self.remote_download(src_side, source_path, &dest_path, is_dir)
+                                .map(|_| ())
+                        }
+                        (false, true) => {
+                            let is_dir = source_path.is_dir();
+                            self.remote_upload(dst_side, source_path, &dest_path, is_dir)
+                                .map(|_| ())
+                        }
+                        (true, true) => {
+                            Err(anyhow::anyhow!("Remote-to-remote copy not yet supported"))
+                        }
+                        _ => unreachable!(),
+                    };
+                    if let Err(e) = result {
+                        first_err = Some(e);
+                        break;
+                    }
+                }
+                if first_err.is_some() {
+                    break;
+                }
+            }
+
+            if is_move && first_err.is_none() && src_remote {
+                for source_path in &source_paths {
+                    let del_result = match &self.panels[src_side].source {
+                        crate::panel::PanelSource::Local => fs_ops::delete_entry(source_path),
+                        crate::panel::PanelSource::Remote { connection } => {
+                            connection.remove_recursive(source_path)
+                        }
+                    };
+                    if let Err(e) = del_result {
+                        first_err = Some(e);
+                        break;
+                    }
+                }
+            }
+
+            match first_err {
+                None => {
+                    let op = if is_move { "Moved" } else { "Copied" };
+                    self.status_message = Some(format!("{} {} file(s)", op, total_files));
+                }
+                Some(e) => self.status_message = Some(format!("Error: {}", e)),
+            }
+            self.reload_panels();
+            return;
+        }
+
+        // Local → Local: use full copy options
         if is_ask {
-            // Flatten all sources × destinations into one item list
             let mut items = Vec::new();
             for dest in &dests {
                 for source in &source_paths {
@@ -5653,26 +8815,146 @@ impl App {
                 && row < content.y + content.height
             {
                 let y_off = (row - content.y) as usize;
-                self.handle_dialog_click(y_off);
+                let x_off = (col - content.x) as usize;
+                self.handle_dialog_click(y_off, x_off);
                 self.dirty = true;
             }
         }
     }
 
-    fn handle_dialog_click(&mut self, y_off: usize) {
-        // File search dialog: term=2, path=5, filter=8, regex=10
+    fn handle_dialog_click(&mut self, y_off: usize, x_off: usize) {
+        // SSH/Connectivity dialog: row 0 = protocol tabs, row 4 = input, row 7+ = host list
+        if let Some(ref mut d) = self.ssh_dialog {
+            if d.saved_selected.is_some() {
+                // Saved connections mode: click selects a connection
+                if y_off >= 2 {
+                    let idx = y_off - 2;
+                    if idx < d.saved_connections.len() {
+                        d.saved_selected = Some(idx);
+                    }
+                }
+                return;
+            }
+            if y_off == 0 {
+                // Click on protocol tab row — hit-test each tab
+                let protocols = [
+                    RemoteProtocol::Ssh,
+                    RemoteProtocol::Sftp,
+                    RemoteProtocol::Smb,
+                    RemoteProtocol::WebDav,
+                    RemoteProtocol::S3,
+                    RemoteProtocol::Gcs,
+                    RemoteProtocol::AzureBlob,
+                    RemoteProtocol::Nfs,
+                ];
+                let mut pos = 0usize;
+                for (i, proto) in protocols.iter().enumerate() {
+                    if i > 0 {
+                        pos += 3; // " | "
+                    }
+                    let label_len = if *proto == d.protocol {
+                        proto.label().len() + 2 // "[X]"
+                    } else {
+                        proto.label().len()
+                    };
+                    if x_off >= pos && x_off < pos + label_len {
+                        d.protocol = *proto;
+                        d.field_focus = 0;
+                        return;
+                    }
+                    pos += label_len;
+                }
+                return;
+            }
+            let is_ssh = matches!(d.protocol, RemoteProtocol::Ssh | RemoteProtocol::Sftp);
+            if is_ssh {
+                if (3..=4).contains(&y_off) {
+                    d.field_focus = 1; // Focus the input
+                } else if y_off >= 7 {
+                    d.field_focus = 2; // Focus the host list
+                    let list_idx = y_off - 7;
+                    if list_idx < d.filtered.len() {
+                        d.selected = list_idx;
+                    }
+                }
+            } else {
+                // For multi-field protocols, each field takes ~3 rows (label + input + gap)
+                // starting at row 3: field 0 at rows 3-4, field 1 at rows 6-7, etc.
+                if y_off >= 3 {
+                    let field_idx = (y_off - 3) / 3;
+                    let max = d.max_fields().saturating_sub(1); // subtract protocol bar
+                    if field_idx < max {
+                        d.field_focus = field_idx + 1; // +1 for protocol bar
+                    }
+                }
+            }
+            return;
+        }
+        // File search dialog — y offsets match render layout
         if let Some(ref mut state) = self.file_search_dialog {
-            state.term.clear_selection();
-            state.path.clear_selection();
-            state.filter.clear_selection();
+            state.clear_all_selections();
             state.focused = match y_off {
-                0..=2 => FileSearchField::Term,
-                3..=5 => FileSearchField::Path,
-                6..=8 => FileSearchField::Filter,
-                9..=10 => FileSearchField::Regex,
-                _ => FileSearchField::ButtonSearch,
+                0..=1 => FileSearchField::Term,
+                2 => FileSearchField::Replace,
+                3 => FileSearchField::Path,
+                4 => FileSearchField::Filter,
+                5 => FileSearchField::FileType,
+                6 => FileSearchField::TypeExclude,
+                7 => FileSearchField::TypeExclude, // separator
+                8 => FileSearchField::Regex,
+                9 => FileSearchField::CaseInsensitive,
+                10 => FileSearchField::SmartCase,
+                11 => FileSearchField::WholeWord,
+                12 => FileSearchField::WholeLineMatch,
+                13 => FileSearchField::InvertMatch,
+                14 => FileSearchField::Multiline,
+                15 => FileSearchField::MultilineDotAll,
+                16 => FileSearchField::Crlf,
+                17 => FileSearchField::Crlf, // separator
+                18 => FileSearchField::Hidden,
+                19 => FileSearchField::FollowSymlinks,
+                20 => FileSearchField::NoGitignore,
+                21 => FileSearchField::Binary,
+                22 => FileSearchField::SearchZip,
+                23 => FileSearchField::GlobCaseInsensitive,
+                24 => FileSearchField::OneFileSystem,
+                25 => FileSearchField::TrimWhitespace,
+                26 => FileSearchField::TrimWhitespace, // separator
+                27 => FileSearchField::BeforeContext,
+                28 => FileSearchField::AfterContext,
+                29 => FileSearchField::MaxDepth,
+                30 => FileSearchField::MaxCount,
+                31 => FileSearchField::MaxFileSize,
+                32 => FileSearchField::Encoding,
+                _ => {
+                    // Button row — pick Search or Cancel by x position,
+                    // then fire the action immediately.
+                    let cw = self
+                        .dialog_content_area
+                        .map(|a| a.width as usize)
+                        .unwrap_or(60);
+                    // Cancel button is on the right half
+                    let btn = if x_off > cw / 2 {
+                        FileSearchField::ButtonCancel
+                    } else {
+                        FileSearchField::ButtonSearch
+                    };
+                    state.focused = btn;
+                    state.select_focused();
+                    self.handle_file_search_dialog(Action::DialogConfirm);
+                    return;
+                }
             };
             state.select_focused();
+            // Toggle checkbox on click (inputs just get focused/selected above)
+            if !state.focused.is_input()
+                && !matches!(
+                    state.focused,
+                    FileSearchField::ButtonSearch | FileSearchField::ButtonCancel
+                )
+            {
+                state.toggle_focused();
+            }
             return;
         }
         // Search dialog: query at y=2
@@ -5730,14 +9012,60 @@ impl App {
     }
 
     fn handle_mouse_click(&mut self, col: u16, row: u16) {
+        // Menu bar click detection (header row)
+        if row == self.menu_bar_y && matches!(self.mode, AppMode::Normal) {
+            for (i, &(x_start, x_end)) in self.menu_title_ranges.iter().enumerate() {
+                if col >= x_start && col < x_end {
+                    let already_open = self.menu_state.as_ref().is_some_and(|m| m.active_menu == i);
+                    self.menu_state = if already_open {
+                        None
+                    } else {
+                        Some(MenuState {
+                            active_menu: i,
+                            selected_item: 0,
+                        })
+                    };
+                    return;
+                }
+            }
+            // Clicked header but not on a title — close menu if open
+            if self.menu_state.is_some() {
+                self.menu_state = None;
+                return;
+            }
+        }
+
+        // Click on dropdown item when menu is open
+        if let Some(ref state) = self.menu_state {
+            let (sw, sh) = crossterm::terminal::size().unwrap_or((80, 24));
+            let screen = Rect::new(0, 0, sw, sh);
+            if let Some(sel) = crate::ui::menu::dropdown_click(
+                state,
+                &self.menu_title_ranges,
+                self.menu_bar_y,
+                screen,
+                col,
+                row,
+            ) {
+                let clicked = MenuState {
+                    active_menu: state.active_menu,
+                    selected_item: sel,
+                };
+                if let Some(action) = crate::ui::menu::selected_action(&clicked) {
+                    self.menu_state = None;
+                    self.handle_action(action);
+                }
+                return;
+            }
+            // Click outside menu closes it
+            self.menu_state = None;
+        }
+
         if let AppMode::Editing(ref mut e) = self.mode {
             e.click_at(col, row);
             return;
         }
-        if matches!(
-            self.mode,
-            AppMode::Viewing(_) | AppMode::HexViewing(_) | AppMode::ParquetViewing(_)
-        ) {
+        if matches!(self.mode, AppMode::ParquetViewing(_)) {
             return;
         }
         // Diff viewer: click positions cursor on left or right side
@@ -5885,6 +9213,21 @@ impl App {
             }
         }
 
+        // Check if click is in an SSH panel
+        for side in 0..2 {
+            if let Some(ssh_area) = self.ssh_panel_areas[side] {
+                if self.ssh_panels[side].is_some()
+                    && col >= ssh_area.x
+                    && col < ssh_area.x + ssh_area.width
+                    && row >= ssh_area.y
+                    && row < ssh_area.y + ssh_area.height
+                {
+                    self.focus = PanelFocus::Ssh(side);
+                    return;
+                }
+            }
+        }
+
         // Check if click is in the search results panel
         if self.file_search.is_some() {
             let search_area = self.panel_areas[self.file_search_side];
@@ -5925,22 +9268,6 @@ impl App {
 
     fn handle_mouse_scroll(&mut self, col: u16, row: u16, delta: i32) {
         match &mut self.mode {
-            AppMode::Viewing(v) => {
-                if delta < 0 {
-                    v.scroll_up((-delta) as usize);
-                } else {
-                    v.scroll_down(delta as usize);
-                }
-                return;
-            }
-            AppMode::HexViewing(h) => {
-                if delta < 0 {
-                    h.scroll_up((-delta) as usize);
-                } else {
-                    h.scroll_down(delta as usize);
-                }
-                return;
-            }
             AppMode::ParquetViewing(p) => {
                 if delta < 0 {
                     p.move_up((-delta) as usize);
@@ -6064,7 +9391,7 @@ impl App {
                 let paths = self.active_panel().effective_selection_paths();
                 let mut first_err: Option<anyhow::Error> = None;
                 for path in &paths {
-                    if let Err(e) = fs_ops::delete_entry(path) {
+                    if let Err(e) = self.remote_delete(path) {
                         first_err = Some(e);
                         break;
                     }
@@ -6078,9 +9405,22 @@ impl App {
                 if dialog.input.text.is_empty() {
                     Ok(())
                 } else if let Some(entry) = self.active_panel().selected_entry() {
-                    fs_ops::rename_entry(&entry.path, &dialog.input.text)
+                    let entry_path = entry.path.clone();
+                    let new_name = dialog.input.text.clone();
+                    let parent = entry_path.parent().unwrap_or(std::path::Path::new("/"));
+                    self.remote_rename(&entry_path, &parent.join(&new_name))
                 } else {
                     Ok(())
+                }
+            }
+            DialogKind::InputCreateFile => {
+                if dialog.input.text.is_empty() {
+                    Ok(())
+                } else {
+                    let dir = self.active_panel().current_dir.clone();
+                    let name = dialog.input.text.clone();
+                    let path = dir.join(&name);
+                    self.remote_create_file(&path)
                 }
             }
         };
@@ -6092,6 +9432,20 @@ impl App {
 
         self.mode = AppMode::Normal;
         self.reload_panels();
+    }
+
+    /// Close hex editor or text editor, returning to normal or stashed diff.
+    fn close_hex_or_editor(&mut self) {
+        if matches!(self.mode, AppMode::HexViewing(_)) {
+            self.mode = AppMode::Normal;
+            self.focus = self
+                .pre_editor_focus
+                .take()
+                .unwrap_or(PanelFocus::FilePanel);
+            self.needs_clear = true;
+        } else {
+            self.restore_or_close_editor();
+        }
     }
 
     /// Close editor: if we came from a diff viewer, re-open it; otherwise go to Normal.
@@ -6114,17 +9468,17 @@ impl App {
             self.mode = AppMode::DiffViewing(Box::new(dv));
         } else {
             self.mode = AppMode::Normal;
-            self.focus = self.stashed_focus.take().unwrap_or(PanelFocus::FilePanel);
+            self.focus = self
+                .pre_editor_focus
+                .take()
+                .unwrap_or(PanelFocus::FilePanel);
         }
         self.needs_clear = true;
     }
 
     fn handle_dialog_cancel(&mut self) {
         match &self.mode {
-            AppMode::Viewing(_)
-            | AppMode::HexViewing(_)
-            | AppMode::ParquetViewing(_)
-            | AppMode::DiffViewing(_) => {
+            AppMode::ParquetViewing(_) | AppMode::DiffViewing(_) => {
                 self.mode = AppMode::Normal;
                 self.needs_clear = true;
             }

@@ -1,25 +1,36 @@
 mod action;
 mod app;
+pub mod azure_blob;
 mod ci;
 mod clipboard;
+mod debug_log;
 mod diff_viewer;
 mod editor;
 mod event;
 mod file_search;
 mod fs_ops;
+pub mod gcs;
 mod hex_viewer;
-mod panel;
+mod nfs_client;
+pub mod panel;
 mod parquet_viewer;
 mod pr_diff;
+pub mod remote_fs;
+pub mod s3;
+mod saved_connections;
+mod session;
+pub mod sftp;
+pub mod smb_client;
+pub mod ssh;
 mod state;
 mod syntax;
 mod terminal;
 mod text_input;
 mod theme;
 mod ui;
-mod viewer;
 mod vt;
 mod watcher;
+pub mod webdav;
 
 use std::io;
 use std::process::Command;
@@ -38,6 +49,19 @@ use app::App;
 use event::{AppEvent, EventHandler};
 
 fn main() -> Result<()> {
+    // Initialize debug logging early -- print path to stderr so user can find it
+    if debug_log::is_enabled() {
+        let path = debug_log::log_path_display();
+        eprintln!("MM_DEBUG: logging to {}", path);
+        debug_log::log("=== middle-manager started ===");
+    }
+
+    // Handle CLI arguments before setting up the TUI
+    let args: Vec<String> = std::env::args().collect();
+    if let Some(action) = parse_cli_args(&args) {
+        return handle_cli_action(action);
+    }
+
     // Install panic hook that restores terminal before printing the panic.
     // Without this, panics are invisible because they print to the alternate screen.
     let original_hook = std::panic::take_hook();
@@ -81,8 +105,129 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+enum CliAction {
+    ListSessions,
+    Session(String),
+    Help,
+}
+
+fn parse_cli_args(args: &[String]) -> Option<CliAction> {
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--list-sessions" | "-l" => return Some(CliAction::ListSessions),
+            "--session" | "-s" => {
+                if i + 1 < args.len() {
+                    return Some(CliAction::Session(args[i + 1].clone()));
+                } else {
+                    eprintln!("Error: --session requires a name argument");
+                    std::process::exit(1);
+                }
+            }
+            "--help" | "-h" => return Some(CliAction::Help),
+            arg if arg.starts_with("--session=") => {
+                let name = arg.strip_prefix("--session=").unwrap();
+                return Some(CliAction::Session(name.to_string()));
+            }
+            arg if arg.starts_with("-s=") => {
+                let name = arg.strip_prefix("-s=").unwrap();
+                return Some(CliAction::Session(name.to_string()));
+            }
+            "session" => {
+                // Bare subcommand: `middle-manager session foo`
+                if i + 1 < args.len() {
+                    return Some(CliAction::Session(args[i + 1].clone()));
+                } else {
+                    eprintln!("Error: 'session' requires a name argument");
+                    std::process::exit(1);
+                }
+            }
+            "list-sessions" | "sessions" => return Some(CliAction::ListSessions),
+            _ => {
+                // Unknown arg — ignore (let TUI start normally)
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+fn handle_cli_action(action: CliAction) -> Result<()> {
+    match action {
+        CliAction::ListSessions => {
+            let sessions = session::list_sessions();
+            print!("{}", session::format_session_list(&sessions));
+            Ok(())
+        }
+        CliAction::Session(name) => {
+            if !session::tmux_available() {
+                eprintln!("Error: tmux is not installed or not in PATH");
+                std::process::exit(1);
+            }
+
+            // Prevent nested tmux -- refuse to attach from inside any tmux session
+            if std::env::var("TMUX").is_ok() {
+                eprintln!("Error: already inside a tmux session.");
+                eprintln!(
+                    "Detach first (` then d), then run: middle-manager --session {}",
+                    name
+                );
+                eprintln!("Or use Ctrl+Y inside middle-manager to manage sessions.");
+                std::process::exit(1);
+            }
+
+            let full_name = session::full_session_name(&name);
+
+            if !session::session_exists(&name) {
+                eprintln!("Creating session '{}'...", name);
+                session::create_session(&name)?;
+            }
+
+            // Attach (replaces this process with tmux)
+            let err = exec_replace(
+                "tmux",
+                &["attach-session".to_string(), "-t".to_string(), full_name],
+            );
+            eprintln!("Failed to attach: {}", err);
+            eprintln!("If running via 'cargo run', try the built binary directly:");
+            eprintln!(
+                "  cargo build && ./target/debug/middle-manager --session {}",
+                name
+            );
+            std::process::exit(1);
+        }
+        CliAction::Help => {
+            println!("Middle Manager TUI — dual-panel file manager");
+            println!();
+            println!("Usage: middle-manager [OPTIONS]");
+            println!();
+            println!("Options:");
+            println!("  --session, -s <name>   Launch in a persistent tmux session");
+            println!("  --list-sessions, -l    List active middle-manager sessions");
+            println!("  --help, -h             Show this help message");
+            println!();
+            println!("Session workflow:");
+            println!("  Start:    middle-manager --session project-a");
+            println!("  Detach:   Ctrl+B then D (tmux default)");
+            println!("  Reattach: middle-manager --session project-a");
+            println!("  List:     middle-manager --list-sessions");
+            Ok(())
+        }
+    }
+}
+
+/// Replace the current process with the given command (Unix exec).
+fn exec_replace(cmd: &str, args: &[String]) -> std::io::Error {
+    use std::os::unix::process::CommandExt;
+    // This only returns on error — on success the process is replaced
+    Command::new(cmd).args(args).exec()
+}
+
 fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     let mut app = App::new();
+    // Apply persisted theme
+    let theme_name = crate::theme::ThemeName::from_str(&app.persisted.theme);
+    crate::theme::set_theme(theme_name);
     let mut events = EventHandler::new(Duration::from_millis(250));
     app.set_wakeup_sender(events.wakeup_sender());
     app.restore_bottom_panels();

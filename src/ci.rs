@@ -218,15 +218,7 @@ impl LogDownload {
 }
 
 fn format_size(bytes: u64) -> String {
-    if bytes < 1024 {
-        format!("{} B", bytes)
-    } else if bytes < 1024 * 1024 {
-        format!("{:.1} KB", bytes as f64 / 1024.0)
-    } else if bytes < 1024 * 1024 * 1024 {
-        format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
-    } else {
-        format!("{:.2} GB", bytes as f64 / (1024.0 * 1024.0 * 1024.0))
-    }
+    crate::remote_fs::format_size(bytes)
 }
 
 type ChecksReceiver = std::sync::mpsc::Receiver<Result<(Option<u64>, Vec<CiCheck>), String>>;
@@ -253,6 +245,8 @@ pub struct CiPanel {
     pub download: Option<LogDownload>,
     /// Pending async step fetch: (item_index, check_idx, check, receiver)
     pending_steps: Option<PendingStepFetch>,
+    /// Active failure extraction.
+    pub failure_extraction: Option<FailureExtraction>,
 }
 
 impl CiPanel {
@@ -270,6 +264,7 @@ impl CiPanel {
                 visible_height: 0,
                 download: None,
                 pending_steps: None,
+                failure_extraction: None,
             };
         }
 
@@ -293,6 +288,7 @@ impl CiPanel {
             visible_height: 0,
             download: None,
             pending_steps: None,
+            failure_extraction: None,
         }
     }
 
@@ -448,8 +444,9 @@ impl CiPanel {
                     }
                     Some(TreeItem::Step { step, check_idx }) => {
                         // Activate step for log viewing
-                        let check = &checks[*check_idx];
-                        Some((check.run_id, step.clone()))
+                        checks
+                            .get(*check_idx)
+                            .map(|check| (check.run_id, step.clone()))
                     }
                     None => None,
                 }
@@ -488,7 +485,9 @@ impl CiPanel {
                 ..
             } => match items.get(*selected)? {
                 TreeItem::Check { check, .. } => Some(&check.details_url),
-                TreeItem::Step { check_idx, .. } => Some(&checks[*check_idx].details_url),
+                TreeItem::Step { check_idx, .. } => {
+                    checks.get(*check_idx).map(|c| c.details_url.as_str())
+                }
             },
             _ => None,
         }
@@ -613,6 +612,515 @@ impl CiPanel {
             }
         }
     }
+}
+
+// ============================================================
+// CI Failure Extraction
+// ============================================================
+
+/// A single extracted test failure.
+#[derive(Debug, Clone)]
+pub struct TestFailure {
+    pub check_name: String,
+    pub test_name: String,
+    /// Error message or failure context (if available).
+    pub failure_info: Option<String>,
+}
+
+/// Batch failure extraction state.
+pub struct FailureExtraction {
+    rx: std::sync::mpsc::Receiver<Result<Vec<TestFailure>, String>>,
+    /// Progress updates: "Downloading log 3/14: Run tests (linux-arm64)"
+    progress_rx: std::sync::mpsc::Receiver<String>,
+    pub progress: String,
+}
+
+impl FailureExtraction {
+    /// Start extracting failures from all failed checks in the background.
+    pub fn start(repo: String, checks: Vec<CiCheck>) -> Self {
+        let failed_count = checks
+            .iter()
+            .filter(|c| c.status == CiStatus::Failure)
+            .count();
+        crate::debug_log::log(&format!(
+            "FailureExtraction::start: {} total checks, {} failed",
+            checks.len(),
+            failed_count
+        ));
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (progress_tx, progress_rx) = std::sync::mpsc::channel();
+
+        std::thread::spawn(move || {
+            let result = extract_all_failures(&repo, &checks, &progress_tx);
+            crate::debug_log::log(&format!(
+                "FailureExtraction complete: {:?}",
+                result.as_ref().map(|v| v.len())
+            ));
+            let _ = tx.send(result);
+        });
+
+        Self {
+            rx,
+            progress_rx,
+            progress: "Starting extraction...".to_string(),
+        }
+    }
+
+    /// Poll for completion. Returns Some when done. Also updates progress.
+    pub fn poll(&mut self) -> Option<Result<Vec<TestFailure>, String>> {
+        // Drain progress updates
+        while let Ok(msg) = self.progress_rx.try_recv() {
+            self.progress = msg;
+        }
+        self.rx.try_recv().ok()
+    }
+}
+
+/// Check if `gh` CLI is authenticated. Returns true if auth is configured.
+pub fn check_gh_auth() -> bool {
+    Command::new("gh")
+        .args(["auth", "status"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Check if Azure DevOps PAT is available.
+pub fn has_azure_pat() -> bool {
+    get_azure_pat().is_some()
+}
+
+/// Check GitHub API rate limit. Returns (remaining, limit) or None if check fails.
+fn check_github_rate_limit() -> Option<(u32, u32)> {
+    let output = Command::new("gh")
+        .args([
+            "api",
+            "rate_limit",
+            "--jq",
+            ".resources.core | \"\\(.remaining) \\(.limit)\"",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let mut parts = text.split_whitespace();
+    let remaining: u32 = parts.next()?.parse().ok()?;
+    let limit: u32 = parts.next()?.parse().ok()?;
+    Some((remaining, limit))
+}
+
+fn extract_all_failures(
+    repo: &str,
+    checks: &[CiCheck],
+    progress: &std::sync::mpsc::Sender<String>,
+) -> Result<Vec<TestFailure>, String> {
+    // Check GitHub rate limit before starting
+    let has_github_checks = checks.iter().any(|c| c.details_url.contains("github.com"));
+    if has_github_checks {
+        if let Some((remaining, limit)) = check_github_rate_limit() {
+            crate::debug_log::log(&format!(
+                "GitHub rate limit: {}/{} remaining",
+                remaining, limit
+            ));
+            let _ = progress.send(format!(
+                "GitHub API: {}/{} requests remaining",
+                remaining, limit
+            ));
+            if remaining < 10 {
+                return Err(format!(
+                    "GitHub API rate limit nearly exhausted ({}/{}). Try again later.",
+                    remaining, limit
+                ));
+            }
+        }
+    }
+
+    let mut all_failures = Vec::new();
+    let total = checks
+        .iter()
+        .filter(|c| c.status == CiStatus::Failure)
+        .count();
+    let mut current = 0;
+
+    for check in checks {
+        if check.status != CiStatus::Failure {
+            continue;
+        }
+
+        current += 1;
+        let check_name = check.display_name();
+
+        crate::debug_log::log(&format!(
+            "Extracting: {} (job_id={}, run_id={}, is_gh={}, has_azure={})",
+            check_name,
+            check.job_id,
+            check.run_id,
+            check.is_github_actions(),
+            check.azure_info.is_some(),
+        ));
+
+        // Azure DevOps: use test results API (structured test names + error messages)
+        if let Some(ref azure) = check.azure_info {
+            let _ = progress.send(format!(
+                "Check {}/{}: {} (querying test results)",
+                current, total, check_name
+            ));
+            if let Some(failures) = query_azure_test_results(azure, &check_name) {
+                crate::debug_log::log(&format!(
+                    "Got {} failures from Azure test results API for {}",
+                    failures.len(),
+                    check_name
+                ));
+                all_failures.extend(failures);
+            } else {
+                crate::debug_log::log(&format!(
+                    "Azure test results API returned no results for {}",
+                    check_name
+                ));
+            }
+        }
+        // GitHub: use check run annotations API (structured error annotations)
+        else if check.details_url.contains("github.com") && check.job_id > 0 {
+            let _ = progress.send(format!(
+                "Check {}/{}: {} (querying annotations)",
+                current, total, check_name
+            ));
+            let failures = query_github_annotations(repo, check.job_id, &check_name);
+            crate::debug_log::log(&format!(
+                "Got {} failures from GitHub annotations for {}",
+                failures.len(),
+                check_name
+            ));
+            all_failures.extend(failures);
+        } else {
+            crate::debug_log::log(&format!("Skipping {}: no API method available", check_name));
+        }
+    }
+
+    // Report final rate limit status
+    if has_github_checks {
+        if let Some((remaining, limit)) = check_github_rate_limit() {
+            let _ = progress.send(format!(
+                "Done. GitHub API: {}/{} requests remaining",
+                remaining, limit
+            ));
+            crate::debug_log::log(&format!(
+                "GitHub rate limit after extraction: {}/{}",
+                remaining, limit
+            ));
+        }
+    }
+
+    Ok(all_failures)
+}
+
+/// Query GitHub check run annotations for failure info.
+/// Uses `gh api` to fetch annotations which contain test failure details.
+fn query_github_annotations(repo: &str, job_id: u64, check_name: &str) -> Vec<TestFailure> {
+    let url = format!("repos/{}/check-runs/{}/annotations", repo, job_id);
+    let output = Command::new("gh")
+        .args(["api", &url, "--paginate"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return Vec::new(),
+    };
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(v) => v,
+        Err(_) => return Vec::new(),
+    };
+
+    let annotations = match json.as_array() {
+        Some(a) => a,
+        None => return Vec::new(),
+    };
+
+    let mut failures = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for ann in annotations {
+        let level = ann
+            .get("annotation_level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        if level != "failure" && level != "error" {
+            continue;
+        }
+
+        let title = ann.get("title").and_then(|v| v.as_str()).unwrap_or("");
+        let message = ann.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        let path = ann.get("path").and_then(|v| v.as_str()).unwrap_or("");
+
+        // Build test name from title or path
+        let test_name = if !title.is_empty() {
+            title.to_string()
+        } else if !path.is_empty() {
+            path.to_string()
+        } else {
+            continue;
+        };
+
+        if seen.insert(test_name.clone()) {
+            let failure_info = if !message.is_empty() {
+                // Truncate very long messages
+                let msg = if message.len() > 500 {
+                    // Find a valid UTF-8 char boundary at or before byte 500.
+                    let mut end = 500;
+                    while end > 0 && !message.is_char_boundary(end) {
+                        end -= 1;
+                    }
+                    format!("{}...", &message[..end])
+                } else {
+                    message.to_string()
+                };
+                Some(msg)
+            } else {
+                None
+            };
+            failures.push(TestFailure {
+                check_name: check_name.to_string(),
+                test_name,
+                failure_info,
+            });
+        }
+    }
+
+    failures
+}
+
+/// Get Azure DevOps PAT from environment or system keyring.
+fn get_azure_pat() -> Option<String> {
+    // 1. Environment variable
+    if let Ok(pat) = std::env::var("AZURE_DEVOPS_PAT") {
+        if !pat.is_empty() {
+            return Some(pat);
+        }
+    }
+    // 2. System keyring via secret-tool (GNOME Keyring / KDE Wallet)
+    if let Ok(output) = Command::new("secret-tool")
+        .args([
+            "lookup",
+            "service",
+            "middle-manager",
+            "account",
+            "azure-pat",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+    {
+        if output.status.success() {
+            let pat = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !pat.is_empty() {
+                return Some(pat);
+            }
+        }
+    }
+    None
+}
+
+/// Build curl auth args for Azure DevOps (if PAT available).
+fn azure_auth_args() -> Vec<String> {
+    if let Some(pat) = get_azure_pat() {
+        // Azure DevOps PAT uses Basic auth with empty username
+        let encoded = crate::clipboard::base64_encode(format!(":{}", pat).as_bytes());
+        vec![
+            "-H".to_string(),
+            format!("Authorization: Basic {}", encoded),
+        ]
+    } else {
+        vec![]
+    }
+}
+
+/// Try to get test failures directly from Azure DevOps test results API.
+/// Returns None if the API is not accessible (auth required), or Some(vec) if it works.
+fn query_azure_test_results(azure: &AzureInfo, check_name: &str) -> Option<Vec<TestFailure>> {
+    // Step 1: Get test runs for this build
+    let runs_url = format!(
+        "https://dev.azure.com/{}/{}/_apis/test/runs?buildUri=vstfs:///Build/Build/{}&api-version=7.1",
+        azure.org, azure.project, azure.build_id
+    );
+
+    let auth = azure_auth_args();
+    let mut cmd = Command::new("curl");
+    cmd.args(["-s", "-L", "--compressed", "--max-time", "10"]);
+    for arg in &auth {
+        cmd.arg(arg);
+    }
+    cmd.arg(&runs_url);
+    let output = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+
+    if !output.status.success() {
+        return None;
+    }
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Check if we got HTML (auth redirect) instead of JSON
+    if text.contains("<!DOCTYPE") || text.contains("<html") {
+        crate::debug_log::log("Azure test results API: got HTML (auth required), skipping");
+        return None;
+    }
+
+    let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let runs = json.get("value")?.as_array()?;
+
+    if runs.is_empty() {
+        crate::debug_log::log("Azure test results API: no test runs found for this build");
+        return None;
+    }
+
+    crate::debug_log::log(&format!(
+        "Azure test results API: found {} test runs",
+        runs.len()
+    ));
+
+    // Step 2: Get failed results from each run
+    let mut failures = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for run in runs {
+        let run_id = match run.get("id").and_then(|v| v.as_u64()) {
+            Some(id) => id,
+            None => continue,
+        };
+        let results_url = format!(
+            "https://dev.azure.com/{}/{}/_apis/test/runs/{}/results?outcomes=Failed&$top=500&api-version=7.1",
+            azure.org, azure.project, run_id
+        );
+
+        let mut cmd = Command::new("curl");
+        cmd.args(["-s", "-L", "--compressed", "--max-time", "10"]);
+        for arg in &auth {
+            cmd.arg(arg);
+        }
+        cmd.arg(&results_url);
+        let output = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+
+        if !output.status.success() {
+            continue;
+        }
+
+        let text = String::from_utf8_lossy(&output.stdout);
+        if text.contains("<!DOCTYPE") {
+            continue;
+        }
+
+        let json: serde_json::Value = match serde_json::from_str(&text) {
+            Ok(v) => v,
+            Err(_) => continue, // Skip unparseable runs, don't lose previous results
+        };
+        if let Some(results) = json.get("value").and_then(|v| v.as_array()) {
+            for result in results {
+                let test_name = result
+                    .get("automatedTestName")
+                    .or_else(|| result.get("testCaseTitle"))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !test_name.is_empty() && seen.insert(test_name.to_string()) {
+                    let error_msg = result
+                        .get("errorMessage")
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
+                    failures.push(TestFailure {
+                        check_name: check_name.to_string(),
+                        test_name: test_name.to_string(),
+                        failure_info: error_msg,
+                    });
+                }
+            }
+        }
+    }
+
+    Some(failures)
+}
+
+/// Write consolidated failures to a Markdown file.
+pub fn write_failures_file(
+    path: &Path,
+    failures: &[TestFailure],
+    repo: &str,
+    pr_number: Option<u64>,
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut f = std::fs::File::create(path)?;
+
+    let pr_str = pr_number.map(|n| format!(" PR #{}", n)).unwrap_or_default();
+    writeln!(f, "# CI Failures — {}{}", repo, pr_str)?;
+    writeln!(f)?;
+
+    if failures.is_empty() {
+        writeln!(f, "No test failures found in the logs.")?;
+        writeln!(f)?;
+        writeln!(
+            f,
+            "The failed checks may not contain recognizable test output."
+        )?;
+        return Ok(());
+    }
+
+    // Group by check name, preserving failure info
+    let mut by_check: std::collections::BTreeMap<&str, Vec<&TestFailure>> =
+        std::collections::BTreeMap::new();
+    for fail in failures {
+        by_check.entry(&fail.check_name).or_default().push(fail);
+    }
+
+    for (check, tests) in &by_check {
+        writeln!(f, "## {}", check)?;
+        for test in tests {
+            writeln!(f, "- **{}**", test.test_name)?;
+            if let Some(ref info) = test.failure_info {
+                // Indent failure info as a code block under the test name
+                writeln!(f, "  ```")?;
+                for info_line in info.lines().take(10) {
+                    writeln!(f, "  {}", info_line)?;
+                }
+                writeln!(f, "  ```")?;
+            }
+        }
+        writeln!(f)?;
+    }
+
+    let unique: std::collections::HashSet<&str> =
+        failures.iter().map(|f| f.test_name.as_str()).collect();
+    writeln!(f, "---")?;
+    writeln!(
+        f,
+        "{} unique failure(s) across {} check(s).",
+        unique.len(),
+        by_check.len()
+    )?;
+
+    // Append rate limit info if available
+    if let Some((remaining, limit)) = check_github_rate_limit() {
+        writeln!(
+            f,
+            "GitHub API rate limit: {}/{} remaining.",
+            remaining, limit
+        )?;
+    }
+
+    Ok(())
 }
 
 /// Detect the GitHub owner/repo from the current directory.
@@ -920,4 +1428,104 @@ fn query_azure_steps(azure: &AzureInfo) -> Result<Vec<CiStep>, String> {
 
     steps.sort_by_key(|s| s.number);
     Ok(steps)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------------------------------------------------------------
+    // parse_details_url: GitHub Actions
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_details_url_github() {
+        let url = "https://github.com/owner/repo/actions/runs/12345/job/67890";
+        let (run_id, job_id, azure) = parse_details_url(url);
+        assert_eq!(run_id, 12345);
+        assert_eq!(job_id, 67890);
+        assert!(azure.is_none());
+    }
+
+    #[test]
+    fn parse_details_url_github_no_job() {
+        let url = "https://github.com/owner/repo/actions/runs/12345/";
+        let (run_id, job_id, azure) = parse_details_url(url);
+        assert_eq!(run_id, 12345);
+        assert_eq!(job_id, 0); // no /job/ segment
+        assert!(azure.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // parse_details_url / parse_azure_url: Azure DevOps
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_details_url_azure() {
+        let url = "https://dev.azure.com/myorg/myproject/_build/results?buildId=999&view=logs&jobId=abc-123";
+        let (run_id, job_id, azure) = parse_details_url(url);
+        assert_eq!(run_id, 0);
+        assert_eq!(job_id, 0);
+        let azure = azure.unwrap();
+        assert_eq!(azure.org, "myorg");
+        assert_eq!(azure.project, "myproject");
+        assert_eq!(azure.build_id, "999");
+        assert_eq!(azure.job_id, "abc-123");
+    }
+
+    #[test]
+    fn parse_azure_url_no_build_id() {
+        let url = "https://dev.azure.com/org/proj/_build/results?view=logs";
+        let azure = parse_azure_url(url);
+        assert!(azure.is_none()); // buildId is required
+    }
+
+    // ---------------------------------------------------------------
+    // parse_details_url: unknown URL
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn parse_details_url_unknown() {
+        let (run_id, job_id, azure) = parse_details_url("https://example.com/status/123");
+        assert_eq!(run_id, 0);
+        assert_eq!(job_id, 0);
+        assert!(azure.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // CiStatus helpers
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn ci_status_sort_priority_ordering() {
+        // Failures should sort first (lowest priority number)
+        assert!(CiStatus::Failure.sort_priority() < CiStatus::Pending.sort_priority());
+        assert!(CiStatus::Pending.sort_priority() < CiStatus::Success.sort_priority());
+        assert!(CiStatus::Success.sort_priority() < CiStatus::Skipped.sort_priority());
+    }
+
+    #[test]
+    fn ci_check_display_name() {
+        let check = CiCheck {
+            workflow_name: "CI".to_string(),
+            job_name: "build".to_string(),
+            status: CiStatus::Success,
+            details_url: String::new(),
+            run_id: 0,
+            job_id: 0,
+            azure_info: None,
+        };
+        assert_eq!(check.display_name(), "CI / build");
+
+        let check_no_workflow = CiCheck {
+            workflow_name: String::new(),
+            job_name: "lint".to_string(),
+            status: CiStatus::Success,
+            details_url: String::new(),
+            run_id: 0,
+            job_id: 0,
+            azure_info: None,
+        };
+        assert_eq!(check_no_workflow.display_name(), "lint");
+    }
 }

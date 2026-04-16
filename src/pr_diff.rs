@@ -525,7 +525,15 @@ fn query_pr_diff(dir: &Path) -> Result<PrDiffData, String> {
     let pr: PrInfo =
         serde_json::from_str(&text).map_err(|e| format!("Failed to parse PR info: {}", e))?;
 
-    // Step 2: Get file changes via git diff --name-status
+    // Step 2: Fetch the base branch so the merge-base is up to date
+    let _ = Command::new("git")
+        .args(["fetch", "origin", &pr.base_ref_name])
+        .current_dir(dir)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .output();
+
+    // Step 3: Get file changes via git diff --name-status
     let diff_ref = format!("origin/{}...HEAD", pr.base_ref_name);
     let output = Command::new("git")
         .args(["diff", "--name-status", &diff_ref])

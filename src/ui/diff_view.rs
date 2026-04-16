@@ -65,7 +65,7 @@ pub fn render(frame: &mut Frame, area: Rect, panel: &mut PrDiffPanel, is_active:
             scroll,
             ..
         } => {
-            render_tree(frame, inner, items, *selected, *scroll, is_active, t);
+            render_tree(frame, inner, items, *selected, *scroll, is_active, &t);
         }
         DiffView::Loading(_) => {}
         DiffView::Error(msg) => {
