@@ -23,6 +23,10 @@ cargo clippy -- -D warnings    # lint (CI enforces -D warnings)
 
 CI runs: fmt check, clippy with `-D warnings`, tests on both Ubuntu and macOS.
 
+## Fixing issues
+
+Fix every issue you encounter, even if it's pre-existing and unrelated to your current task — do not leave broken clippy lints, failing tests, fmt drift, or compiler warnings for a later PR. If CI is red because of a problem that exists on master, fix it here rather than skipping it. Scope creep from a few mechanical fixes is cheaper than a persistently red main branch.
+
 ## Architecture
 
 **Single crate, no workspace.** ~50 source files, ~400+ inline unit tests.
