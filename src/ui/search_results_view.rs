@@ -10,19 +10,25 @@ use crate::theme::theme;
 pub fn render(frame: &mut Frame, area: Rect, state: &mut SearchState, is_active: bool) {
     let t = theme();
 
+    // Build visible items once and reuse for both title and rendering
+    let items = state.visible_items();
+    let total_files = state.files.len();
     let status = if state.searching {
         format!(
             " Searching: \"{}\" — {} matches in {} files... ",
+            state.query, state.total_matches, total_files
+        )
+    } else if !state.filter.is_empty() {
+        format!(
+            " Results: \"{}\" filter: {} — {} visible ",
             state.query,
-            state.total_matches,
-            state.files.len()
+            state.filter,
+            items.len()
         )
     } else {
         format!(
             " Results: \"{}\" — {} matches in {} files ",
-            state.query,
-            state.total_matches,
-            state.files.len()
+            state.query, state.total_matches, total_files
         )
     };
 
@@ -50,8 +56,6 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut SearchState, is_active:
     }
 
     state.scroll_to_selected(visible_height);
-
-    let items = state.visible_items();
     let highlight = if is_active {
         t.highlight_style()
     } else {
@@ -69,6 +73,7 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut SearchState, is_active:
         .fg(t.header_fg)
         .bg(t.bg)
         .add_modifier(Modifier::BOLD);
+    let context_style = Style::default().fg(t.size_fg).bg(t.bg);
 
     let mut lines: Vec<Line> = Vec::with_capacity(visible_height);
     let query_lower = state.query.to_lowercase();
@@ -112,6 +117,10 @@ pub fn render(frame: &mut Frame, area: Rect, state: &mut SearchState, is_active:
                 if is_sel {
                     let text = format!("   {:>5}: {}", m.line_number, m.text);
                     lines.push(Line::from(Span::styled(text, highlight)));
+                } else if m.is_context {
+                    // Context lines: dimmer, no match highlighting
+                    let text = format!("   {:>5}  {}", m.line_number, m.text);
+                    lines.push(Line::from(Span::styled(text, context_style)));
                 } else {
                     // Highlight the matching text within the line
                     let spans = highlight_match(

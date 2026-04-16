@@ -165,6 +165,47 @@ pub fn render_buttons(
     render_line(frame, content, y_off, Line::from(spans));
 }
 
+/// Render a label followed by a TextInput on the same row.
+/// The label occupies `label` characters on the left, input fills the rest.
+#[allow(clippy::too_many_arguments)]
+pub fn render_labeled_text_input(
+    frame: &mut Frame,
+    content: Rect,
+    y_off: u16,
+    label: &str,
+    input: &crate::text_input::TextInput,
+    focused: bool,
+    normal: Style,
+    input_style: Style,
+    cw: usize,
+) {
+    let label_len = label.len();
+    // Render the label portion
+    let label_rect = Rect::new(content.x, content.y + y_off, label_len as u16, 1);
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(label, normal))),
+        label_rect,
+    );
+
+    // Render the input in the remaining space
+    let input_cw = cw.saturating_sub(label_len);
+    let input_content = Rect::new(
+        content.x + label_len as u16,
+        content.y,
+        input_cw as u16,
+        content.height,
+    );
+    render_text_input(
+        frame,
+        input_content,
+        y_off,
+        input,
+        focused,
+        input_style,
+        input_cw,
+    );
+}
+
 /// Render a TextInput field with horizontal scrolling, selection highlighting,
 /// and cursor positioning. Shared across all dialogs.
 pub fn render_text_input(
