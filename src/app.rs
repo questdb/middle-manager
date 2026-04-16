@@ -3299,9 +3299,12 @@ impl App {
             if let Some(result) = ci.poll_download() {
                 match result {
                     Ok(path) => {
-                        // Remember the CI focus so we can restore it when the editor closes.
-                        self.pre_editor_focus = Some(PanelFocus::Ci(side));
-                        self.focus = PanelFocus::FilePanel;
+                        // Only stash CI focus if the user is currently on a CI panel;
+                        // otherwise preserve wherever they are.
+                        if matches!(self.focus, PanelFocus::Ci(_)) {
+                            self.pre_editor_focus = Some(PanelFocus::Ci(side));
+                            self.focus = PanelFocus::FilePanel;
+                        }
                         self.mode =
                             AppMode::Editing(Box::new(crate::editor::EditorState::open(path)));
                         return;
