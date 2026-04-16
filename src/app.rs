@@ -9504,6 +9504,7 @@ impl App {
 #[cfg(test)]
 mod fuzzy_tests {
     use super::*;
+    use std::path::Path;
 
     fn score(query: &str, candidate: &str) -> Option<i64> {
         let query_chars: Vec<char> = query.to_lowercase().chars().collect();
@@ -9834,8 +9835,8 @@ mod fuzzy_tests {
         let home = std::env::var("HOME").unwrap();
         // "~" expands to home dir, no trailing slash, so it's treated as a partial name
         // parent of /Users/foo is /Users, prefix is "foo"
-        assert!(dir.to_string_lossy().len() > 0);
-        assert!(!prefix.is_empty() || dir == PathBuf::from(&home));
+        assert!(!dir.to_string_lossy().is_empty());
+        assert!(!prefix.is_empty() || dir == Path::new(&home));
     }
 
     #[test]

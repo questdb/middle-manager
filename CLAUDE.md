@@ -27,6 +27,8 @@ CI runs: fmt check, clippy with `-D warnings`, tests on both Ubuntu and macOS.
 
 Fix every issue you encounter, even if it's pre-existing and unrelated to your current task — do not leave broken clippy lints, failing tests, fmt drift, or compiler warnings for a later PR. If CI is red because of a problem that exists on master, fix it here rather than skipping it. Scope creep from a few mechanical fixes is cheaper than a persistently red main branch.
 
+`cargo clippy -- -D warnings` is not good enough — it only checks the default (bin) target. Always verify with `cargo clippy --all-targets -- -D warnings` so test-code lints are not missed, and fix anything it surfaces.
+
 ## Architecture
 
 **Single crate, no workspace.** ~50 source files, ~400+ inline unit tests.
