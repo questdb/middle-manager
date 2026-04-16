@@ -299,7 +299,8 @@ impl FuzzySearchState {
                     self.results.push((i, score));
                 }
             }
-            self.results.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            self.results
+                .sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
             self.results.truncate(100);
         }
         self.selected = 0;
@@ -1633,11 +1634,9 @@ impl App {
                             self.bottom_split_pct[side] = self.persisted.split_pct_ci;
                         }
                     }
-                    "diff" => {
-                        if self.panels[side].git_info.is_some() {
-                            self.diff_panels[side] = Some(PrDiffPanel::for_branch(&dir));
-                            self.bottom_split_pct[side] = self.persisted.split_pct_ci;
-                        }
+                    "diff" if self.panels[side].git_info.is_some() => {
+                        self.diff_panels[side] = Some(PrDiffPanel::for_branch(&dir));
+                        self.bottom_split_pct[side] = self.persisted.split_pct_ci;
                     }
                     "shell" => {
                         if let Ok(tp) = TerminalPanel::spawn_shell(
@@ -6829,13 +6828,11 @@ impl App {
                     }
                 }
             }
-            Action::MouseShiftClick(col, row) => {
-                if self.click_in_claude(col, row) {
-                    let coords = self.claude_screen_coords(side, col, row);
-                    if let Some(ref mut tp) = self.claude_panels[side] {
-                        if let Some((sr, sc)) = coords {
-                            tp.drag_select(sr, sc);
-                        }
+            Action::MouseShiftClick(col, row) if self.click_in_claude(col, row) => {
+                let coords = self.claude_screen_coords(side, col, row);
+                if let Some(ref mut tp) = self.claude_panels[side] {
+                    if let Some((sr, sc)) = coords {
+                        tp.drag_select(sr, sc);
                     }
                 }
             }
@@ -7086,13 +7083,11 @@ impl App {
                     }
                 }
             }
-            Action::MouseShiftClick(col, row) => {
-                if self.click_in_shell(col, row) {
-                    let coords = self.shell_screen_coords(side, col, row);
-                    if let Some(ref mut sp) = self.shell_panels[side] {
-                        if let Some((sr, sc)) = coords {
-                            sp.drag_select(sr, sc);
-                        }
+            Action::MouseShiftClick(col, row) if self.click_in_shell(col, row) => {
+                let coords = self.shell_screen_coords(side, col, row);
+                if let Some(ref mut sp) = self.shell_panels[side] {
+                    if let Some((sr, sc)) = coords {
+                        sp.drag_select(sr, sc);
                     }
                 }
             }
