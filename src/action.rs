@@ -38,6 +38,9 @@ pub enum Action {
 
     // Sorting
     CycleSort,
+    SortByName(usize), // panel index
+    SortBySize(usize),
+    SortByDate(usize),
 
     // Quick search
     QuickSearch(char),
@@ -122,6 +125,9 @@ pub enum Action {
 
     // Help
     ShowHelp,
+
+    // Menu
+    OpenMenu,
 
     // Settings
     ToggleSettings,

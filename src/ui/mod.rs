@@ -11,6 +11,7 @@ pub mod footer;
 pub mod header;
 pub mod help_dialog;
 pub mod hex_view;
+pub mod menu;
 pub mod mkdir_dialog;
 pub mod panel_view;
 pub mod parquet_view;
@@ -231,6 +232,15 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         // Hide the text cursor while a help/F1 overlay is shown
         CURSOR_POS.set(None);
     }
+
+    // Render menu bar overlay (on top of everything, only when open)
+    if let Some(ref state) = app.menu_state {
+        let bar_area = Rect::new(frame.area().x, frame.area().y, frame.area().width, 1);
+        let sort_fields = [app.panels[0].sort_field, app.panels[1].sort_field];
+        app.menu_title_ranges = menu::render(frame, state, bar_area, sort_fields);
+    } else {
+        app.menu_title_ranges.clear();
+    }
 }
 
 fn render_normal(frame: &mut Frame, app: &mut App) {
@@ -282,6 +292,7 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
     app.ssh_panel_areas = [left_ssh_area, right_ssh_area];
 
     header::render(frame, header_area, app);
+    app.menu_bar_y = header_area.y;
 
     // File panels are active only when nothing else is focused
     let (left_active, right_active) = if app.focus == PanelFocus::FilePanel {
@@ -328,12 +339,6 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
         );
     }
 
-    // Render file search dialog overlay
-    if let Some(ref state) = app.file_search_dialog {
-        let area = file_search_dialog::render(frame, state);
-        shadow::render_shadow(frame, area);
-    }
-
     // Render CI panels
     if let (Some(ci_area), Some(ref mut ci)) = (left_ci_area, &mut app.ci_panels[0]) {
         ci_view::render(frame, ci_area, ci, app.focus == PanelFocus::Ci(0));
@@ -372,6 +377,12 @@ fn render_normal(frame: &mut Frame, app: &mut App) {
     }
     if let (Some(ssh_area), Some(ref sp)) = (right_ssh_area, &app.ssh_panels[1]) {
         terminal_view::render(frame, ssh_area, sp, app.focus == PanelFocus::Ssh(1));
+    }
+
+    // Render file search dialog overlay (after bottom panels so it's on top)
+    if let Some(ref state) = app.file_search_dialog {
+        let area = file_search_dialog::render(frame, state);
+        shadow::render_shadow(frame, area);
     }
 
     // Render SSH dialog overlay

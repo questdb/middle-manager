@@ -95,6 +95,12 @@ pub struct App {
     pub fuzzy_search: [Option<FuzzySearchState>; 2],
     /// Help dialog state (scroll + optional search filter).
     pub help_state: Option<HelpState>,
+    /// Menu bar state (F9 Far Manager style menu).
+    pub menu_state: Option<MenuState>,
+    /// Click ranges for menu titles in header bar: (x_start, x_end) per menu.
+    pub menu_title_ranges: Vec<(u16, u16)>,
+    /// Y coordinate of the header/menu bar (for click detection).
+    pub menu_bar_y: u16,
     /// Settings dialog: selected item index, or None when closed.
     pub settings_open: Option<usize>,
     /// Shell panels (one per file panel side, like CI panels).
@@ -167,6 +173,14 @@ pub struct StashedDiff {
 pub struct HelpState {
     pub scroll: usize,
     pub filter: String,
+}
+
+/// Menu bar state (F9 menu, Far Manager style).
+pub struct MenuState {
+    /// Which top-level menu is open (0..MENU_COUNT-1).
+    pub active_menu: usize,
+    /// Selected item index within the dropdown.
+    pub selected_item: usize,
 }
 
 /// Overwrite confirmation dialog shown during Ask-mode copy/move.
@@ -1555,6 +1569,9 @@ impl App {
             goto_path: [None, None],
             fuzzy_search: [None, None],
             help_state: None,
+            menu_state: None,
+            menu_title_ranges: Vec::new(),
+            menu_bar_y: 0,
             settings_open: None,
             shell_panels: [None, None],
             claude_panels: [None, None],
@@ -1960,6 +1977,21 @@ impl App {
                 KeyCode::End => Action::MoveToBottom,
                 KeyCode::Backspace => Action::DialogBackspace,
                 KeyCode::Char(c) => Action::DialogInput(c),
+                _ => Action::None,
+            };
+        }
+
+        // Menu bar intercepts keys
+        if self.menu_state.is_some() {
+            return match key.code {
+                KeyCode::Esc | KeyCode::F(9) => Action::DialogCancel,
+                KeyCode::Left => Action::CursorLeft,
+                KeyCode::Right => Action::CursorRight,
+                KeyCode::Up => Action::MoveUp,
+                KeyCode::Down => Action::MoveDown,
+                KeyCode::Home => Action::MoveToTop,
+                KeyCode::End => Action::MoveToBottom,
+                KeyCode::Enter => Action::DialogConfirm,
                 _ => Action::None,
             };
         }
@@ -2587,7 +2619,13 @@ impl App {
                 }
             }
             KeyCode::F(8) => Action::Delete,
-            KeyCode::F(9) => Action::CycleSort,
+            KeyCode::F(9) => {
+                if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    Action::CycleSort
+                } else {
+                    Action::OpenMenu
+                }
+            }
             KeyCode::F(10) => Action::Quit,
             KeyCode::F(2) => {
                 if key.modifiers.contains(KeyModifiers::SHIFT) {
@@ -3528,6 +3566,51 @@ impl App {
             return;
         }
 
+        // Menu bar intercepts when active
+        if let Some(ref mut m) = self.menu_state {
+            let menu_count = crate::ui::menu::MENUS.len();
+            match action {
+                Action::DialogCancel => self.menu_state = None,
+                Action::CursorLeft => {
+                    m.active_menu = if m.active_menu == 0 {
+                        menu_count - 1
+                    } else {
+                        m.active_menu - 1
+                    };
+                    m.selected_item = 0;
+                }
+                Action::CursorRight => {
+                    m.active_menu = (m.active_menu + 1) % menu_count;
+                    m.selected_item = 0;
+                }
+                Action::MoveUp => {
+                    let count = crate::ui::menu::selectable_count(m.active_menu);
+                    m.selected_item = if m.selected_item == 0 {
+                        count.saturating_sub(1)
+                    } else {
+                        m.selected_item - 1
+                    };
+                }
+                Action::MoveDown => {
+                    let count = crate::ui::menu::selectable_count(m.active_menu);
+                    m.selected_item = (m.selected_item + 1) % count;
+                }
+                Action::MoveToTop => m.selected_item = 0,
+                Action::MoveToBottom => {
+                    m.selected_item =
+                        crate::ui::menu::selectable_count(m.active_menu).saturating_sub(1);
+                }
+                Action::DialogConfirm => {
+                    if let Some(action) = crate::ui::menu::selected_action(m) {
+                        self.menu_state = None;
+                        self.handle_action(action);
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
         // Settings dialog intercepts when active
         if self.settings_open.is_some() {
             match action {
@@ -4167,6 +4250,14 @@ impl App {
                 });
             }
 
+            // Menu
+            Action::OpenMenu => {
+                self.menu_state = Some(MenuState {
+                    active_menu: 0,
+                    selected_item: 0,
+                });
+            }
+
             Action::ToggleSettings => {} // handled early, before bottom-panel dispatch
 
             // CI failure extraction (only works when CI panel is focused, handled above)
@@ -4230,6 +4321,15 @@ impl App {
             // Sorting
             Action::CycleSort => {
                 self.active_panel_mut().cycle_sort();
+            }
+            Action::SortByName(side) => {
+                self.panels[side].set_sort(SortField::Name);
+            }
+            Action::SortBySize(side) => {
+                self.panels[side].set_sort(SortField::Size);
+            }
+            Action::SortByDate(side) => {
+                self.panels[side].set_sort(SortField::Date);
             }
 
             // CI / GitHub
@@ -8807,9 +8907,35 @@ impl App {
                 30 => FileSearchField::MaxCount,
                 31 => FileSearchField::MaxFileSize,
                 32 => FileSearchField::Encoding,
-                _ => FileSearchField::ButtonSearch,
+                _ => {
+                    // Button row — pick Search or Cancel by x position,
+                    // then fire the action immediately.
+                    let cw = self
+                        .dialog_content_area
+                        .map(|a| a.width as usize)
+                        .unwrap_or(60);
+                    // Cancel button is on the right half
+                    let btn = if x_off > cw / 2 {
+                        FileSearchField::ButtonCancel
+                    } else {
+                        FileSearchField::ButtonSearch
+                    };
+                    state.focused = btn;
+                    state.select_focused();
+                    self.handle_file_search_dialog(Action::DialogConfirm);
+                    return;
+                }
             };
             state.select_focused();
+            // Toggle checkbox on click (inputs just get focused/selected above)
+            if !state.focused.is_input()
+                && !matches!(
+                    state.focused,
+                    FileSearchField::ButtonSearch | FileSearchField::ButtonCancel
+                )
+            {
+                state.toggle_focused();
+            }
             return;
         }
         // Search dialog: query at y=2
@@ -8867,6 +8993,55 @@ impl App {
     }
 
     fn handle_mouse_click(&mut self, col: u16, row: u16) {
+        // Menu bar click detection (header row)
+        if row == self.menu_bar_y && matches!(self.mode, AppMode::Normal) {
+            for (i, &(x_start, x_end)) in self.menu_title_ranges.iter().enumerate() {
+                if col >= x_start && col < x_end {
+                    let already_open = self.menu_state.as_ref().is_some_and(|m| m.active_menu == i);
+                    self.menu_state = if already_open {
+                        None
+                    } else {
+                        Some(MenuState {
+                            active_menu: i,
+                            selected_item: 0,
+                        })
+                    };
+                    return;
+                }
+            }
+            // Clicked header but not on a title — close menu if open
+            if self.menu_state.is_some() {
+                self.menu_state = None;
+                return;
+            }
+        }
+
+        // Click on dropdown item when menu is open
+        if let Some(ref state) = self.menu_state {
+            let (sw, sh) = crossterm::terminal::size().unwrap_or((80, 24));
+            let screen = Rect::new(0, 0, sw, sh);
+            if let Some(sel) = crate::ui::menu::dropdown_click(
+                state,
+                &self.menu_title_ranges,
+                self.menu_bar_y,
+                screen,
+                col,
+                row,
+            ) {
+                let clicked = MenuState {
+                    active_menu: state.active_menu,
+                    selected_item: sel,
+                };
+                if let Some(action) = crate::ui::menu::selected_action(&clicked) {
+                    self.menu_state = None;
+                    self.handle_action(action);
+                }
+                return;
+            }
+            // Click outside menu closes it
+            self.menu_state = None;
+        }
+
         if let AppMode::Editing(ref mut e) = self.mode {
             e.click_at(col, row);
             return;

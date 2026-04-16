@@ -303,6 +303,11 @@ impl Panel {
         self.apply_sort();
     }
 
+    pub fn set_sort(&mut self, field: SortField) {
+        self.sort_field = field;
+        self.apply_sort();
+    }
+
     pub fn jump_to_match(&mut self, query: &str) {
         let query_lower = query.to_lowercase();
         if let Some(idx) = self
