@@ -4,7 +4,7 @@
 //! 1. **PAT** — user pastes a Personal Access Token, stored in keychain
 //! 2. **Browser login** — OAuth2 authorization code flow with localhost redirect
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
 
@@ -135,7 +135,8 @@ fn token_url(tenant: &str) -> String {
     format!("https://login.microsoftonline.com/{}/oauth2/token", tenant)
 }
 
-const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+/// Braille spinner frames, shared with `ci` for consistent animation.
+pub(crate) const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 /// Success page shown in the browser after authentication completes.
 const SUCCESS_HTML: &str = r#"<html><body style="font-family:sans-serif;text-align:center;padding:60px">
@@ -219,36 +220,31 @@ fn exchange_code(
     })
 }
 
-/// Extract the `code` parameter from an HTTP GET request line.
-/// e.g. "GET /?code=abc123&state=xyz HTTP/1.1" -> Some("abc123")
-fn extract_code_from_request(request_line: &str) -> Option<String> {
+/// Extract a single query-string parameter from an HTTP GET request line.
+/// e.g. ("GET /?code=abc&state=xyz HTTP/1.1", "code") -> Some("abc")
+fn query_param(request_line: &str, name: &str) -> Option<String> {
     let path = request_line.split_whitespace().nth(1)?;
     let query = path.split('?').nth(1)?;
+    let prefix = format!("{}=", name);
     for param in query.split('&') {
-        if let Some(value) = param.strip_prefix("code=") {
+        if let Some(value) = param.strip_prefix(prefix.as_str()) {
             return Some(urldecoded(value));
         }
     }
     None
 }
 
-/// Extract the `error` parameter from an HTTP GET request line.
-/// Prefers `error_description` over `error` for a human-readable message.
+fn extract_code_from_request(request_line: &str) -> Option<String> {
+    query_param(request_line, "code")
+}
+
+fn extract_state_from_request(request_line: &str) -> Option<String> {
+    query_param(request_line, "state")
+}
+
+/// Prefers `error_description` (human-readable) over `error` (code).
 fn extract_error_from_request(request_line: &str) -> Option<String> {
-    let path = request_line.split_whitespace().nth(1)?;
-    let query = path.split('?').nth(1)?;
-    // Prefer error_description (human-readable) over error (code)
-    for param in query.split('&') {
-        if let Some(value) = param.strip_prefix("error_description=") {
-            return Some(urldecoded(value));
-        }
-    }
-    for param in query.split('&') {
-        if let Some(value) = param.strip_prefix("error=") {
-            return Some(urldecoded(value));
-        }
-    }
-    None
+    query_param(request_line, "error_description").or_else(|| query_param(request_line, "error"))
 }
 
 /// Async browser auth flow state — runs localhost server in a background thread.
@@ -277,19 +273,21 @@ impl BrowserAuthFlow {
             .map_err(|e| format!("Failed to get port: {}", e))?
             .port();
 
-        // Generate PKCE code verifier and challenge
+        // Generate PKCE code verifier/challenge and a CSRF `state` nonce.
         let code_verifier = generate_code_verifier();
         let code_challenge =
             compute_code_challenge(&code_verifier).map_err(|e| format!("PKCE error: {}", e))?;
+        let state = generate_state();
 
         let redirect_uri = format!("http://localhost:{}", port);
         let auth_url = format!(
-            "{}?client_id={}&response_type=code&redirect_uri={}&resource={}&code_challenge={}&code_challenge_method=S256",
+            "{}?client_id={}&response_type=code&redirect_uri={}&resource={}&code_challenge={}&code_challenge_method=S256&state={}",
             authorize_url(&tenant),
             client_id,
             urlencoded(&redirect_uri),
             ADO_RESOURCE,
             urlencoded(&code_challenge),
+            urlencoded(&state),
         );
 
         // Open browser
@@ -297,17 +295,16 @@ impl BrowserAuthFlow {
 
         let (tx, rx) = std::sync::mpsc::channel();
 
-        // Background thread: accept one connection, extract code, exchange for token
+        // Poll for an incoming connection with a 2-minute wall-clock timeout.
+        // TcpListener has no native accept timeout, so we use non-blocking + sleep.
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("Failed to set non-blocking: {}", e))?;
+
         std::thread::spawn(move || {
-            // Set a 2-minute timeout so we don't block forever
-            listener.set_nonblocking(false).ok();
-            let _ = listener.set_nonblocking(false);
             let timeout = std::time::Duration::from_secs(120);
-            let _ = std::net::TcpListener::set_nonblocking(&listener, false);
-            // Use SO_RCVTIMEO via a polling approach
             let start = std::time::Instant::now();
-            let _ = listener.set_nonblocking(true);
-            let result = loop {
+            let accepted = loop {
                 match listener.accept() {
                     Ok(conn) => break Ok(conn),
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -322,43 +319,9 @@ impl BrowserAuthFlow {
                     Err(e) => break Err(e),
                 }
             };
-            let result = match result {
-                Ok((mut stream, _)) => {
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut request_line = String::new();
-                    if reader.read_line(&mut request_line).is_err() {
-                        AuthResult::Error("Failed to read browser redirect".to_string())
-                    } else if let Some(code) = extract_code_from_request(&request_line) {
-                        // Send success page before exchanging (so browser shows result fast)
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n{}",
-                            SUCCESS_HTML
-                        );
-                        let _ = stream.write_all(response.as_bytes());
-                        let _ = stream.flush();
-                        drop(stream);
-
-                        match exchange_code(&code, &redirect_uri, &code_verifier, &tenant) {
-                            Ok(token) => AuthResult::Success(token),
-                            Err(e) => AuthResult::Error(e),
-                        }
-                    } else if let Some(err) = extract_error_from_request(&request_line) {
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n{}",
-                            ERROR_HTML
-                        );
-                        let _ = stream.write_all(response.as_bytes());
-                        let _ = stream.flush();
-                        AuthResult::Error(err)
-                    } else {
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n{}",
-                            ERROR_HTML
-                        );
-                        let _ = stream.write_all(response.as_bytes());
-                        let _ = stream.flush();
-                        AuthResult::Error("No authorization code in redirect".to_string())
-                    }
+            let result = match accepted {
+                Ok((stream, _)) => {
+                    handle_redirect(stream, &state, &redirect_uri, &code_verifier, &tenant)
                 }
                 Err(e) => AuthResult::Error(format!("Failed to accept connection: {}", e)),
             };
@@ -378,6 +341,66 @@ impl BrowserAuthFlow {
         let c = SPINNER[self.spinner_tick % SPINNER.len()];
         self.status = format!("{} Waiting for browser login...", c);
         self.rx.try_recv().ok()
+    }
+}
+
+/// Handle a redirect connection: read the request line, write the browser
+/// response page, and return the derived `AuthResult`. Runs in the spawned
+/// thread; errors must always produce an `AuthResult` so the mpsc send never
+/// goes missing (otherwise the dialog would hang on "Waiting...").
+fn handle_redirect(
+    mut stream: std::net::TcpStream,
+    expected_state: &str,
+    redirect_uri: &str,
+    code_verifier: &str,
+    tenant: &str,
+) -> AuthResult {
+    // `BufReader` needs its own handle so the response write below still
+    // uses the original stream. If cloning fails, we can't parse the request
+    // but we can still produce a proper AuthResult::Error.
+    let cloned = match stream.try_clone() {
+        Ok(c) => c,
+        Err(e) => {
+            return AuthResult::Error(format!("Failed to clone socket: {}", e));
+        }
+    };
+    let mut reader = BufReader::new(cloned);
+    let mut request_line = String::new();
+    if reader.read_line(&mut request_line).is_err() {
+        return AuthResult::Error("Failed to read browser redirect".to_string());
+    }
+
+    let send_page = |stream: &mut std::net::TcpStream, body: &str| {
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n{}",
+            body
+        );
+        let _ = stream.write_all(response.as_bytes());
+        let _ = stream.flush();
+    };
+
+    if let Some(code) = extract_code_from_request(&request_line) {
+        // Validate CSRF state before trusting the authorization code.
+        let received = extract_state_from_request(&request_line).unwrap_or_default();
+        if received != expected_state {
+            send_page(&mut stream, ERROR_HTML);
+            return AuthResult::Error(
+                "OAuth state mismatch — possible CSRF, ignoring redirect".to_string(),
+            );
+        }
+        // Flush the success page first so the user sees a fast response.
+        send_page(&mut stream, SUCCESS_HTML);
+        drop(stream);
+        match exchange_code(&code, redirect_uri, code_verifier, tenant) {
+            Ok(token) => AuthResult::Success(token),
+            Err(e) => AuthResult::Error(e),
+        }
+    } else if let Some(err) = extract_error_from_request(&request_line) {
+        send_page(&mut stream, ERROR_HTML);
+        AuthResult::Error(err)
+    } else {
+        send_page(&mut stream, ERROR_HTML);
+        AuthResult::Error("No authorization code in redirect".to_string())
     }
 }
 
@@ -402,24 +425,20 @@ pub fn store_refresh_token(token: &str) -> Result<(), String> {
 
 fn keychain_store(account: &str, label: &str, value: &str) -> Result<(), String> {
     if cfg!(target_os = "macos") {
-        let _ = Command::new("security")
-            .args([
-                "delete-generic-password",
-                "-s",
-                "middle-manager",
-                "-a",
-                account,
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // macOS `security add-generic-password` takes the password as argv (-w),
+        // which is briefly visible to other local users via `ps`. The alternative
+        // (interactive prompt) is unusable from a TUI. We use `-U` to upsert in a
+        // single command, keeping the exposure window as short as possible.
         let status = Command::new("security")
             .args([
                 "add-generic-password",
+                "-U",
                 "-s",
                 "middle-manager",
                 "-a",
                 account,
+                "-l",
+                label,
                 "-w",
                 value,
             ])
@@ -506,28 +525,54 @@ fn keychain_lookup(account: &str) -> Option<String> {
 // PKCE (Proof Key for Code Exchange)
 // ---------------------------------------------------------------------------
 
-/// Generate a random code verifier (43-128 chars, URL-safe).
-fn generate_code_verifier() -> String {
+/// Fill `out` with random bytes.
+///
+/// Primary source is `/dev/urandom` (present on both macOS and Linux, which are
+/// our only targets). Falls back to a time+pid+stack-address seeded xorshift
+/// only if the OS source is unreachable — logged so unexpected fallbacks are
+/// visible. The fallback is NOT a CSPRNG and only exists to keep the flow
+/// functional in degraded environments (e.g. chroot without /dev).
+fn fill_random(out: &mut [u8]) {
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        if f.read_exact(out).is_ok() {
+            return;
+        }
+    }
+    crate::debug_log::log("azure_auth: /dev/urandom unavailable, falling back to xorshift");
     use std::time::{SystemTime, UNIX_EPOCH};
-    // Use multiple entropy sources to build a seed
     let time_ns = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_nanos();
     let pid = std::process::id() as u128;
-    let ptr = &time_ns as *const u128 as u128;
+    let ptr = out.as_ptr() as u128;
     let mut state: u64 = (time_ns ^ pid ^ ptr) as u64;
-
-    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
-    let mut verifier = String::with_capacity(64);
-    for _ in 0..64 {
-        // xorshift64
+    for b in out.iter_mut() {
         state ^= state << 13;
         state ^= state >> 7;
         state ^= state << 17;
-        verifier.push(CHARSET[(state as usize) % CHARSET.len()] as char);
+        *b = state as u8;
+    }
+}
+
+/// Generate a PKCE code verifier (RFC 7636 §4.1): 43–128 URL-safe chars.
+fn generate_code_verifier() -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
+    let mut bytes = [0u8; 64];
+    fill_random(&mut bytes);
+    let mut verifier = String::with_capacity(64);
+    for b in bytes.iter() {
+        verifier.push(CHARSET[(*b as usize) % CHARSET.len()] as char);
     }
     verifier
+}
+
+/// Generate an OAuth2 `state` parameter (RFC 6749 §10.12) — a 32-byte
+/// base64url-encoded random nonce for CSRF protection on the redirect.
+fn generate_state() -> String {
+    let mut bytes = [0u8; 32];
+    fill_random(&mut bytes);
+    base64url_encode(&bytes)
 }
 
 /// Compute S256 code challenge: base64url(sha256(code_verifier)).

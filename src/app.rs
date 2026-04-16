@@ -495,7 +495,7 @@ pub enum DialogKind {
 
 // --- Azure DevOps auth dialog ---
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum AzureAuthMode {
     Pat,
     Browser,
@@ -3636,6 +3636,10 @@ impl App {
                                 crate::azure_auth::store_bearer_token(&token.access_token)
                             {
                                 auth.browser_flow = None;
+                                // Zones expand when browser_flow transitions to None;
+                                // re-anchor focus to Cancel so it doesn't silently
+                                // land on the input field.
+                                auth.field_focus = auth.max_focus().saturating_sub(1);
                                 auth.error =
                                     Some(format!("Token obtained but failed to store: {}", e));
                             } else {
@@ -3650,6 +3654,7 @@ impl App {
                         }
                         crate::azure_auth::AuthResult::Error(e) => {
                             auth.browser_flow = None;
+                            auth.field_focus = auth.max_focus().saturating_sub(1);
                             auth.error = Some(e);
                         }
                     }
@@ -4143,6 +4148,14 @@ impl App {
             return;
         }
 
+        // OpenAzureAuth works from any panel/mode (opens the auth dialog).
+        if matches!(action, Action::OpenAzureAuth) {
+            if self.azure_auth_dialog.is_none() {
+                self.azure_auth_dialog = Some(AzureAuthDialogState::new());
+            }
+            return;
+        }
+
         // Bottom panel focus intercepts only apply in normal/quick-search modes
         // (full-screen modes like DiffViewing/Editing handle their own keys)
         if matches!(self.mode, AppMode::Normal | AppMode::QuickSearch) {
@@ -4561,13 +4574,6 @@ impl App {
             // CI failure extraction (only works when CI panel is focused, handled above)
             Action::ExtractCiFailures => {}
 
-            // Azure auth dialog: may be opened globally as well
-            Action::OpenAzureAuth => {
-                if self.azure_auth_dialog.is_none() {
-                    self.azure_auth_dialog = Some(AzureAuthDialogState::new());
-                }
-            }
-
             // File content search dialog
             Action::FileSearchPrompt => {
                 let path = self
@@ -4767,7 +4773,10 @@ impl App {
             Action::DialogCancel => self.handle_dialog_cancel(),
             Action::DialogBackspace => self.handle_dialog_backspace(),
             Action::DialogConfirm | Action::DialogInput(_) => {}
-            Action::TerminalInput(_) | Action::TerminalOpenFile | Action::ToggleReverse => {} // handled by intercepts above
+            Action::TerminalInput(_)
+            | Action::TerminalOpenFile
+            | Action::ToggleReverse
+            | Action::OpenAzureAuth => {} // handled by intercepts above
         }
     }
 
@@ -6855,11 +6864,6 @@ impl App {
             }
             Action::ExtractCiFailures => {
                 self.start_failure_extraction(side);
-            }
-            Action::OpenAzureAuth => {
-                if self.azure_auth_dialog.is_none() {
-                    self.azure_auth_dialog = Some(AzureAuthDialogState::new());
-                }
             }
             Action::BottomResizeUp => {
                 self.bottom_split_pct[side] = self.bottom_split_pct[side]
@@ -10476,5 +10480,211 @@ mod fuzzy_tests {
         // Move up wraps
         state.selected = (state.selected + len - 1) % len;
         assert_eq!(state.selected, 2); // wrapped backward
+    }
+}
+
+#[cfg(test)]
+mod azure_auth_dialog_tests {
+    use super::*;
+
+    // ── AzureAuthMode ───────────────────────────────────────────────
+
+    #[test]
+    fn mode_next_cycles_pat_browser_azcli() {
+        assert_eq!(AzureAuthMode::Pat.next(), AzureAuthMode::Browser);
+        assert_eq!(AzureAuthMode::Browser.next(), AzureAuthMode::AzCli);
+        assert_eq!(AzureAuthMode::AzCli.next(), AzureAuthMode::Pat);
+    }
+
+    #[test]
+    fn mode_prev_is_inverse_of_next() {
+        for m in [
+            AzureAuthMode::Pat,
+            AzureAuthMode::Browser,
+            AzureAuthMode::AzCli,
+        ] {
+            assert_eq!(m.next().prev(), m);
+            assert_eq!(m.prev().next(), m);
+        }
+    }
+
+    #[test]
+    fn has_input_only_for_pat_and_browser() {
+        assert!(AzureAuthMode::Pat.has_input());
+        assert!(AzureAuthMode::Browser.has_input());
+        assert!(!AzureAuthMode::AzCli.has_input());
+    }
+
+    // ── AzureAuthDialogState: max_focus layout ─────────────────────
+    //
+    // Layout: [bar, (input?), (ok?), cancel]
+    //   - input zone only for Pat/Browser and only when not in flight
+    //   - ok zone only when not in flight
+    //   - cancel zone always present
+
+    #[test]
+    fn max_focus_pat_idle_has_four_zones() {
+        let s = AzureAuthDialogState::new();
+        // Default mode is Pat, no flow active.
+        assert_eq!(s.mode, AzureAuthMode::Pat);
+        assert_eq!(s.max_focus(), 4); // bar, input, ok, cancel
+    }
+
+    #[test]
+    fn max_focus_azcli_idle_has_three_zones() {
+        let mut s = AzureAuthDialogState::new();
+        s.mode = AzureAuthMode::AzCli;
+        // AzCli has no input field.
+        assert_eq!(s.max_focus(), 3); // bar, ok, cancel
+    }
+
+    #[test]
+    fn max_focus_azcli_in_flight_has_two_zones() {
+        let mut s = AzureAuthDialogState::new();
+        s.mode = AzureAuthMode::AzCli;
+        s.az_fetching = true;
+        // When fetching, no input and no OK — just bar + cancel.
+        assert_eq!(s.max_focus(), 2);
+    }
+
+    #[test]
+    fn max_focus_browser_idle_has_four_zones() {
+        let mut s = AzureAuthDialogState::new();
+        s.mode = AzureAuthMode::Browser;
+        assert_eq!(s.max_focus(), 4); // bar, input (tenant), login, cancel
+    }
+
+    // ── focus predicates partition the zone space ─────────────────
+
+    #[test]
+    fn focus_predicates_pat_mode() {
+        let mut s = AzureAuthDialogState::new();
+        s.mode = AzureAuthMode::Pat;
+
+        // zone 0 = bar
+        s.field_focus = 0;
+        assert!(s.on_bar());
+        assert!(!s.on_input());
+        assert!(!s.on_ok());
+        assert!(!s.on_cancel());
+
+        // zone 1 = input
+        s.field_focus = 1;
+        assert!(!s.on_bar());
+        assert!(s.on_input());
+        assert!(!s.on_ok());
+        assert!(!s.on_cancel());
+
+        // zone 2 = ok
+        s.field_focus = 2;
+        assert!(!s.on_bar());
+        assert!(!s.on_input());
+        assert!(s.on_ok());
+        assert!(!s.on_cancel());
+
+        // zone 3 = cancel
+        s.field_focus = 3;
+        assert!(!s.on_bar());
+        assert!(!s.on_input());
+        assert!(!s.on_ok());
+        assert!(s.on_cancel());
+    }
+
+    #[test]
+    fn focus_predicates_azcli_mode_skips_input_zone() {
+        let mut s = AzureAuthDialogState::new();
+        s.mode = AzureAuthMode::AzCli;
+
+        // zones: [bar(0), ok(1), cancel(2)]
+        s.field_focus = 0;
+        assert!(s.on_bar());
+        assert!(!s.on_input());
+
+        s.field_focus = 1;
+        assert!(!s.on_bar());
+        assert!(!s.on_input());
+        assert!(s.on_ok());
+        assert!(!s.on_cancel());
+
+        s.field_focus = 2;
+        assert!(s.on_cancel());
+    }
+
+    #[test]
+    fn focus_predicates_in_flight_only_bar_and_cancel() {
+        let mut s = AzureAuthDialogState::new();
+        s.mode = AzureAuthMode::Browser;
+        // Simulate an active browser flow by setting az_fetching (same in_flight
+        // branch reachable without building a real TcpListener).
+        s.az_fetching = true;
+
+        // zones: [bar(0), cancel(1)]
+        assert_eq!(s.max_focus(), 2);
+
+        s.field_focus = 0;
+        assert!(s.on_bar());
+        assert!(!s.on_input());
+        assert!(!s.on_ok());
+        assert!(!s.on_cancel());
+
+        s.field_focus = 1;
+        assert!(!s.on_bar());
+        assert!(!s.on_input());
+        assert!(!s.on_ok());
+        assert!(s.on_cancel());
+    }
+
+    #[test]
+    fn exactly_one_predicate_true_per_zone_across_modes() {
+        // For every mode × idle/in-flight × zone, exactly one focus predicate
+        // should return true — otherwise the UI would highlight two zones at
+        // once or none at all.
+        for mode in [
+            AzureAuthMode::Pat,
+            AzureAuthMode::Browser,
+            AzureAuthMode::AzCli,
+        ] {
+            for in_flight in [false, true] {
+                let mut s = AzureAuthDialogState::new();
+                s.mode = mode;
+                s.az_fetching = in_flight;
+                let n = s.max_focus();
+                for zone in 0..n {
+                    s.field_focus = zone;
+                    let hits = [s.on_bar(), s.on_input(), s.on_ok(), s.on_cancel()]
+                        .iter()
+                        .filter(|b| **b)
+                        .count();
+                    assert_eq!(
+                        hits, 1,
+                        "mode={:?} in_flight={} zone={}/{} → hits={}",
+                        mode, in_flight, zone, n, hits
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn active_input_mut_returns_pat_or_tenant_by_mode() {
+        // `new()` may seed tenant_input from the environment; reset for a clean
+        // starting state so the test doesn't depend on the dev's shell.
+        let mut s = AzureAuthDialogState::new();
+        s.pat_input = crate::text_input::TextInput::new(String::new());
+        s.tenant_input = crate::text_input::TextInput::new(String::new());
+
+        s.mode = AzureAuthMode::Pat;
+        s.active_input_mut().text.push_str("pat-value");
+        assert_eq!(s.pat_input.text, "pat-value");
+        assert_eq!(s.tenant_input.text, "");
+
+        s.mode = AzureAuthMode::Browser;
+        s.active_input_mut().text.push_str("my.tenant");
+        assert_eq!(s.tenant_input.text, "my.tenant");
+        assert_eq!(s.pat_input.text, "pat-value");
+
+        // AzCli has no input; active_input_mut returns tenant as a safe default.
+        s.mode = AzureAuthMode::AzCli;
+        let _ = s.active_input_mut();
     }
 }

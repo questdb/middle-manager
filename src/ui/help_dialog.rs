@@ -65,12 +65,23 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
     (
         "Azure DevOps Auth",
         &[
-            ("Auth dialog", "Opens automatically when auth is needed"),
-            ("PAT mode", "Paste token, stored in system keychain"),
-            ("AZURE_DEVOPS_PAT", "Or set env var directly"),
+            ("a (in CI panel)", "Open auth dialog (auto-opens if needed)"),
+            ("Tab / Shift+Tab", "Cycle tab bar / input / buttons"),
+            ("Left / Right (on bar)", "Switch PAT / Browser / az CLI"),
+            ("Alt+Left / Alt+Right", "Switch mode from any zone"),
+            ("Enter", "Submit (PAT: store, Browser: Login, az: Fetch)"),
+            ("Esc", "Close dialog"),
+            ("PAT mode", "Paste token; stored in system keychain"),
             (
                 "Browser mode",
-                "Set AZURE_DEVOPS_TENANT to enable OAuth2 login",
+                "Tenant prompted in dialog; OAuth2+PKCE login",
+            ),
+            ("az CLI mode", "Reuses `az login` session; no OAuth needed"),
+            ("AZURE_DEVOPS_PAT", "Env var for CI/headless PAT use"),
+            ("AZURE_DEVOPS_TENANT", "Preseeds the tenant input"),
+            (
+                "AZURE_DEVOPS_CLIENT_ID",
+                "Override Azure CLI public client ID",
             ),
         ],
     ),

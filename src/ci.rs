@@ -108,7 +108,7 @@ pub enum CiView {
     Error(String),
 }
 
-const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+use crate::azure_auth::SPINNER;
 
 /// Active log download state.
 pub struct LogDownload {
@@ -1039,25 +1039,20 @@ fn get_azure_pat() -> Option<String> {
 /// Returns Ok(()) on success or Err with a message.
 pub fn store_azure_pat(pat: &str) -> Result<(), String> {
     if cfg!(target_os = "macos") {
-        // Delete any existing entry first (ignore errors)
-        let _ = Command::new("security")
-            .args([
-                "delete-generic-password",
-                "-s",
-                "middle-manager",
-                "-a",
-                "azure-pat",
-            ])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        // macOS `security add-generic-password` takes the PAT as argv (-w),
+        // which is briefly visible to other local users via `ps`. The alternative
+        // (interactive prompt) is unusable from a TUI. We use `-U` to upsert in
+        // a single command, keeping the exposure window as short as possible.
         let status = Command::new("security")
             .args([
                 "add-generic-password",
+                "-U",
                 "-s",
                 "middle-manager",
                 "-a",
                 "azure-pat",
+                "-l",
+                "middle-manager azure PAT",
                 "-w",
                 pat,
             ])
