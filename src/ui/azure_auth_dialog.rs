@@ -182,14 +182,18 @@ fn render_body(
             }
         }
         AzureAuthMode::AzCli => {
-            let text = match &state.az_status {
-                AzCliStatus::Unknown => "Checking az CLI...".to_string(),
-                AzCliStatus::Checking => "Checking az CLI...".to_string(),
-                AzCliStatus::LoggedIn { user, tenant } => {
-                    format!("Logged in as {}  ·  tenant {}", user, tenant)
+            let text = if state.az_fetching {
+                state.az_fetch_status()
+            } else {
+                match &state.az_status {
+                    AzCliStatus::Unknown => "Checking az CLI...".to_string(),
+                    AzCliStatus::Checking => "Checking az CLI...".to_string(),
+                    AzCliStatus::LoggedIn { user, tenant } => {
+                        format!("Logged in as {}  ·  tenant {}", user, tenant)
+                    }
+                    AzCliStatus::NotLoggedIn => "az found — run `az login` first".to_string(),
+                    AzCliStatus::NotInstalled => "az CLI not found in PATH".to_string(),
                 }
-                AzCliStatus::NotLoggedIn => "az found — run `az login` first".to_string(),
-                AzCliStatus::NotInstalled => "az CLI not found in PATH".to_string(),
             };
             dh::render_line(
                 frame,

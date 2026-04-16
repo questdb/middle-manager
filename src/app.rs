@@ -551,12 +551,18 @@ pub struct AzureAuthDialogState {
     pub browser_flow: Option<crate::azure_auth::BrowserAuthFlow>,
     /// True while an az CLI token fetch is in progress (no input, only Cancel).
     pub az_fetching: bool,
+    /// Animated spinner tick for the in-flight az CLI fetch message.
+    pub az_fetch_tick: usize,
     pub error: Option<String>,
     /// Cached az CLI status. Populated asynchronously when entering az CLI tab.
     pub az_status: AzCliStatus,
     /// Receiver for the in-flight az status check. Dropping this cancels the
     /// effect of a stale thread (its send() fails silently).
     az_status_rx: Option<std::sync::mpsc::Receiver<AzCliStatus>>,
+    /// Receiver for the in-flight `az account get-access-token` call. Dropping
+    /// it tells the worker its result will be discarded.
+    az_token_rx:
+        Option<std::sync::mpsc::Receiver<Result<crate::azure_auth::TokenResponse, String>>>,
 }
 
 impl AzureAuthDialogState {
@@ -573,10 +579,42 @@ impl AzureAuthDialogState {
             field_focus: 0,
             browser_flow: None,
             az_fetching: false,
+            az_fetch_tick: 0,
             error: None,
             az_status: AzCliStatus::Unknown,
             az_status_rx: None,
+            az_token_rx: None,
         }
+    }
+
+    /// Kick off a background `az account get-access-token` call. Cancels any
+    /// in-flight fetch (by replacing the receiver).
+    pub fn start_az_token_fetch(&mut self) {
+        self.az_fetching = true;
+        self.az_fetch_tick = 0;
+        self.error = None;
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.az_token_rx = Some(rx); // drops any previous receiver
+        std::thread::spawn(move || {
+            let result = crate::azure_auth::get_token_via_az_cli();
+            let _ = tx.send(result);
+        });
+    }
+
+    /// Poll the in-flight az token fetch. Returns Some(result) when done.
+    pub fn poll_az_token(&mut self) -> Option<Result<crate::azure_auth::TokenResponse, String>> {
+        let done = self.az_token_rx.as_ref().and_then(|rx| rx.try_recv().ok());
+        if done.is_some() {
+            self.az_fetching = false;
+            self.az_token_rx = None;
+        }
+        done
+    }
+
+    /// Human-readable status text for the in-flight az fetch, with spinner.
+    pub fn az_fetch_status(&self) -> String {
+        let c = crate::azure_auth::SPINNER[self.az_fetch_tick % crate::azure_auth::SPINNER.len()];
+        format!("{} Fetching token from az CLI...", c)
     }
 
     /// Kick off a background check of `az` CLI status. Cancels any in-flight
@@ -3655,6 +3693,35 @@ impl App {
                         crate::azure_auth::AuthResult::Error(e) => {
                             auth.browser_flow = None;
                             auth.field_focus = auth.max_focus().saturating_sub(1);
+                            auth.error = Some(e);
+                        }
+                    }
+                }
+            }
+        }
+        // Poll the async az CLI token fetch, if one is in flight.
+        if let Some(ref mut auth) = self.azure_auth_dialog {
+            if auth.az_fetching {
+                auth.az_fetch_tick = auth.az_fetch_tick.wrapping_add(1);
+                if let Some(result) = auth.poll_az_token() {
+                    // Zones expand when az_fetching flips to false; re-anchor
+                    // focus to Cancel before (possibly) closing the dialog so
+                    // it's never left on a stale index.
+                    auth.field_focus = auth.max_focus().saturating_sub(1);
+                    match result {
+                        Ok(token) => {
+                            if let Err(e) =
+                                crate::azure_auth::store_bearer_token(&token.access_token)
+                            {
+                                auth.error = Some(format!("Got token but failed to store: {}", e));
+                            } else {
+                                self.status_message =
+                                    Some("Azure DevOps authenticated via az CLI".to_string());
+                                self.azure_auth_dialog = None;
+                                self.retry_ci_auth_expansions();
+                            }
+                        }
+                        Err(e) => {
                             auth.error = Some(e);
                         }
                     }
@@ -8679,26 +8746,15 @@ impl App {
                     }
                     return;
                 }
-                // Synchronous: az is fast (cached token). If we hit latency issues
-                // later, move to a background thread like BrowserAuthFlow.
-                match crate::azure_auth::get_token_via_az_cli() {
-                    Ok(token) => {
-                        if let Err(e) = crate::azure_auth::store_bearer_token(&token.access_token) {
-                            if let Some(ref mut s) = self.azure_auth_dialog {
-                                s.error = Some(format!("Got token but failed to store: {}", e));
-                            }
-                        } else {
-                            self.status_message =
-                                Some("Azure DevOps authenticated via az CLI".to_string());
-                            self.azure_auth_dialog = None;
-                            self.retry_ci_auth_expansions();
-                        }
-                    }
-                    Err(e) => {
-                        if let Some(ref mut s) = self.azure_auth_dialog {
-                            s.error = Some(e);
-                        }
-                    }
+                // Run on a background thread so the UI thread stays responsive
+                // (`az account get-access-token` is ~1s on a warm cache, longer
+                // on a cold one). The tick loop polls `az_token_rx` and closes
+                // the dialog on success.
+                if let Some(ref mut s) = self.azure_auth_dialog {
+                    s.start_az_token_fetch();
+                    // While fetching, only bar + Cancel are reachable; land
+                    // focus on Cancel so Enter cancels.
+                    s.field_focus = s.max_focus().saturating_sub(1);
                 }
             }
         }

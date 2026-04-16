@@ -7,6 +7,8 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpListener;
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Token obtained from the OAuth2 flow.
 #[derive(Debug, Clone)]
@@ -165,8 +167,11 @@ fn exchange_code(
         urlencoded(code_verifier),
     );
 
+    // Pipe the body through stdin rather than `-d <body>`: the body contains
+    // the one-shot authorization code and the PKCE code_verifier, and argv is
+    // world-readable via `ps`.
     let url = token_url(tenant);
-    let output = Command::new("curl")
+    let mut child = Command::new("curl")
         .args([
             "-s",
             "-X",
@@ -174,15 +179,24 @@ fn exchange_code(
             &url,
             "-H",
             "Content-Type: application/x-www-form-urlencoded",
-            "-d",
-            &body,
+            "--data-binary",
+            "@-",
             "--max-time",
             "30",
         ])
+        .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
-        .output()
+        .spawn()
         .map_err(|e| format!("Failed to exchange code: {}", e))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        stdin
+            .write_all(body.as_bytes())
+            .map_err(|e| format!("Failed to write token request: {}", e))?;
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|e| format!("Failed to read curl output: {}", e))?;
 
     if !output.status.success() {
         return Err("Token exchange request failed".to_string());
@@ -252,6 +266,10 @@ pub struct BrowserAuthFlow {
     pub status: String,
     rx: std::sync::mpsc::Receiver<AuthResult>,
     spinner_tick: usize,
+    /// Flipped by `Drop` so the worker thread can exit promptly when the user
+    /// cancels the dialog — otherwise it keeps holding the bound port for the
+    /// full 2-minute timeout.
+    cancelled: Arc<AtomicBool>,
 }
 
 impl BrowserAuthFlow {
@@ -301,10 +319,16 @@ impl BrowserAuthFlow {
             .set_nonblocking(true)
             .map_err(|e| format!("Failed to set non-blocking: {}", e))?;
 
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let thread_cancelled = Arc::clone(&cancelled);
+
         std::thread::spawn(move || {
             let timeout = std::time::Duration::from_secs(120);
             let start = std::time::Instant::now();
             let accepted = loop {
+                if thread_cancelled.load(Ordering::Relaxed) {
+                    return; // receiver is gone; don't bother sending
+                }
                 match listener.accept() {
                     Ok(conn) => break Ok(conn),
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
@@ -332,6 +356,7 @@ impl BrowserAuthFlow {
             status: "Waiting for browser login...".to_string(),
             rx,
             spinner_tick: 0,
+            cancelled,
         })
     }
 
@@ -341,6 +366,14 @@ impl BrowserAuthFlow {
         let c = SPINNER[self.spinner_tick % SPINNER.len()];
         self.status = format!("{} Waiting for browser login...", c);
         self.rx.try_recv().ok()
+    }
+}
+
+impl Drop for BrowserAuthFlow {
+    fn drop(&mut self) {
+        // Signal the worker thread so it can release the bound port instead of
+        // spinning out the 2-minute timeout.
+        self.cancelled.store(true, Ordering::Relaxed);
     }
 }
 
