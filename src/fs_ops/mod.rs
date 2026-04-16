@@ -516,22 +516,6 @@ pub fn delete_entry(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[allow(dead_code)]
-pub fn create_directory(parent: &Path, name: &str) -> Result<()> {
-    let path = parent.join(name);
-    fs::create_dir_all(&path).with_context(|| format!("Failed to create directory {:?}", path))?;
-    Ok(())
-}
-
-#[allow(dead_code)]
-pub fn rename_entry(path: &Path, new_name: &str) -> Result<()> {
-    let parent = path.parent().context("path has no parent")?;
-    let new_path = parent.join(new_name);
-    fs::rename(path, &new_path)
-        .with_context(|| format!("Failed to rename {:?} to {:?}", path, new_path))?;
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Sparse copy
 // ---------------------------------------------------------------------------
@@ -930,7 +914,7 @@ mod tests {
 
         let inner_target = tmp.path().join("inner_target.txt");
         write_file(&inner_target, "inner");
-        symlink(&inner_target, &real_dir.join("inner_link.txt")).unwrap();
+        symlink(&inner_target, real_dir.join("inner_link.txt")).unwrap();
 
         // Create a top-level symlink to the directory.
         let dir_link = tmp.path().join("dir_link");
@@ -1120,7 +1104,7 @@ mod tests {
 
         let target = tmp.path().join("target.txt");
         write_file(&target, "t");
-        symlink(&target, &src_dir.join("link.txt")).unwrap();
+        symlink(&target, src_dir.join("link.txt")).unwrap();
         write_file(&src_dir.join("real.txt"), "r");
 
         let dst_dir = tmp.path().join("dst");
@@ -1146,7 +1130,7 @@ mod tests {
 
         let target = tmp.path().join("target.txt");
         write_file(&target, "t");
-        symlink(&target, &src_dir.join("inner_link.txt")).unwrap();
+        symlink(&target, src_dir.join("inner_link.txt")).unwrap();
         write_file(&src_dir.join("real.txt"), "r");
 
         // Top-level symlink to the directory.
@@ -1435,8 +1419,8 @@ mod tests {
 
         let external = tmp.path().join("external.txt");
         write_file(&external, "ext");
-        symlink(&external, &root.join("ext_link.txt")).unwrap();
-        symlink(&external, &root.join("sub").join("nested_link.txt")).unwrap();
+        symlink(&external, root.join("ext_link.txt")).unwrap();
+        symlink(&external, root.join("sub").join("nested_link.txt")).unwrap();
 
         let dst_dir = tmp.path().join("dst");
         fs::create_dir_all(&dst_dir).unwrap();
@@ -1604,7 +1588,7 @@ mod tests {
         fs::create_dir_all(&dst_dir).unwrap();
         copy_entry(&src, &dst_dir, &default_opts()).unwrap();
 
-        let copied_data = fs::read(&dst_dir.join("big.bin")).unwrap();
+        let copied_data = fs::read(dst_dir.join("big.bin")).unwrap();
         assert_eq!(copied_data, data);
     }
 

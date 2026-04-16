@@ -159,11 +159,7 @@ mod s3mock {
                 "Missing hello.txt in {:?}",
                 names
             );
-            assert!(
-                names.iter().any(|n| *n == "subdir"),
-                "Missing subdir/ in {:?}",
-                names
-            );
+            assert!(names.contains(&"subdir"), "Missing subdir/ in {:?}", names);
 
             // Check subdir listing
             let sub_entries = c.read_dir(Path::new("/subdir")).unwrap();
@@ -473,12 +469,6 @@ mod sftp {
 
 mod webdav {
     use super::*;
-
-    // WebDAV test server could be: `docker run -p 8080:80 bytemark/webdav`
-    // or `npx webdav-server` or similar. We'll skip if not available.
-    fn webdav_available() -> bool {
-        port_open(8080) && tool_available("curl")
-    }
 
     #[test]
     fn test_webdav_propfind_parsing() {

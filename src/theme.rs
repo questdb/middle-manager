@@ -85,7 +85,6 @@ pub struct Theme {
     pub dialog_cursor_fg: Color,
     pub dialog_input_fg_focused: Color,
     pub dialog_input_bg: Color,
-    #[allow(dead_code)]
     pub dialog_hint_fg: Color,
     pub selected_fg: Color,
     pub selected_highlight_fg: Color,
@@ -430,11 +429,6 @@ impl Theme {
             .fg(self.dialog_title_fg)
             .bg(self.dialog_bg)
             .add_modifier(Modifier::BOLD)
-    }
-
-    #[allow(dead_code)]
-    pub fn dialog_text_style(&self) -> Style {
-        Style::default().fg(self.dialog_text_fg).bg(self.dialog_bg)
     }
 
     pub fn overwrite_bg_style(&self) -> Style {

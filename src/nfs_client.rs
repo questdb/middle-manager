@@ -230,6 +230,26 @@ fn normalize_path(path: &Path) -> PathBuf {
     components.iter().collect()
 }
 
+fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<u64> {
+    std::fs::create_dir_all(dst)?;
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let dest = dst.join(entry.file_name());
+        let ft = entry.file_type()?;
+        if ft.is_symlink() {
+            continue; // Skip symlinks to prevent infinite recursion on cycles
+        }
+        if ft.is_dir() {
+            total += copy_dir_recursive(&entry.path(), &dest)?;
+        } else {
+            std::fs::copy(entry.path(), &dest)?;
+            total += entry.metadata()?.len();
+        }
+    }
+    Ok(total)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,24 +342,4 @@ mod tests {
         let result = nfs.local_path(Path::new(""));
         assert_eq!(result, PathBuf::from("/mnt/nfs"));
     }
-}
-
-fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<u64> {
-    std::fs::create_dir_all(dst)?;
-    let mut total = 0u64;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let dest = dst.join(entry.file_name());
-        let ft = entry.file_type()?;
-        if ft.is_symlink() {
-            continue; // Skip symlinks to prevent infinite recursion on cycles
-        }
-        if ft.is_dir() {
-            total += copy_dir_recursive(&entry.path(), &dest)?;
-        } else {
-            std::fs::copy(entry.path(), &dest)?;
-            total += entry.metadata()?.len();
-        }
-    }
-    Ok(total)
 }

@@ -57,8 +57,21 @@ const HELP_SECTIONS: &[(&str, &[(&str, &str)])] = &[
             ("Enter", "Expand/collapse or download step log"),
             ("o", "Open check in browser"),
             ("Ctrl+E", "Extract all failures to file"),
+            ("a", "Open Azure DevOps auth dialog"),
             ("Alt+Up / Alt+Down", "Resize panel split"),
             ("Alt+Enter", "Maximize / restore panel"),
+        ],
+    ),
+    (
+        "Azure DevOps Auth",
+        &[
+            ("Auth dialog", "Opens automatically when auth is needed"),
+            ("PAT mode", "Paste token, stored in system keychain"),
+            ("AZURE_DEVOPS_PAT", "Or set env var directly"),
+            (
+                "Browser mode",
+                "Set AZURE_DEVOPS_TENANT to enable OAuth2 login",
+            ),
         ],
     ),
     (

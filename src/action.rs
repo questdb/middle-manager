@@ -107,6 +107,7 @@ pub enum Action {
     OpenPr,
     ToggleCi,
     ExtractCiFailures,
+    OpenAzureAuth,
     ToggleDiff,
 
     // Terminal / Shell / SSH / Sessions

@@ -69,8 +69,6 @@ pub struct DataPreview {
 pub struct ParquetViewerState {
     pub path: PathBuf,
     pub file_size: u64,
-    #[allow(dead_code)]
-    pub error: Option<String>,
 
     metadata: FileMetaData,
 
@@ -124,7 +122,6 @@ impl ParquetViewerState {
         let mut state = Self {
             path,
             file_size,
-            error: None,
             metadata,
             view_mode: ViewMode::Tree,
             // Pre-allocate: root + properties + schema header + row group headers
