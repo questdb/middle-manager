@@ -123,6 +123,8 @@ pub struct App {
     pub file_search_side: usize,
     /// File content search dialog.
     pub file_search_dialog: Option<FileSearchDialogState>,
+    /// When set, the help dialog shows contextual rg help instead of normal help.
+    pub file_search_help: Option<FileSearchHelp>,
     /// Overwrite confirmation dialog for Ask-mode copy/move.
     pub overwrite_ask: Option<OverwriteAskState>,
     /// Wakeup sender for the event loop (given to terminal reader threads).
@@ -139,6 +141,8 @@ pub struct App {
     pending_remote: Option<PendingRemoteConnect>,
     /// Stashed diff viewer context for F4 editor↔diff toggle.
     pub stashed_diff: Option<StashedDiff>,
+    /// Focus to restore when closing editor (tracks where we came from).
+    pub pre_editor_focus: Option<PanelFocus>,
 }
 
 /// Result of a background remote connection attempt.
@@ -725,12 +729,50 @@ impl SymlinkMode {
 
 // --- File search dialog ---
 
-#[derive(Clone, Copy, PartialEq)]
+/// Which contextual help to show when F1 is pressed in the file search dialog.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum FileSearchHelp {
+    FileTypes,
+    Glob,
+    Field(FileSearchField),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FileSearchField {
-    Path,
+    // Text inputs
     Term,
+    Replace,
+    Path,
     Filter,
+    FileType,
+    TypeExclude,
+    // Search option checkboxes
     Regex,
+    CaseInsensitive,
+    SmartCase,
+    WholeWord,
+    WholeLineMatch,
+    InvertMatch,
+    Multiline,
+    MultilineDotAll,
+    Crlf,
+    // Filter checkboxes
+    Hidden,
+    FollowSymlinks,
+    NoGitignore,
+    Binary,
+    SearchZip,
+    GlobCaseInsensitive,
+    OneFileSystem,
+    TrimWhitespace,
+    // Numeric/text inputs
+    BeforeContext,
+    AfterContext,
+    MaxDepth,
+    MaxCount,
+    MaxFileSize,
+    Encoding,
+    // Buttons
     ButtonSearch,
     ButtonCancel,
 }
@@ -738,10 +780,35 @@ pub enum FileSearchField {
 impl FileSearchField {
     pub fn next(self) -> Self {
         match self {
-            Self::Term => Self::Path,
+            Self::Term => Self::Replace,
+            Self::Replace => Self::Path,
             Self::Path => Self::Filter,
-            Self::Filter => Self::Regex,
-            Self::Regex => Self::ButtonSearch,
+            Self::Filter => Self::FileType,
+            Self::FileType => Self::TypeExclude,
+            Self::TypeExclude => Self::Regex,
+            Self::Regex => Self::CaseInsensitive,
+            Self::CaseInsensitive => Self::SmartCase,
+            Self::SmartCase => Self::WholeWord,
+            Self::WholeWord => Self::WholeLineMatch,
+            Self::WholeLineMatch => Self::InvertMatch,
+            Self::InvertMatch => Self::Multiline,
+            Self::Multiline => Self::MultilineDotAll,
+            Self::MultilineDotAll => Self::Crlf,
+            Self::Crlf => Self::Hidden,
+            Self::Hidden => Self::FollowSymlinks,
+            Self::FollowSymlinks => Self::NoGitignore,
+            Self::NoGitignore => Self::Binary,
+            Self::Binary => Self::SearchZip,
+            Self::SearchZip => Self::GlobCaseInsensitive,
+            Self::GlobCaseInsensitive => Self::OneFileSystem,
+            Self::OneFileSystem => Self::TrimWhitespace,
+            Self::TrimWhitespace => Self::BeforeContext,
+            Self::BeforeContext => Self::AfterContext,
+            Self::AfterContext => Self::MaxDepth,
+            Self::MaxDepth => Self::MaxCount,
+            Self::MaxCount => Self::MaxFileSize,
+            Self::MaxFileSize => Self::Encoding,
+            Self::Encoding => Self::ButtonSearch,
             Self::ButtonSearch => Self::ButtonCancel,
             Self::ButtonCancel => Self::Term,
         }
@@ -749,50 +816,239 @@ impl FileSearchField {
     pub fn prev(self) -> Self {
         match self {
             Self::Term => Self::ButtonCancel,
-            Self::Path => Self::Term,
+            Self::Replace => Self::Term,
+            Self::Path => Self::Replace,
             Self::Filter => Self::Path,
-            Self::Regex => Self::Filter,
-            Self::ButtonSearch => Self::Regex,
+            Self::FileType => Self::Filter,
+            Self::TypeExclude => Self::FileType,
+            Self::Regex => Self::TypeExclude,
+            Self::CaseInsensitive => Self::Regex,
+            Self::SmartCase => Self::CaseInsensitive,
+            Self::WholeWord => Self::SmartCase,
+            Self::WholeLineMatch => Self::WholeWord,
+            Self::InvertMatch => Self::WholeLineMatch,
+            Self::Multiline => Self::InvertMatch,
+            Self::MultilineDotAll => Self::Multiline,
+            Self::Crlf => Self::MultilineDotAll,
+            Self::Hidden => Self::Crlf,
+            Self::FollowSymlinks => Self::Hidden,
+            Self::NoGitignore => Self::FollowSymlinks,
+            Self::Binary => Self::NoGitignore,
+            Self::SearchZip => Self::Binary,
+            Self::GlobCaseInsensitive => Self::SearchZip,
+            Self::OneFileSystem => Self::GlobCaseInsensitive,
+            Self::TrimWhitespace => Self::OneFileSystem,
+            Self::BeforeContext => Self::TrimWhitespace,
+            Self::AfterContext => Self::BeforeContext,
+            Self::MaxDepth => Self::AfterContext,
+            Self::MaxCount => Self::MaxDepth,
+            Self::MaxFileSize => Self::MaxCount,
+            Self::Encoding => Self::MaxFileSize,
+            Self::ButtonSearch => Self::Encoding,
             Self::ButtonCancel => Self::ButtonSearch,
         }
     }
     pub fn is_input(self) -> bool {
-        matches!(self, Self::Path | Self::Term | Self::Filter)
+        matches!(
+            self,
+            Self::Term
+                | Self::Replace
+                | Self::Path
+                | Self::Filter
+                | Self::FileType
+                | Self::TypeExclude
+                | Self::BeforeContext
+                | Self::AfterContext
+                | Self::MaxDepth
+                | Self::MaxCount
+                | Self::MaxFileSize
+                | Self::Encoding
+        )
     }
 }
 
 pub struct FileSearchDialogState {
-    pub path: crate::text_input::TextInput,
+    // Text inputs
     pub term: crate::text_input::TextInput,
+    pub replace: crate::text_input::TextInput,
+    pub path: crate::text_input::TextInput,
     pub filter: crate::text_input::TextInput,
+    pub file_type: crate::text_input::TextInput,
+    pub type_exclude: crate::text_input::TextInput,
+    // Search options
     pub is_regex: bool,
+    pub case_insensitive: bool,
+    pub smart_case: bool,
+    pub whole_word: bool,
+    pub whole_line_match: bool,
+    pub invert_match: bool,
+    pub multiline: bool,
+    pub multiline_dotall: bool,
+    pub crlf: bool,
+    // Filter options
+    pub hidden: bool,
+    pub follow_symlinks: bool,
+    pub no_gitignore: bool,
+    pub binary: bool,
+    pub search_zip: bool,
+    pub glob_case_insensitive: bool,
+    pub one_file_system: bool,
+    pub trim_whitespace: bool,
+    // Numeric/text inputs
+    pub before_context: crate::text_input::TextInput,
+    pub after_context: crate::text_input::TextInput,
+    pub max_depth: crate::text_input::TextInput,
+    pub max_count: crate::text_input::TextInput,
+    pub max_filesize: crate::text_input::TextInput,
+    pub encoding: crate::text_input::TextInput,
+    // Focus
     pub focused: FileSearchField,
+    // Auto-complete for file type fields
+    pub completion_matches: Vec<usize>,
+    pub completion_selected: usize,
+    pub show_completions: bool,
 }
 
 impl FileSearchDialogState {
-    pub fn new(path: String, term: String, filter: String, is_regex: bool) -> Self {
-        Self {
-            path: crate::text_input::TextInput::new(path),
-            term: crate::text_input::TextInput::new(term),
-            filter: crate::text_input::TextInput::new(filter),
-            is_regex,
-            focused: FileSearchField::Term,
+    /// Whether the focused field has an active completion popup.
+    pub fn has_completions(&self) -> bool {
+        self.show_completions
+            && !self.completion_matches.is_empty()
+            && matches!(
+                self.focused,
+                FileSearchField::FileType | FileSearchField::TypeExclude
+            )
+    }
+
+    /// Extract the current token being typed (after the last comma).
+    fn current_token(text: &str) -> &str {
+        text.rsplit(',').next().unwrap_or("").trim()
+    }
+
+    /// Update completion matches based on the current input.
+    pub fn update_completions(&mut self) {
+        let text = match self.focused {
+            FileSearchField::FileType => &self.file_type.text,
+            FileSearchField::TypeExclude => &self.type_exclude.text,
+            _ => {
+                self.show_completions = false;
+                return;
+            }
+        };
+        let token = Self::current_token(text).to_lowercase();
+        if token.is_empty() {
+            self.show_completions = false;
+            self.completion_matches.clear();
+            return;
         }
+        let types = crate::file_search::rg_file_types();
+        self.completion_matches = types
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.name.starts_with(&token))
+            .map(|(i, _)| i)
+            .collect();
+        self.completion_selected = 0;
+        self.show_completions = !self.completion_matches.is_empty();
+    }
+
+    /// Accept the currently selected completion and insert it into the input.
+    pub fn accept_completion(&mut self) {
+        if !self.has_completions() {
+            return;
+        }
+        let types = crate::file_search::rg_file_types();
+        let idx = self.completion_matches[self.completion_selected];
+        let name = &types[idx].name;
+
+        let input = match self.focused {
+            FileSearchField::FileType => &mut self.file_type,
+            FileSearchField::TypeExclude => &mut self.type_exclude,
+            _ => return,
+        };
+
+        // Replace the current token with the selected type name
+        let text = &input.text;
+        let last_comma = text.rfind(',').map(|i| i + 1);
+        let prefix = match last_comma {
+            Some(pos) => {
+                let before = &text[..pos];
+                // Preserve spacing after comma
+                format!("{} ", before.trim_end())
+            }
+            None => String::new(),
+        };
+        let new_text = format!("{}{}", prefix, name);
+        let new_cursor = new_text.len();
+        input.text = new_text;
+        input.cursor = new_cursor;
+        input.anchor = None;
+        self.show_completions = false;
+        self.completion_matches.clear();
     }
 
     pub fn active_input(&mut self) -> Option<&mut crate::text_input::TextInput> {
         match self.focused {
-            FileSearchField::Path => Some(&mut self.path),
             FileSearchField::Term => Some(&mut self.term),
+            FileSearchField::Replace => Some(&mut self.replace),
+            FileSearchField::Path => Some(&mut self.path),
             FileSearchField::Filter => Some(&mut self.filter),
+            FileSearchField::FileType => Some(&mut self.file_type),
+            FileSearchField::TypeExclude => Some(&mut self.type_exclude),
+            FileSearchField::BeforeContext => Some(&mut self.before_context),
+            FileSearchField::AfterContext => Some(&mut self.after_context),
+            FileSearchField::MaxDepth => Some(&mut self.max_depth),
+            FileSearchField::MaxCount => Some(&mut self.max_count),
+            FileSearchField::MaxFileSize => Some(&mut self.max_filesize),
+            FileSearchField::Encoding => Some(&mut self.encoding),
             _ => None,
         }
+    }
+
+    pub fn clear_all_selections(&mut self) {
+        self.term.clear_selection();
+        self.replace.clear_selection();
+        self.path.clear_selection();
+        self.filter.clear_selection();
+        self.file_type.clear_selection();
+        self.type_exclude.clear_selection();
+        self.before_context.clear_selection();
+        self.after_context.clear_selection();
+        self.max_depth.clear_selection();
+        self.max_count.clear_selection();
+        self.max_filesize.clear_selection();
+        self.encoding.clear_selection();
     }
 
     /// Select all text in the newly focused input field.
     pub fn select_focused(&mut self) {
         if let Some(input) = self.active_input() {
             input.select_all();
+        }
+    }
+
+    pub fn toggle_focused(&mut self) {
+        match self.focused {
+            FileSearchField::Regex => self.is_regex = !self.is_regex,
+            FileSearchField::CaseInsensitive => self.case_insensitive = !self.case_insensitive,
+            FileSearchField::SmartCase => self.smart_case = !self.smart_case,
+            FileSearchField::WholeWord => self.whole_word = !self.whole_word,
+            FileSearchField::WholeLineMatch => self.whole_line_match = !self.whole_line_match,
+            FileSearchField::InvertMatch => self.invert_match = !self.invert_match,
+            FileSearchField::Multiline => self.multiline = !self.multiline,
+            FileSearchField::MultilineDotAll => self.multiline_dotall = !self.multiline_dotall,
+            FileSearchField::Crlf => self.crlf = !self.crlf,
+            FileSearchField::Hidden => self.hidden = !self.hidden,
+            FileSearchField::FollowSymlinks => self.follow_symlinks = !self.follow_symlinks,
+            FileSearchField::NoGitignore => self.no_gitignore = !self.no_gitignore,
+            FileSearchField::Binary => self.binary = !self.binary,
+            FileSearchField::SearchZip => self.search_zip = !self.search_zip,
+            FileSearchField::GlobCaseInsensitive => {
+                self.glob_case_insensitive = !self.glob_case_insensitive;
+            }
+            FileSearchField::OneFileSystem => self.one_file_system = !self.one_file_system,
+            FileSearchField::TrimWhitespace => self.trim_whitespace = !self.trim_whitespace,
+            _ => {}
         }
     }
 }
@@ -1313,6 +1569,7 @@ impl App {
             file_search: None,
             file_search_side: 1,
             file_search_dialog: None,
+            file_search_help: None,
             overwrite_ask: None,
             wakeup_sender: None,
             last_cursor_pos: None,
@@ -1321,6 +1578,7 @@ impl App {
             archive_progress: None,
             pending_remote: None,
             stashed_diff: None,
+            pre_editor_focus: None,
         }
     }
 
@@ -1766,21 +2024,28 @@ impl App {
         // File content search dialog intercepts keys
         if let Some(ref state) = self.file_search_dialog {
             let focused = state.focused;
+            let has_comp = state.has_completions();
             let on_buttons = matches!(
                 focused,
                 FileSearchField::ButtonSearch | FileSearchField::ButtonCancel
             );
             return match key.code {
+                // F1 shows contextual help for the focused field
+                KeyCode::F(1) if !on_buttons => Action::ShowHelp,
+                // When completion popup is visible, intercept nav keys
+                KeyCode::Esc if has_comp => Action::Toggle, // dismiss completions
+                KeyCode::Up if has_comp => Action::MoveUp,
+                KeyCode::Down if has_comp => Action::MoveDown,
+                KeyCode::Tab if has_comp => Action::DialogConfirm,
+                KeyCode::Enter if has_comp => Action::DialogConfirm,
+                // Normal dialog keys
                 KeyCode::Esc => Action::DialogCancel,
                 KeyCode::Enter => Action::DialogConfirm,
-                KeyCode::Tab => Action::MoveDown,
-                KeyCode::BackTab => Action::MoveUp,
-                KeyCode::Up if !focused.is_input() || on_buttons => Action::MoveUp,
-                KeyCode::Down if on_buttons => Action::None,
-                KeyCode::Down if !focused.is_input() => Action::MoveDown,
+                KeyCode::Tab | KeyCode::Down => Action::MoveDown,
+                KeyCode::BackTab | KeyCode::Up => Action::MoveUp,
                 KeyCode::Left if on_buttons => Action::SwitchPanel,
                 KeyCode::Right if on_buttons => Action::SwitchPanel,
-                KeyCode::Char(' ') if focused == FileSearchField::Regex => Action::Toggle,
+                KeyCode::Char(' ') if !focused.is_input() && !on_buttons => Action::Toggle,
                 // Text input with selection, undo/redo, cut support
                 KeyCode::Char('z')
                     if focused.is_input()
@@ -1969,7 +2234,7 @@ impl App {
             if self.focus == PanelFocus::Search && self.file_search.is_some() {
                 return match key.code {
                     KeyCode::Esc => Action::DialogCancel,
-                    KeyCode::Enter => Action::DialogConfirm,
+                    KeyCode::Enter | KeyCode::F(4) => Action::DialogConfirm,
                     KeyCode::Up => Action::MoveUp,
                     KeyCode::Down => Action::MoveDown,
                     KeyCode::PageUp => Action::PageUp,
@@ -1981,6 +2246,9 @@ impl App {
                     KeyCode::Tab => Action::SwitchPanel,
                     KeyCode::BackTab => Action::SwitchPanelReverse,
                     KeyCode::F(10) => Action::Quit,
+                    // Type to filter within results
+                    KeyCode::Char(c) => Action::DialogInput(c),
+                    KeyCode::Backspace => Action::DialogBackspace,
                     _ => Action::None,
                 };
             }
@@ -3209,7 +3477,10 @@ impl App {
         // Help dialog intercepts when active
         if self.help_state.is_some() {
             match action {
-                Action::DialogCancel => self.help_state = None,
+                Action::DialogCancel => {
+                    self.help_state = None;
+                    self.file_search_help = None;
+                }
                 Action::MoveUp => {
                     if let Some(ref mut h) = self.help_state {
                         h.scroll = h.scroll.saturating_sub(1);
@@ -3908,12 +4179,43 @@ impl App {
                     .current_dir
                     .to_string_lossy()
                     .to_string();
-                let mut dlg = FileSearchDialogState::new(
-                    path,
-                    self.persisted.file_search_term.clone(),
-                    self.persisted.file_search_filter.clone(),
-                    self.persisted.file_search_regex,
-                );
+                let p = &self.persisted;
+                let ti = crate::text_input::TextInput::new;
+                let mut dlg = FileSearchDialogState {
+                    term: ti(p.file_search_term.clone()),
+                    replace: ti(p.file_search_replace.clone()),
+                    path: ti(path),
+                    filter: ti(p.file_search_filter.clone()),
+                    file_type: ti(p.file_search_file_type.clone()),
+                    type_exclude: ti(p.file_search_type_exclude.clone()),
+                    is_regex: p.file_search_regex,
+                    case_insensitive: p.file_search_case_insensitive,
+                    smart_case: p.file_search_smart_case,
+                    whole_word: p.file_search_whole_word,
+                    whole_line_match: p.file_search_whole_line,
+                    invert_match: p.file_search_invert_match,
+                    multiline: p.file_search_multiline,
+                    multiline_dotall: p.file_search_multiline_dotall,
+                    crlf: p.file_search_crlf,
+                    hidden: p.file_search_hidden,
+                    follow_symlinks: p.file_search_follow_symlinks,
+                    no_gitignore: p.file_search_no_gitignore,
+                    binary: p.file_search_binary,
+                    search_zip: p.file_search_search_zip,
+                    glob_case_insensitive: p.file_search_glob_case_insensitive,
+                    one_file_system: p.file_search_one_file_system,
+                    trim_whitespace: p.file_search_trim,
+                    before_context: ti(p.file_search_before_context.clone()),
+                    after_context: ti(p.file_search_after_context.clone()),
+                    max_depth: ti(p.file_search_max_depth.clone()),
+                    max_count: ti(p.file_search_max_count.clone()),
+                    max_filesize: ti(p.file_search_max_filesize.clone()),
+                    encoding: ti(p.file_search_encoding.clone()),
+                    focused: FileSearchField::Term,
+                    completion_matches: Vec::new(),
+                    completion_selected: 0,
+                    show_completions: false,
+                };
                 dlg.select_focused();
                 self.file_search_dialog = Some(dlg);
             }
@@ -4580,7 +4882,65 @@ impl App {
     }
 
     fn handle_file_search_dialog(&mut self, action: Action) {
+        // Check if completion popup is active
+        let has_comp = self
+            .file_search_dialog
+            .as_ref()
+            .is_some_and(|s| s.has_completions());
+
         match action {
+            // F1: show contextual help for the focused field
+            Action::ShowHelp => {
+                if let Some(ref state) = self.file_search_dialog {
+                    let help = match state.focused {
+                        FileSearchField::FileType | FileSearchField::TypeExclude => {
+                            FileSearchHelp::FileTypes
+                        }
+                        FileSearchField::Filter => FileSearchHelp::Glob,
+                        f => FileSearchHelp::Field(f),
+                    };
+                    self.file_search_help = Some(help);
+                    self.help_state = Some(HelpState {
+                        scroll: 0,
+                        filter: String::new(),
+                    });
+                }
+            }
+
+            // When completions are visible, intercept navigation
+            Action::MoveUp if has_comp => {
+                if let Some(ref mut state) = self.file_search_dialog {
+                    if state.completion_selected > 0 {
+                        state.completion_selected -= 1;
+                    } else {
+                        state.completion_selected =
+                            state.completion_matches.len().saturating_sub(1);
+                    }
+                }
+            }
+            Action::MoveDown if has_comp => {
+                if let Some(ref mut state) = self.file_search_dialog {
+                    if state.completion_selected + 1 < state.completion_matches.len() {
+                        state.completion_selected += 1;
+                    } else {
+                        state.completion_selected = 0;
+                    }
+                }
+            }
+            Action::DialogConfirm if has_comp => {
+                if let Some(ref mut state) = self.file_search_dialog {
+                    state.accept_completion();
+                }
+            }
+            // Toggle is used as "dismiss completions" when Esc pressed with popup open
+            Action::Toggle if has_comp => {
+                if let Some(ref mut state) = self.file_search_dialog {
+                    state.show_completions = false;
+                    state.completion_matches.clear();
+                }
+            }
+
+            // Normal dialog actions
             Action::DialogCancel => {
                 self.file_search_dialog = None;
             }
@@ -4590,19 +4950,70 @@ impl App {
                         return;
                     }
                     if !state.term.text.is_empty() {
-                        // Persist search params
-                        self.persisted.file_search_term = state.term.text.clone();
-                        self.persisted.file_search_filter = state.filter.text.clone();
-                        self.persisted.file_search_regex = state.is_regex;
+                        // Persist all search params
+                        let p = &mut self.persisted;
+                        p.file_search_term = state.term.text.clone();
+                        p.file_search_replace = state.replace.text.clone();
+                        p.file_search_filter = state.filter.text.clone();
+                        p.file_search_file_type = state.file_type.text.clone();
+                        p.file_search_type_exclude = state.type_exclude.text.clone();
+                        p.file_search_regex = state.is_regex;
+                        p.file_search_case_insensitive = state.case_insensitive;
+                        p.file_search_smart_case = state.smart_case;
+                        p.file_search_whole_word = state.whole_word;
+                        p.file_search_whole_line = state.whole_line_match;
+                        p.file_search_invert_match = state.invert_match;
+                        p.file_search_multiline = state.multiline;
+                        p.file_search_multiline_dotall = state.multiline_dotall;
+                        p.file_search_crlf = state.crlf;
+                        p.file_search_hidden = state.hidden;
+                        p.file_search_follow_symlinks = state.follow_symlinks;
+                        p.file_search_no_gitignore = state.no_gitignore;
+                        p.file_search_binary = state.binary;
+                        p.file_search_search_zip = state.search_zip;
+                        p.file_search_glob_case_insensitive = state.glob_case_insensitive;
+                        p.file_search_one_file_system = state.one_file_system;
+                        p.file_search_trim = state.trim_whitespace;
+                        p.file_search_before_context = state.before_context.text.clone();
+                        p.file_search_after_context = state.after_context.text.clone();
+                        p.file_search_max_depth = state.max_depth.text.clone();
+                        p.file_search_max_count = state.max_count.text.clone();
+                        p.file_search_max_filesize = state.max_filesize.text.clone();
+                        p.file_search_encoding = state.encoding.text.clone();
 
-                        let dir = PathBuf::from(&state.path.text);
+                        let config = crate::file_search::SearchConfig {
+                            root: PathBuf::from(&state.path.text),
+                            query: state.term.text.clone(),
+                            filter: state.filter.text.clone(),
+                            file_type: state.file_type.text.clone(),
+                            type_exclude: state.type_exclude.text.clone(),
+                            is_regex: state.is_regex,
+                            case_insensitive: state.case_insensitive,
+                            smart_case: state.smart_case,
+                            whole_word: state.whole_word,
+                            whole_line: state.whole_line_match,
+                            invert_match: state.invert_match,
+                            multiline: state.multiline,
+                            multiline_dotall: state.multiline_dotall,
+                            crlf: state.crlf,
+                            hidden: state.hidden,
+                            follow_symlinks: state.follow_symlinks,
+                            no_gitignore: state.no_gitignore,
+                            binary: state.binary,
+                            glob_case_insensitive: state.glob_case_insensitive,
+                            one_file_system: state.one_file_system,
+                            trim_whitespace: state.trim_whitespace,
+                            before_context: state.before_context.text.trim().parse().unwrap_or(0),
+                            after_context: state.after_context.text.trim().parse().unwrap_or(0),
+                            max_depth: state.max_depth.text.trim().parse().ok(),
+                            max_count: state.max_count.text.trim().parse().ok(),
+                            max_filesize: crate::file_search::parse_filesize(
+                                &state.max_filesize.text,
+                            ),
+                            encoding: state.encoding.text.clone(),
+                        };
                         let search_side = 1 - self.active_panel;
-                        let mut search = SearchState::new(
-                            dir,
-                            state.term.text.clone(),
-                            state.filter.text.clone(),
-                            state.is_regex,
-                        );
+                        let mut search = SearchState::new(config);
                         search.poll(); // get initial results
                         self.file_search = Some(search);
                         self.file_search_side = search_side;
@@ -4612,27 +5023,24 @@ impl App {
             }
             Action::MoveDown => {
                 if let Some(ref mut state) = self.file_search_dialog {
-                    state.term.clear_selection();
-                    state.path.clear_selection();
-                    state.filter.clear_selection();
+                    state.clear_all_selections();
+                    state.show_completions = false;
                     state.focused = state.focused.next();
                     state.select_focused();
                 }
             }
             Action::MoveUp => {
                 if let Some(ref mut state) = self.file_search_dialog {
-                    state.term.clear_selection();
-                    state.path.clear_selection();
-                    state.filter.clear_selection();
+                    state.clear_all_selections();
+                    state.show_completions = false;
                     state.focused = state.focused.prev();
                     state.select_focused();
                 }
             }
             Action::SwitchPanel | Action::SwitchPanelReverse => {
                 if let Some(ref mut state) = self.file_search_dialog {
-                    state.term.clear_selection();
-                    state.path.clear_selection();
-                    state.filter.clear_selection();
+                    state.clear_all_selections();
+                    state.show_completions = false;
                     state.focused = match state.focused {
                         FileSearchField::ButtonSearch => FileSearchField::ButtonCancel,
                         FileSearchField::ButtonCancel => FileSearchField::ButtonSearch,
@@ -4643,9 +5051,7 @@ impl App {
             }
             Action::Toggle => {
                 if let Some(ref mut state) = self.file_search_dialog {
-                    if state.focused == FileSearchField::Regex {
-                        state.is_regex = !state.is_regex;
-                    }
+                    state.toggle_focused();
                 }
             }
             Action::MouseClick(col, row) => self.handle_dialog_click_at(col, row),
@@ -4653,6 +5059,13 @@ impl App {
                 if let Some(ref mut state) = self.file_search_dialog {
                     if let Some(input) = state.active_input() {
                         input.handle_action(&action);
+                    }
+                    // Update completions after text changes in type fields
+                    if matches!(
+                        state.focused,
+                        FileSearchField::FileType | FileSearchField::TypeExclude
+                    ) {
+                        state.update_completions();
                     }
                 }
             }
@@ -4662,14 +5075,35 @@ impl App {
     fn handle_file_search_results(&mut self, action: Action) {
         match action {
             Action::DialogCancel => {
+                // First Esc clears filter, second Esc closes search
+                if let Some(ref mut state) = self.file_search {
+                    if !state.filter.is_empty() {
+                        state.filter.clear();
+                        state.clamp_selected();
+                        return;
+                    }
+                }
                 self.file_search = None;
                 self.focus = PanelFocus::FilePanel;
+            }
+            Action::DialogInput(c) => {
+                if let Some(ref mut state) = self.file_search {
+                    state.filter.push(c);
+                    state.clamp_selected();
+                }
+            }
+            Action::DialogBackspace => {
+                if let Some(ref mut state) = self.file_search {
+                    state.filter.pop();
+                    state.clamp_selected();
+                }
             }
             Action::DialogConfirm => {
                 // Open selected match in editor and highlight search term
                 if let Some(ref state) = self.file_search {
                     let query = state.query.clone();
                     if let Some((path, line)) = state.selected_location() {
+                        self.pre_editor_focus = Some(self.focus);
                         let mut editor = EditorState::open(path);
                         let target_line = (line as usize).saturating_sub(1);
                         if !editor.scan_complete {
@@ -8337,16 +8771,42 @@ impl App {
             }
             return;
         }
-        // File search dialog: term=2, path=5, filter=8, regex=10
+        // File search dialog — y offsets match render layout
         if let Some(ref mut state) = self.file_search_dialog {
-            state.term.clear_selection();
-            state.path.clear_selection();
-            state.filter.clear_selection();
+            state.clear_all_selections();
             state.focused = match y_off {
-                0..=2 => FileSearchField::Term,
-                3..=5 => FileSearchField::Path,
-                6..=8 => FileSearchField::Filter,
-                9..=10 => FileSearchField::Regex,
+                0..=1 => FileSearchField::Term,
+                2 => FileSearchField::Replace,
+                3 => FileSearchField::Path,
+                4 => FileSearchField::Filter,
+                5 => FileSearchField::FileType,
+                6 => FileSearchField::TypeExclude,
+                7 => FileSearchField::TypeExclude, // separator
+                8 => FileSearchField::Regex,
+                9 => FileSearchField::CaseInsensitive,
+                10 => FileSearchField::SmartCase,
+                11 => FileSearchField::WholeWord,
+                12 => FileSearchField::WholeLineMatch,
+                13 => FileSearchField::InvertMatch,
+                14 => FileSearchField::Multiline,
+                15 => FileSearchField::MultilineDotAll,
+                16 => FileSearchField::Crlf,
+                17 => FileSearchField::Crlf, // separator
+                18 => FileSearchField::Hidden,
+                19 => FileSearchField::FollowSymlinks,
+                20 => FileSearchField::NoGitignore,
+                21 => FileSearchField::Binary,
+                22 => FileSearchField::SearchZip,
+                23 => FileSearchField::GlobCaseInsensitive,
+                24 => FileSearchField::OneFileSystem,
+                25 => FileSearchField::TrimWhitespace,
+                26 => FileSearchField::TrimWhitespace, // separator
+                27 => FileSearchField::BeforeContext,
+                28 => FileSearchField::AfterContext,
+                29 => FileSearchField::MaxDepth,
+                30 => FileSearchField::MaxCount,
+                31 => FileSearchField::MaxFileSize,
+                32 => FileSearchField::Encoding,
                 _ => FileSearchField::ButtonSearch,
             };
             state.select_focused();
@@ -8784,7 +9244,10 @@ impl App {
     fn close_hex_or_editor(&mut self) {
         if matches!(self.mode, AppMode::HexViewing(_)) {
             self.mode = AppMode::Normal;
-            self.focus = PanelFocus::FilePanel;
+            self.focus = self
+                .pre_editor_focus
+                .take()
+                .unwrap_or(PanelFocus::FilePanel);
             self.needs_clear = true;
         } else {
             self.restore_or_close_editor();
@@ -8811,7 +9274,10 @@ impl App {
             self.mode = AppMode::DiffViewing(Box::new(dv));
         } else {
             self.mode = AppMode::Normal;
-            self.focus = PanelFocus::FilePanel;
+            self.focus = self
+                .pre_editor_focus
+                .take()
+                .unwrap_or(PanelFocus::FilePanel);
         }
         self.needs_clear = true;
     }

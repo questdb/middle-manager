@@ -28,9 +28,59 @@ pub struct AppState {
     #[serde(default)]
     pub file_search_term: String,
     #[serde(default)]
+    pub file_search_replace: String,
+    #[serde(default)]
     pub file_search_filter: String,
     #[serde(default)]
+    pub file_search_file_type: String,
+    #[serde(default)]
+    pub file_search_type_exclude: String,
+    #[serde(default)]
     pub file_search_regex: bool,
+    #[serde(default)]
+    pub file_search_case_insensitive: bool,
+    #[serde(default)]
+    pub file_search_smart_case: bool,
+    #[serde(default)]
+    pub file_search_whole_word: bool,
+    #[serde(default)]
+    pub file_search_whole_line: bool,
+    #[serde(default)]
+    pub file_search_invert_match: bool,
+    #[serde(default)]
+    pub file_search_multiline: bool,
+    #[serde(default)]
+    pub file_search_multiline_dotall: bool,
+    #[serde(default)]
+    pub file_search_crlf: bool,
+    #[serde(default)]
+    pub file_search_hidden: bool,
+    #[serde(default)]
+    pub file_search_follow_symlinks: bool,
+    #[serde(default)]
+    pub file_search_no_gitignore: bool,
+    #[serde(default)]
+    pub file_search_binary: bool,
+    #[serde(default)]
+    pub file_search_search_zip: bool,
+    #[serde(default)]
+    pub file_search_glob_case_insensitive: bool,
+    #[serde(default)]
+    pub file_search_one_file_system: bool,
+    #[serde(default)]
+    pub file_search_trim: bool,
+    #[serde(default)]
+    pub file_search_before_context: String,
+    #[serde(default)]
+    pub file_search_after_context: String,
+    #[serde(default)]
+    pub file_search_max_depth: String,
+    #[serde(default)]
+    pub file_search_max_count: String,
+    #[serde(default)]
+    pub file_search_max_filesize: String,
+    #[serde(default)]
+    pub file_search_encoding: String,
 
     /// Last panel paths.
     #[serde(default)]
@@ -86,8 +136,33 @@ impl Default for AppState {
             search_direction_forward: false,
             search_case_sensitive: false,
             file_search_term: String::new(),
+            file_search_replace: String::new(),
             file_search_filter: String::new(),
+            file_search_file_type: String::new(),
+            file_search_type_exclude: String::new(),
             file_search_regex: false,
+            file_search_case_insensitive: false,
+            file_search_smart_case: false,
+            file_search_whole_word: false,
+            file_search_whole_line: false,
+            file_search_invert_match: false,
+            file_search_multiline: false,
+            file_search_multiline_dotall: false,
+            file_search_crlf: false,
+            file_search_hidden: false,
+            file_search_follow_symlinks: false,
+            file_search_no_gitignore: false,
+            file_search_binary: false,
+            file_search_search_zip: false,
+            file_search_glob_case_insensitive: false,
+            file_search_one_file_system: false,
+            file_search_trim: false,
+            file_search_before_context: String::new(),
+            file_search_after_context: String::new(),
+            file_search_max_depth: String::new(),
+            file_search_max_count: String::new(),
+            file_search_max_filesize: String::new(),
+            file_search_encoding: String::new(),
             left_panel_path: None,
             right_panel_path: None,
             split_pct_ci: 60,

@@ -213,10 +213,23 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         shadow::render_shadow(frame, area);
     }
 
-    // Render help dialog overlay
+    // Render help dialog overlay (or contextual rg help when F1 pressed in search dialog)
     if let Some(ref state) = app.help_state {
-        let area = help_dialog::render(frame, state.scroll, &state.filter);
+        let area = match app.file_search_help {
+            Some(crate::app::FileSearchHelp::FileTypes) => {
+                file_search_dialog::render_type_list(frame, state.scroll, &state.filter)
+            }
+            Some(crate::app::FileSearchHelp::Glob) => {
+                file_search_dialog::render_glob_help(frame, state.scroll)
+            }
+            Some(crate::app::FileSearchHelp::Field(f)) => {
+                file_search_dialog::render_field_help(frame, f)
+            }
+            None => help_dialog::render(frame, state.scroll, &state.filter),
+        };
         shadow::render_shadow(frame, area);
+        // Hide the text cursor while a help/F1 overlay is shown
+        CURSOR_POS.set(None);
     }
 }
 
