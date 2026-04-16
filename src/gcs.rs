@@ -261,7 +261,6 @@ mod tests {
             {"url": "gs://mybucket/docs/subdir/", "size": "0", "updated": "2024-01-01T00:00:00Z"}
         ]"#).unwrap();
 
-        let prefix = "docs/";
         let full_prefix = "gs://mybucket/docs/";
         let mut entries = Vec::new();
         if let Some(items) = json.as_array() {

@@ -74,6 +74,7 @@ pub enum Action {
     // Search (editor)
     SearchPrompt,
     FindNext,
+    FindPrev,
 
     // Word navigation (editor)
     WordLeft,

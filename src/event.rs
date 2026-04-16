@@ -53,23 +53,16 @@ impl EventHandler {
                 return;
             }
             if event::poll(tick_rate).unwrap_or(false) {
-                match event::read() {
-                    Ok(Event::Key(key)) => {
-                        if tx.send(AppEvent::Key(key)).is_err() {
-                            return;
-                        }
+                let app_event = match event::read() {
+                    Ok(Event::Key(key)) => Some(AppEvent::Key(key)),
+                    Ok(Event::Mouse(mouse)) => Some(AppEvent::Mouse(mouse)),
+                    Ok(Event::Resize(w, h)) => Some(AppEvent::Resize(w, h)),
+                    _ => None,
+                };
+                if let Some(ev) = app_event {
+                    if tx.send(ev).is_err() {
+                        return;
                     }
-                    Ok(Event::Mouse(mouse)) => {
-                        if tx.send(AppEvent::Mouse(mouse)).is_err() {
-                            return;
-                        }
-                    }
-                    Ok(Event::Resize(w, h)) => {
-                        if tx.send(AppEvent::Resize(w, h)).is_err() {
-                            return;
-                        }
-                    }
-                    _ => {}
                 }
             } else if tx.send(AppEvent::Tick).is_err() {
                 return;

@@ -299,7 +299,8 @@ impl FuzzySearchState {
                     self.results.push((i, score));
                 }
             }
-            self.results.sort_unstable_by(|a, b| b.1.cmp(&a.1));
+            self.results
+                .sort_unstable_by_key(|b| std::cmp::Reverse(b.1));
             self.results.truncate(100);
         }
         self.selected = 0;
@@ -1633,11 +1634,9 @@ impl App {
                             self.bottom_split_pct[side] = self.persisted.split_pct_ci;
                         }
                     }
-                    "diff" => {
-                        if self.panels[side].git_info.is_some() {
-                            self.diff_panels[side] = Some(PrDiffPanel::for_branch(&dir));
-                            self.bottom_split_pct[side] = self.persisted.split_pct_ci;
-                        }
+                    "diff" if self.panels[side].git_info.is_some() => {
+                        self.diff_panels[side] = Some(PrDiffPanel::for_branch(&dir));
+                        self.bottom_split_pct[side] = self.persisted.split_pct_ci;
                     }
                     "shell" => {
                         if let Ok(tp) = TerminalPanel::spawn_shell(
@@ -3156,7 +3155,11 @@ impl App {
     }
 
     fn map_parquet_key(&self, key: KeyEvent) -> Action {
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
+            // Opt+a/e on Mac → top/bottom of file (reliable across all terminals)
+            KeyCode::Char('a') if alt => Action::MoveToTop,
+            KeyCode::Char('e') if alt => Action::MoveToBottom,
             KeyCode::Up => Action::MoveUp,
             KeyCode::Down => Action::MoveDown,
             KeyCode::Left => Action::CursorLeft,
@@ -3183,6 +3186,8 @@ impl App {
                 KeyCode::Char('c') => Action::CopySelection,
                 KeyCode::Char('a') => Action::SelectAll,
                 KeyCode::Char('f') => Action::SearchPrompt,
+                KeyCode::Char('n') => Action::FindNext,
+                KeyCode::Char('p') => Action::FindPrev,
                 KeyCode::Char('z') if shift => Action::EditorRedo,
                 KeyCode::Char('z') => Action::EditorUndo,
                 KeyCode::Char('g') => Action::GotoLinePrompt,
@@ -3206,6 +3211,9 @@ impl App {
             // Opt+Left/Right on Mac → sends Alt+b/Alt+f (readline-style)
             KeyCode::Char('b') if alt => Action::WordLeft,
             KeyCode::Char('f') if alt => Action::WordRight,
+            // Opt+a/e on Mac → top/bottom of file (reliable across all terminals)
+            KeyCode::Char('a') if alt => Action::MoveToTop,
+            KeyCode::Char('e') if alt => Action::MoveToBottom,
             KeyCode::Up if shift => Action::SelectUp,
             KeyCode::Down if shift => Action::SelectDown,
             KeyCode::Left if shift => Action::SelectLeft,
@@ -3284,12 +3292,16 @@ impl App {
         }
 
         // Poll CI panels for async results, downloads, and failure extraction
-        for ci in self.ci_panels.iter_mut().flatten() {
+        for (side, ci) in self.ci_panels.iter_mut().enumerate() {
+            let Some(ci) = ci else { continue };
             ci.poll();
             if let Some(result) = ci.poll_download() {
                 match result {
                     Ok(path) => {
+                        // Only stash CI focus if the user is currently on a CI panel;
+                        // otherwise preserve wherever they are.
                         if matches!(self.focus, PanelFocus::Ci(_)) {
+                            self.pre_editor_focus = Some(PanelFocus::Ci(side));
                             self.focus = PanelFocus::FilePanel;
                         }
                         self.mode =
@@ -4176,9 +4188,9 @@ impl App {
             | Action::WordLeft
             | Action::WordRight
             | Action::EditorUndo
-            | Action::EditorRedo
-            | Action::SearchPrompt
-            | Action::FindNext => {}
+            | Action::EditorRedo => {}
+
+            Action::SearchPrompt | Action::FindNext | Action::FindPrev => {}
 
             // Panel multi-file selection
             Action::ToggleSelect => self.active_panel_mut().toggle_select_current(),
@@ -6000,14 +6012,19 @@ impl App {
                     focused: SearchDialogField::Query,
                 });
             }
-            Action::FindNext => {
+            Action::FindNext | Action::FindPrev => {
                 let params = if let AppMode::Editing(ref e) = self.mode {
                     e.last_search.clone()
                 } else {
                     None
                 };
-                if let Some(params) = params {
-                    self.do_find(params);
+                if let Some(mut params) = params {
+                    params.direction = if action == Action::FindNext {
+                        SearchDirection::Forward
+                    } else {
+                        SearchDirection::Backward
+                    };
+                    self.do_find(params, false);
                 } else if let AppMode::Editing(ref mut e) = self.mode {
                     e.status_msg = Some("No previous search".to_string());
                 }
@@ -6405,13 +6422,17 @@ impl App {
             matches!(params.direction, SearchDirection::Forward);
         self.persisted.search_case_sensitive = params.case_sensitive;
 
-        self.do_find(params);
+        self.do_find(params, true);
     }
 
     /// Run a non-wrapping search. If not found, show the wrap confirmation dialog.
-    fn do_find(&mut self, params: crate::editor::SearchParams) {
+    /// When `save` is true, updates `last_search` (used by the dialog). FindNext/FindPrev
+    /// pass false so they don't overwrite the dialog's direction setting.
+    fn do_find(&mut self, params: crate::editor::SearchParams, save: bool) {
         if let AppMode::Editing(ref mut e) = self.mode {
-            e.last_search = Some(params.clone());
+            if save {
+                e.last_search = Some(params.clone());
+            }
             if !e.find(&params) {
                 // Not found in current direction — offer to wrap
                 self.search_wrap_dialog = Some(SearchWrapDialog {
@@ -6807,13 +6828,11 @@ impl App {
                     }
                 }
             }
-            Action::MouseShiftClick(col, row) => {
-                if self.click_in_claude(col, row) {
-                    let coords = self.claude_screen_coords(side, col, row);
-                    if let Some(ref mut tp) = self.claude_panels[side] {
-                        if let Some((sr, sc)) = coords {
-                            tp.drag_select(sr, sc);
-                        }
+            Action::MouseShiftClick(col, row) if self.click_in_claude(col, row) => {
+                let coords = self.claude_screen_coords(side, col, row);
+                if let Some(ref mut tp) = self.claude_panels[side] {
+                    if let Some((sr, sc)) = coords {
+                        tp.drag_select(sr, sc);
                     }
                 }
             }
@@ -7064,13 +7083,11 @@ impl App {
                     }
                 }
             }
-            Action::MouseShiftClick(col, row) => {
-                if self.click_in_shell(col, row) {
-                    let coords = self.shell_screen_coords(side, col, row);
-                    if let Some(ref mut sp) = self.shell_panels[side] {
-                        if let Some((sr, sc)) = coords {
-                            sp.drag_select(sr, sc);
-                        }
+            Action::MouseShiftClick(col, row) if self.click_in_shell(col, row) => {
+                let coords = self.shell_screen_coords(side, col, row);
+                if let Some(ref mut sp) = self.shell_panels[side] {
+                    if let Some((sr, sc)) = coords {
+                        sp.drag_select(sr, sc);
                     }
                 }
             }
@@ -9487,6 +9504,7 @@ impl App {
 #[cfg(test)]
 mod fuzzy_tests {
     use super::*;
+    use std::path::Path;
 
     fn score(query: &str, candidate: &str) -> Option<i64> {
         let query_chars: Vec<char> = query.to_lowercase().chars().collect();
@@ -9817,8 +9835,8 @@ mod fuzzy_tests {
         let home = std::env::var("HOME").unwrap();
         // "~" expands to home dir, no trailing slash, so it's treated as a partial name
         // parent of /Users/foo is /Users, prefix is "foo"
-        assert!(dir.to_string_lossy().len() > 0);
-        assert!(!prefix.is_empty() || dir == PathBuf::from(&home));
+        assert!(!dir.to_string_lossy().is_empty());
+        assert!(!prefix.is_empty() || dir == Path::new(&home));
     }
 
     #[test]
