@@ -1962,8 +1962,8 @@ impl App {
     pub fn reload_panels(&mut self) {
         self.panels[0].reload();
         self.panels[1].reload();
-        self.git_cache.invalidate(&self.panels[0].current_dir);
-        self.git_cache.invalidate(&self.panels[1].current_dir);
+        self.git_cache.refresh_async(&self.panels[0].current_dir);
+        self.git_cache.refresh_async(&self.panels[1].current_dir);
         self.panels[0].refresh_git(&mut self.git_cache);
         self.panels[1].refresh_git(&mut self.git_cache);
         self.update_watched_dirs();
