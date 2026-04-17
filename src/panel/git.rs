@@ -286,12 +286,28 @@ impl GitCache {
         updated
     }
 
-    /// Force refresh for a specific directory's repo.
-    pub fn invalidate(&mut self, dir: &Path) {
+    /// Spawn a background git-status query for this directory's repo while
+    /// leaving any existing cache entry in place. Used when a panel reload is
+    /// triggered by a filesystem event: the current `GitInfo` stays visible
+    /// until the fresh query lands (via `poll_pending`), instead of blinking
+    /// to `None` and back. If a query for this repo is already in flight, it
+    /// is left alone.
+    pub fn refresh_async(&mut self, dir: &Path) {
         let dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-        if let Some(root) = get_repo_root_cached(&dir) {
-            self.cache.remove(&root);
+        let Some(repo_root) = get_repo_root_cached(&dir) else {
+            return;
+        };
+        if self.git_receivers.contains_key(&repo_root) {
+            return;
         }
+        let dir_clone = dir.clone();
+        let root_clone = repo_root.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = query_repo(&dir_clone, &root_clone);
+            let _ = tx.send(result);
+        });
+        self.git_receivers.insert(repo_root, rx);
     }
 }
 

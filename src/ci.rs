@@ -1563,6 +1563,27 @@ fn query_azure_steps(azure: &AzureInfo) -> Result<Vec<CiStep>, String> {
             http_status
         ));
     }
+
+    // Azure returns 404 with a BuildNotFoundException when the build has been
+    // deleted by retention policy or a user. Surface the server's message
+    // (e.g. "The requested build N has been deleted.") instead of failing in
+    // the Timeline JSON parser below.
+    if http_status == 404 {
+        let msg = serde_json::from_str::<serde_json::Value>(body)
+            .ok()
+            .and_then(|v| {
+                v.get("message")
+                    .and_then(|m| m.as_str())
+                    .map(|s| s.to_string())
+            });
+        return Err(msg.unwrap_or_else(|| {
+            format!(
+                "Azure build {} not found (it may have been deleted).",
+                azure.build_id
+            )
+        }));
+    }
+
     let text = body;
 
     #[derive(Deserialize)]

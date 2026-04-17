@@ -110,9 +110,20 @@ pub fn query_pr_info(dir: &Path, branch: &str) -> Option<PrInfo> {
 }
 
 /// Open a URL in the default browser.
+///
+/// The spawned process inherits our controlling TTY by default, so any chatter
+/// the browser writes to stdout/stderr ("Opening in existing browser session.",
+/// Gtk/Wayland warnings, etc.) corrupts the TUI. Redirect all three std
+/// streams to /dev/null to keep the terminal clean.
 pub fn open_url(url: &str) {
     #[cfg(target_os = "macos")]
-    let _ = Command::new("open").arg(url).spawn();
+    let cmd = "open";
     #[cfg(target_os = "linux")]
-    let _ = Command::new("xdg-open").arg(url).spawn();
+    let cmd = "xdg-open";
+    let _ = Command::new(cmd)
+        .arg(url)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
 }
