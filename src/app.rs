@@ -3428,14 +3428,45 @@ impl App {
 
     fn map_parquet_key(&self, key: KeyEvent) -> Action {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        // If the parquet search input is open, characters feed the query;
+        // Enter accepts it; Esc cancels.
+        if let AppMode::ParquetViewing(ref p) = self.mode {
+            if p.search_is_input_open() {
+                return match key.code {
+                    KeyCode::Char(c) => Action::ParquetSearchChar(c),
+                    KeyCode::Backspace => Action::ParquetSearchBackspace,
+                    KeyCode::Enter => Action::ParquetSearchAccept,
+                    KeyCode::Esc => Action::ParquetSearchCancel,
+                    _ => Action::None,
+                };
+            }
+        }
+
+        // Ctrl-modified keys take precedence over any plain-letter bindings.
+        if ctrl {
+            return match key.code {
+                KeyCode::Char('a') => Action::ParquetSelectAll,
+                KeyCode::Char('i') => Action::ParquetInvertSelection,
+                KeyCode::Char('u') => Action::ParquetHalfPageUp,
+                KeyCode::Char('d') => Action::ParquetHalfPageDown,
+                _ => Action::None,
+            };
+        }
+
         match key.code {
             // Opt+a/e on Mac → top/bottom of file (reliable across all terminals)
             KeyCode::Char('a') if alt => Action::MoveToTop,
             KeyCode::Char('e') if alt => Action::MoveToBottom,
             KeyCode::Up => Action::MoveUp,
             KeyCode::Down => Action::MoveDown,
+            KeyCode::Left if shift => Action::ParquetPageLeft,
+            KeyCode::Right if shift => Action::ParquetPageRight,
             KeyCode::Left => Action::CursorLeft,
             KeyCode::Right => Action::CursorRight,
+            KeyCode::Enter if shift => Action::ParquetRowDetail,
             KeyCode::Enter => Action::Enter,
             KeyCode::PageUp => Action::PageUp,
             KeyCode::PageDown => Action::PageDown,
@@ -3443,6 +3474,36 @@ impl App {
             KeyCode::End => Action::MoveToBottom,
             KeyCode::Tab => Action::Toggle,
             KeyCode::Char('g') => Action::GotoLinePrompt,
+            KeyCode::Char('/') => Action::ParquetSearchOpen,
+            KeyCode::Char('n') if shift => Action::ParquetSearchPrev,
+            KeyCode::Char('N') => Action::ParquetSearchPrev,
+            KeyCode::Char('n') => Action::ParquetSearchNext,
+            KeyCode::Char('Y') => Action::ParquetCopyRow,
+            KeyCode::Char('y') => Action::ParquetCopyCell,
+            KeyCode::Char('E') => Action::ParquetExportCsvAll,
+            KeyCode::Char('e') => Action::ParquetExportCsv,
+            KeyCode::Char(']') => Action::ParquetNextRowGroup,
+            KeyCode::Char('[') => Action::ParquetPrevRowGroup,
+            KeyCode::Char(' ') => Action::ParquetToggleSelect,
+            KeyCode::Char('a') => Action::ParquetClearSelect,
+            KeyCode::Char('c') => Action::ParquetCopyColumn,
+            KeyCode::Char('w') => Action::ParquetColWiden,
+            KeyCode::Char('W') => Action::ParquetColNarrow,
+            KeyCode::Char('=') => Action::ParquetColReset,
+            KeyCode::Char('f') => Action::ParquetColFreezeToggle,
+            KeyCode::Char('j') => Action::ParquetCopyRowJson,
+            KeyCode::Char('J') => Action::ParquetExportNdjson,
+            KeyCode::Char('h') => Action::ParquetColHide,
+            KeyCode::Char('H') => Action::ParquetColUnhideAll,
+            KeyCode::Char('^') => Action::ParquetColFirst,
+            KeyCode::Char('$') => Action::ParquetColLast,
+            KeyCode::Char('~') => Action::ParquetColAutofit,
+            KeyCode::Char('i') => Action::ParquetColInfo,
+            KeyCode::Char('R') => Action::ParquetReload,
+            KeyCode::Char(',') => Action::ParquetToggleThousands,
+            KeyCode::Char('*') => Action::ParquetSearchCurrentForward,
+            KeyCode::Char('#') => Action::ParquetSearchCurrentBackward,
+            KeyCode::Char('s') => Action::ParquetCycleSort,
             KeyCode::Char('q') | KeyCode::Esc => Action::DialogCancel,
             _ => Action::None,
         }
@@ -4535,6 +4596,229 @@ impl App {
                     p.scroll_right();
                 }
             }
+            Action::ParquetPageLeft => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.page_left();
+                }
+            }
+            Action::ParquetPageRight => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.page_right();
+                }
+            }
+            Action::ParquetSearchOpen => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_open();
+                }
+            }
+            Action::ParquetSearchChar(c) => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_input_char(c);
+                }
+            }
+            Action::ParquetSearchBackspace => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_input_backspace();
+                }
+            }
+            Action::ParquetSearchAccept => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_input_accept();
+                }
+            }
+            Action::ParquetSearchCancel => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_input_cancel();
+                }
+            }
+            Action::ParquetSearchNext => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_next();
+                }
+            }
+            Action::ParquetSearchPrev => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_prev();
+                }
+            }
+            Action::ParquetCopyCell => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    if let Some(s) = p.clipboard_selection() {
+                        crate::clipboard::copy(&s);
+                        p.set_status("Copied");
+                    }
+                }
+            }
+            Action::ParquetCopyRow => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    if let Some(s) = p.clipboard_row_tsv() {
+                        crate::clipboard::copy(&s);
+                        p.set_status("Copied row");
+                    }
+                }
+            }
+            Action::ParquetRowDetail => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.activate_row_detail();
+                }
+            }
+            Action::ParquetExportCsv => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    match p.export_current_row_group_csv() {
+                        Ok(path) => p.set_status(format!("Exported → {}", path.display())),
+                        Err(e) => p.set_status(format!("Export failed: {}", e)),
+                    }
+                }
+            }
+            Action::ParquetExportCsvAll => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    match p.export_full_file_csv() {
+                        Ok(path) => p.set_status(format!("Exported all → {}", path.display())),
+                        Err(e) => p.set_status(format!("Export failed: {}", e)),
+                    }
+                }
+            }
+            Action::ParquetNextRowGroup => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.next_row_group();
+                }
+            }
+            Action::ParquetPrevRowGroup => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.prev_row_group();
+                }
+            }
+            Action::ParquetToggleSelect => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.toggle_row_selection();
+                }
+            }
+            Action::ParquetClearSelect => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.clear_row_selection();
+                }
+            }
+            Action::ParquetCopyColumn => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    if let Some((s, n)) = p.clipboard_column_values() {
+                        crate::clipboard::copy(&s);
+                        p.set_status(format!("Copied {} values", n));
+                    }
+                }
+            }
+            Action::ParquetColWiden => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.widen_current_column();
+                }
+            }
+            Action::ParquetColNarrow => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.narrow_current_column();
+                }
+            }
+            Action::ParquetColReset => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.reset_column_widths();
+                }
+            }
+            Action::ParquetColFreezeToggle => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.toggle_column_freeze();
+                }
+            }
+            Action::ParquetCopyRowJson => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    if let Some(s) = p.clipboard_row_json() {
+                        crate::clipboard::copy(&s);
+                        p.set_status("Copied row JSON");
+                    }
+                }
+            }
+            Action::ParquetExportNdjson => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    match p.export_full_file_ndjson() {
+                        Ok(path) => p.set_status(format!("Exported NDJSON → {}", path.display())),
+                        Err(e) => p.set_status(format!("Export failed: {}", e)),
+                    }
+                }
+            }
+            Action::ParquetColHide => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.hide_current_column();
+                }
+            }
+            Action::ParquetColUnhideAll => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.unhide_all_columns();
+                }
+            }
+            Action::ParquetColFirst => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.jump_to_first_column();
+                }
+            }
+            Action::ParquetColLast => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.jump_to_last_column();
+                }
+            }
+            Action::ParquetColAutofit => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.autofit_current_column();
+                }
+            }
+            Action::ParquetColInfo => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.open_column_info();
+                }
+            }
+            Action::ParquetReload => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    if let Err(e) = p.reload() {
+                        p.set_status(format!("Reload failed: {}", e));
+                    }
+                }
+            }
+            Action::ParquetToggleThousands => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.toggle_thousands_separators();
+                }
+            }
+            Action::ParquetSelectAll => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.select_all_rows();
+                }
+            }
+            Action::ParquetInvertSelection => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.invert_row_selection();
+                }
+            }
+            Action::ParquetSearchCurrentForward => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_current_cell(false);
+                }
+            }
+            Action::ParquetSearchCurrentBackward => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_current_cell(true);
+                }
+            }
+            Action::ParquetHalfPageUp => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.half_page_up();
+                }
+            }
+            Action::ParquetHalfPageDown => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.half_page_down();
+                }
+            }
+            Action::ParquetCycleSort => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.cycle_sort();
+                }
+            }
             Action::CursorLineStart
             | Action::CursorLineEnd
             | Action::EditorSave
@@ -4898,9 +5182,9 @@ impl App {
     }
 
     fn handle_enter(&mut self) {
-        // Parquet: Enter toggles expand/collapse
+        // Parquet: Enter activates (expand tree node / open row detail / close popup)
         if let AppMode::ParquetViewing(ref mut p) = self.mode {
-            p.toggle_expand();
+            p.activate();
             return;
         }
 
@@ -9605,7 +9889,8 @@ impl App {
             e.click_at(col, row);
             return;
         }
-        if matches!(self.mode, AppMode::ParquetViewing(_)) {
+        if let AppMode::ParquetViewing(ref mut p) = self.mode {
+            p.click_at(col, row);
             return;
         }
         // Diff viewer: click positions cursor on left or right side
@@ -10017,6 +10302,12 @@ impl App {
     }
 
     fn handle_dialog_cancel(&mut self) {
+        // Let the parquet viewer swallow Esc when a row-detail popup is open.
+        if let AppMode::ParquetViewing(ref mut p) = self.mode {
+            if p.close_popup_if_open() {
+                return;
+            }
+        }
         match &self.mode {
             AppMode::ParquetViewing(_) | AppMode::DiffViewing(_) => {
                 self.mode = AppMode::Normal;
