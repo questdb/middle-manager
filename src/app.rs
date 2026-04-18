@@ -62,7 +62,9 @@ pub struct App {
     pub shell_panel_areas: [Option<Rect>; 2],
     last_click: Option<(Instant, u16, u16, u8)>,
     /// Go-to-line prompt state. When Some, an input overlay is shown.
-    pub goto_line_input: Option<String>,
+    /// Backed by `TextInput` so cursor movement, selection, undo/redo and
+    /// clipboard paste all behave like every other dialog in the app.
+    pub goto_line_input: Option<TextInput>,
     /// Set to true when the UI needs a full terminal clear (e.g. leaving full-screen mode).
     pub needs_clear: bool,
     /// Search dialog overlay (shown on top of editor).
@@ -2203,13 +2205,26 @@ impl App {
             };
         }
 
-        // Goto-line prompt intercepts keys
+        // Goto-line prompt intercepts keys. Accepts hex digits (plus `x`/`X`
+        // for the `0x` prefix) when called from the hex viewer; decimal
+        // digits and `:` for the line[:col] form otherwise.
         if self.goto_line_input.is_some() {
+            let is_hex = matches!(self.mode, AppMode::HexViewing(_));
             return match key.code {
                 KeyCode::Esc => Action::DialogCancel,
                 KeyCode::Enter => Action::DialogConfirm,
                 KeyCode::Backspace => Action::DialogBackspace,
-                KeyCode::Char(c) if c.is_ascii_digit() || c == ':' => Action::DialogInput(c),
+                KeyCode::Delete => Action::EditorDeleteForward,
+                KeyCode::Left => Action::CursorLeft,
+                KeyCode::Right => Action::CursorRight,
+                KeyCode::Home => Action::CursorLineStart,
+                KeyCode::End => Action::CursorLineEnd,
+                KeyCode::Char(c)
+                    if (is_hex && (c.is_ascii_hexdigit() || c == 'x' || c == 'X'))
+                        || (!is_hex && (c.is_ascii_digit() || c == ':')) =>
+                {
+                    Action::DialogInput(c)
+                }
                 _ => Action::None,
             };
         }
@@ -4516,7 +4531,7 @@ impl App {
                 }
                 Action::GotoLinePrompt => {
                     if matches!(self.mode, AppMode::DiffViewing(_)) {
-                        self.goto_line_input = Some(String::new());
+                        self.goto_line_input = Some(TextInput::new(String::new()));
                     }
                     return;
                 }
@@ -4584,7 +4599,7 @@ impl App {
             Action::GotoLinePrompt => {
                 // Only works in hex/editor/parquet modes
                 if matches!(self.mode, AppMode::ParquetViewing(_) | AppMode::Editing(_)) {
-                    self.goto_line_input = Some(String::new());
+                    self.goto_line_input = Some(TextInput::new(String::new()));
                 }
             }
             Action::EditBuiltin => self.handle_edit_builtin(),
@@ -5365,12 +5380,12 @@ impl App {
                 if let Some(input) = self.goto_line_input.take() {
                     if is_hex {
                         if let AppMode::HexViewing(ref mut h) = self.mode {
-                            if let Err(e) = h.goto_offset(&input) {
+                            if let Err(e) = h.goto_offset(&input.text) {
                                 h.status_msg = Some(e);
                             }
                         }
                     } else {
-                        self.goto_line_col(&input);
+                        self.goto_line_col(&input.text);
                     }
                 }
             }
@@ -5382,13 +5397,38 @@ impl App {
                 };
                 if valid {
                     if let Some(ref mut input) = self.goto_line_input {
-                        input.push(c);
+                        input.insert_char(c);
                     }
                 }
             }
             Action::DialogBackspace => {
                 if let Some(ref mut input) = self.goto_line_input {
-                    input.pop();
+                    input.backspace();
+                }
+            }
+            Action::EditorDeleteForward => {
+                if let Some(ref mut input) = self.goto_line_input {
+                    input.delete_forward();
+                }
+            }
+            Action::CursorLeft => {
+                if let Some(ref mut input) = self.goto_line_input {
+                    input.move_left();
+                }
+            }
+            Action::CursorRight => {
+                if let Some(ref mut input) = self.goto_line_input {
+                    input.move_right();
+                }
+            }
+            Action::CursorLineStart => {
+                if let Some(ref mut input) = self.goto_line_input {
+                    input.move_home();
+                }
+            }
+            Action::CursorLineEnd => {
+                if let Some(ref mut input) = self.goto_line_input {
+                    input.move_end();
                 }
             }
             _ => {}
@@ -6251,7 +6291,7 @@ impl App {
                 }
             }
             Action::GotoLinePrompt => {
-                self.goto_line_input = Some(String::new());
+                self.goto_line_input = Some(TextInput::new(String::new()));
             }
             Action::SearchPrompt => {
                 // Open search dialog with last hex search pre-filled
@@ -6436,7 +6476,7 @@ impl App {
                 }
             }
             Action::GotoLinePrompt => {
-                self.goto_line_input = Some(String::new());
+                self.goto_line_input = Some(TextInput::new(String::new()));
             }
             Action::DialogCancel => {
                 let modified = matches!(self.mode, AppMode::Editing(ref e) if e.modified);

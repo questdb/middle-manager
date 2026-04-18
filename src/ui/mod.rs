@@ -200,7 +200,8 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         } else {
             " Go to Line[:Col] "
         };
-        render_goto_prompt(frame, input, title);
+        let area = render_goto_prompt(frame, input, title);
+        shadow::render_shadow(frame, area);
     }
 
     // Render quit confirmation overlay
@@ -793,43 +794,44 @@ fn render_quit_dialog(frame: &mut Frame, quit_focused: bool) -> Rect {
     layout.outer
 }
 
-fn render_goto_prompt(frame: &mut Frame, input: &str, title: &str) {
+fn render_goto_prompt(
+    frame: &mut Frame,
+    input: &crate::text_input::TextInput,
+    title: &str,
+) -> Rect {
+    // A minimal, focused input dialog: single row with a "> " prompt and the
+    // `TextInput`, framed by the shared `dh::render_dialog_frame` so it
+    // inherits margins/border/centering from every other dialog.
+    let layout = dialog_helpers::render_dialog_frame(frame, title, 36, 3);
+    let (_, highlight, _) = dialog_helpers::dialog_styles();
     let t = theme();
-    let width: u16 = 36;
-    let height: u16 = 3;
-    let area = frame.area();
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    let rect = Rect::new(x, y, width.min(area.width), height.min(area.height));
 
-    frame.render_widget(Clear, rect);
+    let prompt_style = Style::default().fg(t.dialog_prompt_fg).bg(t.dialog_bg);
+    dialog_helpers::render_line(
+        frame,
+        layout.content,
+        1,
+        Line::from(Span::styled("> ", prompt_style)),
+    );
 
-    let block = Block::default()
-        .title(Span::styled(title, t.dialog_title_style()))
-        .borders(Borders::ALL)
-        .border_style(t.dialog_border_style())
-        .style(t.dialog_bg_style());
+    // Reserve 2 cols for the "> " prompt then hand the rest to the TextInput.
+    let input_area = Rect::new(
+        layout.content.x + 2,
+        layout.content.y,
+        layout.content.width.saturating_sub(2),
+        layout.content.height,
+    );
+    dialog_helpers::render_text_input(
+        frame,
+        input_area,
+        1,
+        input,
+        true,
+        highlight,
+        input_area.width as usize,
+    );
 
-    let inner = block.inner(rect);
-    frame.render_widget(block, rect);
-
-    let prompt = Line::from(vec![
-        Span::styled(
-            "> ",
-            Style::default().fg(t.dialog_prompt_fg).bg(t.dialog_bg),
-        ),
-        Span::styled(
-            input,
-            Style::default()
-                .fg(t.dialog_input_fg)
-                .bg(t.dialog_bg)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled("_", Style::default().fg(t.dialog_cursor_fg).bg(t.dialog_bg)),
-    ]);
-    frame.render_widget(Paragraph::new(prompt), inner);
-
-    shadow::render_shadow(frame, rect);
+    layout.outer
 }
 
 #[cfg(test)]
