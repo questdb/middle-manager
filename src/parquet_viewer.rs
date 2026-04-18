@@ -549,15 +549,13 @@ impl ParquetViewerState {
                     } else {
                         self.expanded.insert(node_id);
                         match node_id {
-                            NodeId::RowGroupData(rg) => {
-                                if self.data_previews[rg].is_none() {
-                                    self.load_data_preview(rg);
-                                }
+                            NodeId::RowGroupData(rg) if self.data_previews[rg].is_none() => {
+                                self.load_data_preview(rg);
                             }
-                            NodeId::ColumnDict(rg, col) => {
-                                if !self.column_dicts.contains_key(&(rg, col)) {
-                                    self.load_column_dict(rg, col);
-                                }
+                            NodeId::ColumnDict(rg, col)
+                                if !self.column_dicts.contains_key(&(rg, col)) =>
+                            {
+                                self.load_column_dict(rg, col);
                             }
                             _ => {}
                         }
@@ -577,15 +575,13 @@ impl ParquetViewerState {
                 if item.expandable && !self.expanded.contains(&node_id) {
                     self.expanded.insert(node_id);
                     match node_id {
-                        NodeId::RowGroupData(rg) => {
-                            if self.data_previews[rg].is_none() {
-                                self.load_data_preview(rg);
-                            }
+                        NodeId::RowGroupData(rg) if self.data_previews[rg].is_none() => {
+                            self.load_data_preview(rg);
                         }
-                        NodeId::ColumnDict(rg, col) => {
-                            if !self.column_dicts.contains_key(&(rg, col)) {
-                                self.load_column_dict(rg, col);
-                            }
+                        NodeId::ColumnDict(rg, col)
+                            if !self.column_dicts.contains_key(&(rg, col)) =>
+                        {
+                            self.load_column_dict(rg, col);
                         }
                         _ => {}
                     }
@@ -1248,7 +1244,7 @@ impl ParquetViewerState {
             ViewMode::Table => {
                 let col = self
                     .table_cursor_col
-                    .min(self.table_columns.len().saturating_sub(1).max(0));
+                    .min(self.table_columns.len().saturating_sub(1));
                 self.table_row(self.table_cursor_row)
                     .and_then(|r| r.get(col).cloned())
             }
