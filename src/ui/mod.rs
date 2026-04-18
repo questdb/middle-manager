@@ -193,14 +193,9 @@ pub fn render(frame: &mut Frame, app: &mut App) {
         _ => render_normal(frame, app),
     }
 
-    // Render goto-line prompt overlay if active
-    if let Some(ref input) = app.goto_line_input {
-        let title = if matches!(app.mode, AppMode::HexViewing(_)) {
-            " Go to Offset (hex) "
-        } else {
-            " Go to Line[:Col] "
-        };
-        let area = render_goto_prompt(frame, input, title);
+    // Render goto-line dialog overlay if active
+    if let Some(ref dlg) = app.goto_line_dialog {
+        let area = render_goto_line_dialog(frame, dlg);
         shadow::render_shadow(frame, area);
     }
 
@@ -794,41 +789,75 @@ fn render_quit_dialog(frame: &mut Frame, quit_focused: bool) -> Rect {
     layout.outer
 }
 
-fn render_goto_prompt(
-    frame: &mut Frame,
-    input: &crate::text_input::TextInput,
-    title: &str,
-) -> Rect {
-    // A minimal, focused input dialog: single row with a "> " prompt and the
-    // `TextInput`, framed by the shared `dh::render_dialog_frame` so it
-    // inherits margins/border/centering from every other dialog.
-    let layout = dialog_helpers::render_dialog_frame(frame, title, 36, 3);
-    let (_, highlight, _) = dialog_helpers::dialog_styles();
+fn render_goto_line_dialog(frame: &mut Frame, dlg: &crate::app::GotoLineDialogState) -> Rect {
+    use crate::app::GotoLineDialogField;
+
+    let (title, label) = if dlg.is_hex {
+        (" Go to Offset ", "Offset (hex):")
+    } else {
+        (" Go to Line ", "Line[:Col]:")
+    };
+
+    // Layout (inner rows):
+    //   y=1  label
+    //   y=2  input field
+    //   y=3  separator
+    //   y=4  buttons
+    // + 2 rows of border → dialog_height = 7
+    let layout = dialog_helpers::render_dialog_frame(frame, title, 44, 7);
+    let (normal, highlight, input_normal) = dialog_helpers::dialog_styles();
     let t = theme();
 
-    let prompt_style = Style::default().fg(t.dialog_prompt_fg).bg(t.dialog_bg);
+    // y=1: label
     dialog_helpers::render_line(
         frame,
         layout.content,
         1,
-        Line::from(Span::styled("> ", prompt_style)),
+        Line::from(Span::styled(
+            format!("{:<width$}", label, width = layout.cw),
+            normal,
+        )),
     );
 
-    // Reserve 2 cols for the "> " prompt then hand the rest to the TextInput.
-    let input_area = Rect::new(
-        layout.content.x + 2,
-        layout.content.y,
-        layout.content.width.saturating_sub(2),
-        layout.content.height,
-    );
+    // y=2: input
+    let input_focused = dlg.focused == GotoLineDialogField::Input;
+    let input_style = if input_focused {
+        highlight
+    } else {
+        input_normal
+    };
     dialog_helpers::render_text_input(
         frame,
-        input_area,
-        1,
-        input,
-        true,
+        layout.content,
+        2,
+        &dlg.input,
+        input_focused,
+        input_style,
+        layout.cw,
+    );
+
+    // y=3: separator above the button row
+    dialog_helpers::render_separator(
+        frame,
+        layout.area,
+        layout.inner.y + 3,
+        t.dialog_border_style(),
+    );
+
+    // y=4: buttons
+    dialog_helpers::render_buttons(
+        frame,
+        layout.content,
+        4,
+        &[
+            ("{ Go }", dlg.focused == GotoLineDialogField::ButtonOk),
+            (
+                "[ Cancel ]",
+                dlg.focused == GotoLineDialogField::ButtonCancel,
+            ),
+        ],
+        normal,
         highlight,
-        input_area.width as usize,
     );
 
     layout.outer
