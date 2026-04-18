@@ -135,14 +135,43 @@ impl DetailPopup {
     }
 }
 
-/// Search state for the Table view. The `query` is a regex pattern (with a
-/// fallback to literal substring if the pattern doesn't compile); searching
-/// is case-insensitive by default via the `(?i)` inline flag.
+/// Search state for the Table view. The `input` is a full `TextInput` so
+/// cursor movement, selection, undo/redo and clipboard paste all work in the
+/// search prompt — consistent with every other dialog in the app.
+/// The pattern is treated as a regex (with a fallback to literal substring
+/// if the regex doesn't compile); searching is case-insensitive.
 pub struct TableSearch {
-    pub query: String,
+    pub input: crate::text_input::TextInput,
     /// True while the user is typing the query; false once accepted with Enter.
     pub input_open: bool,
     pub last_match_row: Option<usize>,
+    /// Cached compiled regex plus the query string it was built from.
+    /// Rebuilt lazily from `query()` when the query changes; looked up from
+    /// render on every row, so this avoids ~100 recompilations per keystroke.
+    cached_regex: std::cell::RefCell<Option<(String, Option<regex::Regex>)>>,
+}
+
+impl TableSearch {
+    pub fn query(&self) -> &str {
+        &self.input.text
+    }
+
+    /// Compile-on-demand, cached by query text. Returns `None` if the query
+    /// is empty or the pattern cannot be compiled (even as an escaped literal).
+    pub fn regex(&self) -> Option<regex::Regex> {
+        let q = self.query();
+        {
+            let cache = self.cached_regex.borrow();
+            if let Some((cached_q, cached_re)) = cache.as_ref() {
+                if cached_q == q {
+                    return cached_re.clone();
+                }
+            }
+        }
+        let re = compile_search_regex(q);
+        *self.cached_regex.borrow_mut() = Some((q.to_string(), re.clone()));
+        re
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -717,8 +746,7 @@ impl ParquetViewerState {
         let mut total_uncompressed: u64 = 0;
         let mut compressions: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
-        let mut encodings: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
+        let mut encodings: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         let mut per_rg: Vec<String> = Vec::new();
 
         let mut physical = String::new();
@@ -740,8 +768,7 @@ impl ParquetViewerState {
             }
             let nv = col_meta.num_values() as u64;
             total_values = total_values.saturating_add(nv);
-            total_compressed =
-                total_compressed.saturating_add(col_meta.compressed_size() as u64);
+            total_compressed = total_compressed.saturating_add(col_meta.compressed_size() as u64);
             total_uncompressed =
                 total_uncompressed.saturating_add(col_meta.uncompressed_size() as u64);
             let comp_name = format!("{:?}", col_meta.compression());
@@ -775,10 +802,7 @@ impl ParquetViewerState {
             format!("{} / {}", physical, logical)
         };
         pairs.push(("Type".into(), type_str));
-        pairs.push((
-            "Values".into(),
-            format_number(total_values as usize),
-        ));
+        pairs.push(("Values".into(), format_number(total_values as usize)));
         if let Some(n) = total_nulls {
             if total_values > 0 {
                 let pct = 100.0 * (n as f64) / (total_values as f64);
@@ -842,12 +866,7 @@ impl ParquetViewerState {
             Some(r) => r.clone(),
             None => return,
         };
-        let pairs: Vec<(String, String)> = self
-            .table_columns
-            .iter()
-            .cloned()
-            .zip(row.into_iter())
-            .collect();
+        let pairs: Vec<(String, String)> = self.table_columns.iter().cloned().zip(row).collect();
         self.popup = Some(DetailPopup::Row {
             row_idx: self.table_cursor_row,
             pairs,
@@ -866,9 +885,10 @@ impl ParquetViewerState {
         self.popup = None;
         self.status = None;
         self.search = Some(TableSearch {
-            query: String::new(),
+            input: crate::text_input::TextInput::new(String::new()),
             input_open: true,
             last_match_row: None,
+            cached_regex: std::cell::RefCell::new(None),
         });
     }
 
@@ -879,7 +899,7 @@ impl ParquetViewerState {
     pub fn search_input_char(&mut self, c: char) {
         if let Some(s) = &mut self.search {
             if s.input_open {
-                s.query.push(c);
+                s.input.insert_char(c);
             }
         }
     }
@@ -887,7 +907,7 @@ impl ParquetViewerState {
     pub fn search_input_backspace(&mut self) {
         if let Some(s) = &mut self.search {
             if s.input_open {
-                s.query.pop();
+                s.input.backspace();
             }
         }
     }
@@ -900,7 +920,7 @@ impl ParquetViewerState {
     /// Accept the current query and jump to the first match from the cursor.
     pub fn search_input_accept(&mut self) {
         let query = match &self.search {
-            Some(s) if s.input_open && !s.query.is_empty() => s.query.clone(),
+            Some(s) if s.input_open && !s.query().is_empty() => s.query().to_string(),
             _ => {
                 self.search = None;
                 return;
@@ -936,9 +956,10 @@ impl ParquetViewerState {
         // Escape so regex metacharacters in the value become literals.
         let pattern = regex::escape(&val);
         self.search = Some(TableSearch {
-            query: pattern.clone(),
+            input: crate::text_input::TextInput::new(pattern.clone()),
             input_open: false,
             last_match_row: None,
+            cached_regex: std::cell::RefCell::new(None),
         });
         let start = if reverse {
             self.table_cursor_row.saturating_sub(1)
@@ -949,7 +970,7 @@ impl ParquetViewerState {
     }
 
     pub fn search_next(&mut self) {
-        let query = match self.search.as_ref().map(|s| s.query.clone()) {
+        let query = match self.search.as_ref().map(|s| s.query().to_string()) {
             Some(q) if !q.is_empty() => q,
             _ => return,
         };
@@ -966,7 +987,7 @@ impl ParquetViewerState {
     }
 
     pub fn search_prev(&mut self) {
-        let query = match self.search.as_ref().map(|s| s.query.clone()) {
+        let query = match self.search.as_ref().map(|s| s.query().to_string()) {
             Some(q) if !q.is_empty() => q,
             _ => return,
         };
@@ -988,18 +1009,12 @@ impl ParquetViewerState {
         if self.tree_items.is_empty() {
             return;
         }
-        let re = match regex::RegexBuilder::new(query).case_insensitive(true).build() {
-            Ok(r) => r,
-            Err(_) => match regex::RegexBuilder::new(&regex::escape(query))
-                .case_insensitive(true)
-                .build()
-            {
-                Ok(r) => r,
-                Err(_) => {
-                    self.status = Some(format!("Invalid pattern: {}", query));
-                    return;
-                }
-            },
+        let re = match compile_search_regex(query) {
+            Some(r) => r,
+            None => {
+                self.status = Some(format!("Invalid pattern: {}", query));
+                return;
+            }
         };
         let len = self.tree_items.len();
         let start = start.min(len - 1);
@@ -1057,17 +1072,7 @@ impl ParquetViewerState {
     /// back to an escaped literal substring if the user's pattern doesn't
     /// compile (so a naive `/(foo` still works as a literal search).
     pub fn search_regex(&self) -> Option<regex::Regex> {
-        let q = self.search.as_ref()?.query.clone();
-        if q.is_empty() {
-            return None;
-        }
-        match regex::RegexBuilder::new(&q).case_insensitive(true).build() {
-            Ok(r) => Some(r),
-            Err(_) => regex::RegexBuilder::new(&regex::escape(&q))
-                .case_insensitive(true)
-                .build()
-                .ok(),
-        }
+        self.search.as_ref()?.regex()
     }
 
     /// Scan forward (or backward) for a row where any column matches the
@@ -1078,18 +1083,12 @@ impl ParquetViewerState {
             return;
         }
         // Compile once.
-        let re = match regex::RegexBuilder::new(query).case_insensitive(true).build() {
-            Ok(r) => r,
-            Err(_) => match regex::RegexBuilder::new(&regex::escape(query))
-                .case_insensitive(true)
-                .build()
-            {
-                Ok(r) => r,
-                Err(_) => {
-                    self.status = Some(format!("Invalid pattern: {}", query));
-                    return;
-                }
-            },
+        let re = match compile_search_regex(query) {
+            Some(r) => r,
+            None => {
+                self.status = Some(format!("Invalid pattern: {}", query));
+                return;
+            }
         };
         let limit = TABLE_BUFFER_ROWS.saturating_mul(100);
         let mut checked = 0usize;
@@ -1240,8 +1239,7 @@ impl ParquetViewerState {
         if let Some(popup) = &self.popup {
             return Some(match popup {
                 DetailPopup::Cell { value, .. } => value.clone(),
-                DetailPopup::Row { pairs, .. }
-                | DetailPopup::ColumnInfo { pairs, .. } => pairs
+                DetailPopup::Row { pairs, .. } | DetailPopup::ColumnInfo { pairs, .. } => pairs
                     .iter()
                     .map(|(k, v)| format!("{}\t{}", k, v))
                     .collect::<Vec<_>>()
@@ -1249,11 +1247,14 @@ impl ParquetViewerState {
             });
         }
         match self.view_mode {
-            ViewMode::Tree => self.tree_items.get(self.tree_cursor).map(|i| i.text.clone()),
+            ViewMode::Tree => self
+                .tree_items
+                .get(self.tree_cursor)
+                .map(|i| i.text.clone()),
             ViewMode::Table => {
-                let col = self.table_cursor_col.min(
-                    self.table_columns.len().saturating_sub(1).max(0),
-                );
+                let col = self
+                    .table_cursor_col
+                    .min(self.table_columns.len().saturating_sub(1).max(0));
                 self.table_row(self.table_cursor_row)
                     .and_then(|r| r.get(col).cloned())
             }
@@ -1265,8 +1266,7 @@ impl ParquetViewerState {
         if self.view_mode != ViewMode::Table {
             return None;
         }
-        self.table_row(self.table_cursor_row)
-            .map(|r| r.join("\t"))
+        self.table_row(self.table_cursor_row).map(|r| r.join("\t"))
     }
 
     /// Copy the whole current row as a single-line JSON object. All values
@@ -1392,7 +1392,9 @@ impl ParquetViewerState {
         if self.view_mode != ViewMode::Table || self.table_columns.is_empty() {
             return;
         }
-        let c = self.table_cursor_col.min(self.table_column_widths.len() - 1);
+        let c = self
+            .table_cursor_col
+            .min(self.table_column_widths.len() - 1);
         let cur = self.table_column_widths[c];
         let step = (cur / 3).max(4);
         let new = (cur + step).min(120);
@@ -1405,7 +1407,9 @@ impl ParquetViewerState {
         if self.view_mode != ViewMode::Table || self.table_columns.is_empty() {
             return;
         }
-        let c = self.table_cursor_col.min(self.table_column_widths.len() - 1);
+        let c = self
+            .table_cursor_col
+            .min(self.table_column_widths.len() - 1);
         let cur = self.table_column_widths[c];
         let step = (cur / 3).max(4);
         let new = cur.saturating_sub(step).max(4);
@@ -1632,17 +1636,16 @@ impl ParquetViewerState {
         if total == 0 {
             return None;
         }
-        let search: Box<dyn Iterator<Item = usize>> = if reverse {
-            Box::new((0..=from.min(total - 1)).rev().chain((from + 1..total).rev()))
+        let mut search: Box<dyn Iterator<Item = usize>> = if reverse {
+            Box::new(
+                (0..=from.min(total - 1))
+                    .rev()
+                    .chain((from + 1..total).rev()),
+            )
         } else {
             Box::new((from..total).chain(0..from))
         };
-        for i in search {
-            if !self.hidden_cols.contains(&i) {
-                return Some(i);
-            }
-        }
-        None
+        search.find(|i| !self.hidden_cols.contains(i))
     }
 
     /// Hide the column under the cursor. Refuses to hide the last remaining
@@ -1705,8 +1708,7 @@ impl ParquetViewerState {
                     .max()
                     .unwrap_or(0);
                 if ci < self.table_column_widths.len() {
-                    self.table_column_widths[ci] =
-                        self.table_column_widths[ci].max(max_w).min(80);
+                    self.table_column_widths[ci] = self.table_column_widths[ci].max(max_w).min(80);
                 }
             }
             self.status = Some("Thousands separators ON".into());
@@ -1777,7 +1779,7 @@ impl ParquetViewerState {
             .map(|v| display_width_oneline(v))
             .max()
             .unwrap_or(0);
-        let target = name_w.max(data_w).max(4).min(80);
+        let target = name_w.max(data_w).clamp(4, 80);
         let old = self.table_column_widths[c];
         self.table_column_widths[c] = target;
         self.status = Some(format!("col width {} → {} (autofit)", old, target));
@@ -1902,24 +1904,14 @@ impl ParquetViewerState {
             stem
         };
 
-        let out_path = {
-            let mut attempt: u32 = 0;
-            loop {
-                let suffix = if attempt == 0 {
-                    String::new()
-                } else {
-                    format!("-{}", attempt)
-                };
-                let cand = parent.join(format!("{}{}.ndjson", base, suffix));
-                if !cand.exists() {
-                    break cand;
-                }
-                attempt += 1;
-                if attempt > 1000 {
-                    return Err("too many existing .ndjson files".into());
-                }
-            }
-        };
+        let out_path = pick_unused_export_path(|attempt| {
+            let suffix = if attempt == 0 {
+                String::new()
+            } else {
+                format!("-{}", attempt)
+            };
+            parent.join(format!("{}{}.ndjson", base, suffix))
+        })?;
 
         let file = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
         let mut w = std::io::BufWriter::new(file);
@@ -1991,24 +1983,14 @@ impl ParquetViewerState {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_else(|| "export".to_string());
 
-        let out_path = {
-            let mut attempt: u32 = 0;
-            loop {
-                let suffix = if attempt == 0 {
-                    String::new()
-                } else {
-                    format!("-{}", attempt)
-                };
-                let cand = parent.join(format!("{}{}.csv", stem, suffix));
-                if !cand.exists() {
-                    break cand;
-                }
-                attempt += 1;
-                if attempt > 1000 {
-                    return Err("too many existing .csv files".into());
-                }
-            }
-        };
+        let out_path = pick_unused_export_path(|attempt| {
+            let suffix = if attempt == 0 {
+                String::new()
+            } else {
+                format!("-{}", attempt)
+            };
+            parent.join(format!("{}{}.csv", stem, suffix))
+        })?;
 
         let file = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
         let mut w = std::io::BufWriter::new(file);
@@ -2016,8 +1998,7 @@ impl ParquetViewerState {
 
         // Header.
         {
-            let cells: Vec<String> =
-                self.table_columns.iter().map(|c| csv_escape(c)).collect();
+            let cells: Vec<String> = self.table_columns.iter().map(|c| csv_escape(c)).collect();
             writeln!(w, "{}", cells.join(",")).map_err(|e| e.to_string())?;
         }
 
@@ -2093,28 +2074,18 @@ impl ParquetViewerState {
         let has_selection = !self.selected_rows.is_empty();
         let suffix_tag = if has_selection { "selected" } else { "rg" };
 
-        let out_path = {
-            let mut attempt: u32 = 0;
-            loop {
-                let suffix = if attempt == 0 {
-                    String::new()
-                } else {
-                    format!("-{}", attempt)
-                };
-                let cand = if has_selection {
-                    parent.join(format!("{}.{}{}.csv", stem, suffix_tag, suffix))
-                } else {
-                    parent.join(format!("{}.{}{}{}.csv", stem, suffix_tag, rg_idx, suffix))
-                };
-                if !cand.exists() {
-                    break cand;
-                }
-                attempt += 1;
-                if attempt > 1000 {
-                    return Err("too many existing export files".into());
-                }
+        let out_path = pick_unused_export_path(|attempt| {
+            let suffix = if attempt == 0 {
+                String::new()
+            } else {
+                format!("-{}", attempt)
+            };
+            if has_selection {
+                parent.join(format!("{}.{}{}.csv", stem, suffix_tag, suffix))
+            } else {
+                parent.join(format!("{}.{}{}{}.csv", stem, suffix_tag, rg_idx, suffix))
             }
-        };
+        })?;
 
         let file = std::fs::File::create(&out_path).map_err(|e| e.to_string())?;
         let mut w = std::io::BufWriter::new(file);
@@ -2122,8 +2093,7 @@ impl ParquetViewerState {
 
         // Header
         {
-            let cells: Vec<String> =
-                self.table_columns.iter().map(|c| csv_escape(c)).collect();
+            let cells: Vec<String> = self.table_columns.iter().map(|c| csv_escape(c)).collect();
             writeln!(w, "{}", cells.join(",")).map_err(|e| e.to_string())?;
         }
 
@@ -2195,8 +2165,7 @@ impl ParquetViewerState {
         } else if self.table_visible_cols > 0
             && self.table_cursor_col >= self.table_scroll_col + self.table_visible_cols
         {
-            self.table_scroll_col =
-                self.table_cursor_col + 1 - self.table_visible_cols;
+            self.table_scroll_col = self.table_cursor_col + 1 - self.table_visible_cols;
         }
         // Clamp scroll so we don't scroll past the last column.
         let max_scroll = self
@@ -2255,11 +2224,10 @@ impl ParquetViewerState {
             return;
         }
 
-        let mut columns =
-            match decode_row_group_columns(&self.path, rg, start_local, count) {
-                Some(c) => c,
-                None => return,
-            };
+        let mut columns = match decode_row_group_columns(&self.path, rg, start_local, count) {
+            Some(c) => c,
+            None => return,
+        };
 
         // Update column widths using Unicode display width so non-ASCII
         // (accented chars, CJK, emoji) don't push separators out of alignment.
@@ -2660,10 +2628,7 @@ impl ParquetViewerState {
                             push_item(
                                 &mut self.tree_items,
                                 4,
-                                format!(
-                                    "Dict page offset: {}",
-                                    format_number(dict_off as usize)
-                                ),
+                                format!("Dict page offset: {}", format_number(dict_off as usize)),
                                 ItemKind::Property,
                                 false,
                                 None,
@@ -2718,7 +2683,9 @@ impl ParquetViewerState {
                                 match self.column_dicts.get(&(rg_idx, col_idx)) {
                                     Some(Some(dict)) => {
                                         const DICT_PREVIEW_LIMIT: usize = 50;
-                                        for (i, v) in dict.iter().take(DICT_PREVIEW_LIMIT).enumerate() {
+                                        for (i, v) in
+                                            dict.iter().take(DICT_PREVIEW_LIMIT).enumerate()
+                                        {
                                             push_item(
                                                 &mut self.tree_items,
                                                 5,
@@ -3274,9 +3241,7 @@ fn transpose_columns(columns: &mut [Vec<String>]) -> Vec<Vec<String>> {
 /// display strings. Returns None when the column has no dictionary or when
 /// decoding fails (e.g. on corrupted files).
 fn decode_column_dict(path: &PathBuf, col_meta: &ColumnChunkMetaData) -> Option<Vec<String>> {
-    if col_meta.dictionary_page_offset().is_none() {
-        return None;
-    }
+    col_meta.dictionary_page_offset()?;
     let mut file = File::open(path).ok()?;
     let pages = read::get_page_iterator(col_meta, &mut file, None, vec![], usize::MAX).ok()?;
     let desc = col_meta.descriptor();
@@ -3700,10 +3665,7 @@ fn is_string_byte_array(logical_type: Option<&PrimitiveLogicalType>) -> bool {
 /// display column, keeping column-width math honest.
 fn sanitize_for_display(s: &str) -> String {
     // \n (0x0A) is intentionally preserved.
-    if !s
-        .bytes()
-        .any(|b| (b < 0x20 && b != b'\n') || b == 0x7F)
-    {
+    if !s.bytes().any(|b| (b < 0x20 && b != b'\n') || b == 0x7F) {
         return s.to_string();
     }
     s.chars()
@@ -3726,10 +3688,7 @@ pub fn display_width_oneline(s: &str) -> usize {
 /// Default alignment for a column given its physical + logical type.
 /// Numeric columns right-align; everything else (dates, times, timestamps,
 /// strings, binary, bool) left-aligns.
-fn column_alignment(
-    phys: PhysicalType,
-    logical: Option<&PrimitiveLogicalType>,
-) -> Alignment {
+fn column_alignment(phys: PhysicalType, logical: Option<&PrimitiveLogicalType>) -> Alignment {
     // Date/Time/Timestamp already render left-aligned in the existing branch.
     match phys {
         PhysicalType::Int32 | PhysicalType::Int64 => match logical {
@@ -3741,9 +3700,9 @@ fn column_alignment(
         PhysicalType::Float | PhysicalType::Double => Alignment::Right,
         // INT96 is always an Impala timestamp in practice.
         PhysicalType::Int96 => Alignment::Left,
-        PhysicalType::Boolean
-        | PhysicalType::ByteArray
-        | PhysicalType::FixedLenByteArray(_) => Alignment::Left,
+        PhysicalType::Boolean | PhysicalType::ByteArray | PhysicalType::FixedLenByteArray(_) => {
+            Alignment::Left
+        }
     }
 }
 
@@ -3859,6 +3818,8 @@ fn decode_delta_byte_array(
     let mut prefixes: Vec<usize> = Vec::new();
     for item in pref_dec.by_ref() {
         match item {
+            // Prefix decoder emits `u32`, so no non-negative guard is possible
+            // (or needed). Casting to `usize` is lossless on 32-/64-bit targets.
             Ok(v) => prefixes.push(v as usize),
             Err(_) => return vec!["<delta-ba err>".into()],
         }
@@ -4131,9 +4092,9 @@ fn format_time_of_day(val: i64, unit: TimeUnit) -> String {
     let base = format!("{:02}:{:02}:{:02}", hh, mm, ss);
     if nanos == 0 {
         base
-    } else if nanos % 1_000_000 == 0 {
+    } else if nanos.is_multiple_of(1_000_000) {
         format!("{}.{:03}", base, nanos / 1_000_000)
-    } else if nanos % 1_000 == 0 {
+    } else if nanos.is_multiple_of(1_000) {
         format!("{}.{:06}", base, nanos / 1_000)
     } else {
         format!("{}.{:09}", base, nanos)
@@ -4154,9 +4115,9 @@ fn format_timestamp_secs(secs: i64, nanos: u32) -> String {
     }
     // Trim trailing zeros: show ms if µs/ns parts are zero, µs if ns is zero,
     // otherwise full ns precision.
-    if nanos % 1_000_000 == 0 {
+    if nanos.is_multiple_of(1_000_000) {
         format!("{}.{:03}", base, nanos / 1_000_000)
-    } else if nanos % 1_000 == 0 {
+    } else if nanos.is_multiple_of(1_000) {
         format!("{}.{:06}", base, nanos / 1_000)
     } else {
         format!("{}.{:09}", base, nanos)
@@ -4245,6 +4206,47 @@ fn format_number(n: usize) -> String {
         result.push(c);
     }
     result.chars().rev().collect()
+}
+
+/// Cap on export attempts when resolving a non-colliding output filename.
+/// With 1000+ existing variants of the same export, the user has a larger
+/// problem than we can solve from a keystroke handler.
+const EXPORT_ATTEMPT_LIMIT: u32 = 1000;
+
+/// Find a non-existent path under `parent` built from `make_path(attempt)`.
+/// Tries `attempt = 0, 1, 2, ...` until `make_path` returns a path that does
+/// not yet exist, or until `EXPORT_ATTEMPT_LIMIT` is reached.
+fn pick_unused_export_path<F>(mut make_path: F) -> Result<PathBuf, String>
+where
+    F: FnMut(u32) -> PathBuf,
+{
+    for attempt in 0..=EXPORT_ATTEMPT_LIMIT {
+        let cand = make_path(attempt);
+        if !cand.exists() {
+            return Ok(cand);
+        }
+    }
+    Err("too many existing export files".into())
+}
+
+/// Compile a search pattern to a case-insensitive regex. If `query` is not
+/// valid regex, falls back to an escaped literal substring so that a naive
+/// `/(foo` still works as a literal search. Returns None when even the
+/// escaped fallback fails to compile (shouldn't happen in practice).
+fn compile_search_regex(query: &str) -> Option<regex::Regex> {
+    if query.is_empty() {
+        return None;
+    }
+    match regex::RegexBuilder::new(query)
+        .case_insensitive(true)
+        .build()
+    {
+        Ok(r) => Some(r),
+        Err(_) => regex::RegexBuilder::new(&regex::escape(query))
+            .case_insensitive(true)
+            .build()
+            .ok(),
+    }
 }
 
 fn format_encoding(id: i32) -> &'static str {
@@ -4525,7 +4527,10 @@ mod tests {
         let values: Vec<&[u8]> = vec![b"a", b"b", b"c", b"d", b"e"];
         let mut buf = Vec::new();
         parquet2::encoding::delta_length_byte_array::encode(values.iter().copied(), &mut buf);
-        assert_eq!(decode_delta_length_byte_array(&buf, None, 3), vec!["a", "b", "c"]);
+        assert_eq!(
+            decode_delta_length_byte_array(&buf, None, 3),
+            vec!["a", "b", "c"]
+        );
     }
 
     // --- Delta byte array (prefix-compressed) ---
@@ -4581,7 +4586,13 @@ mod tests {
         let decoded = decode_rle_values(&buf, PhysicalType::Boolean, false, bits.len());
         let expected: Vec<String> = bits
             .iter()
-            .map(|b| if *b != 0 { "true".into() } else { "false".into() })
+            .map(|b| {
+                if *b != 0 {
+                    "true".into()
+                } else {
+                    "false".into()
+                }
+            })
             .collect();
         assert_eq!(decoded, expected);
     }
@@ -4599,7 +4610,13 @@ mod tests {
         let decoded = decode_rle_values(&buf, PhysicalType::Boolean, true, bits.len());
         let expected: Vec<String> = bits
             .iter()
-            .map(|b| if *b != 0 { "true".into() } else { "false".into() })
+            .map(|b| {
+                if *b != 0 {
+                    "true".into()
+                } else {
+                    "false".into()
+                }
+            })
             .collect();
         assert_eq!(decoded, expected);
     }
@@ -4704,17 +4721,33 @@ mod tests {
             is_adjusted_to_utc: true,
         };
         let out = format_i64(0, Some(&lt));
-        assert!(out.ends_with('Z'), "expected Z suffix on UTC timestamps, got {}", out);
+        assert!(
+            out.ends_with('Z'),
+            "expected Z suffix on UTC timestamps, got {}",
+            out
+        );
     }
 
     // --- Column alignment ---
 
     #[test]
     fn alignment_numeric_types_right_align() {
-        assert_eq!(column_alignment(PhysicalType::Int32, None), Alignment::Right);
-        assert_eq!(column_alignment(PhysicalType::Int64, None), Alignment::Right);
-        assert_eq!(column_alignment(PhysicalType::Float, None), Alignment::Right);
-        assert_eq!(column_alignment(PhysicalType::Double, None), Alignment::Right);
+        assert_eq!(
+            column_alignment(PhysicalType::Int32, None),
+            Alignment::Right
+        );
+        assert_eq!(
+            column_alignment(PhysicalType::Int64, None),
+            Alignment::Right
+        );
+        assert_eq!(
+            column_alignment(PhysicalType::Float, None),
+            Alignment::Right
+        );
+        assert_eq!(
+            column_alignment(PhysicalType::Double, None),
+            Alignment::Right
+        );
     }
 
     #[test]
@@ -4727,7 +4760,10 @@ mod tests {
             unit: TimeUnit::Milliseconds,
             is_adjusted_to_utc: true,
         };
-        assert_eq!(column_alignment(PhysicalType::Int64, Some(&ts)), Alignment::Left);
+        assert_eq!(
+            column_alignment(PhysicalType::Int64, Some(&ts)),
+            Alignment::Left
+        );
     }
 
     #[test]
@@ -4741,8 +4777,14 @@ mod tests {
 
     #[test]
     fn alignment_strings_and_bytes_left_align() {
-        assert_eq!(column_alignment(PhysicalType::ByteArray, None), Alignment::Left);
-        assert_eq!(column_alignment(PhysicalType::Boolean, None), Alignment::Left);
+        assert_eq!(
+            column_alignment(PhysicalType::ByteArray, None),
+            Alignment::Left
+        );
+        assert_eq!(
+            column_alignment(PhysicalType::Boolean, None),
+            Alignment::Left
+        );
         assert_eq!(
             column_alignment(PhysicalType::FixedLenByteArray(16), None),
             Alignment::Left
@@ -4755,26 +4797,14 @@ mod tests {
     #[test]
     fn cmp_values_numeric_beats_lexicographic() {
         // "10" > "2" numerically (lex would say "10" < "2").
-        assert_eq!(
-            cmp_values("10", "2", true),
-            std::cmp::Ordering::Greater
-        );
-        assert_eq!(
-            cmp_values("10", "2", false),
-            std::cmp::Ordering::Less
-        );
+        assert_eq!(cmp_values("10", "2", true), std::cmp::Ordering::Greater);
+        assert_eq!(cmp_values("10", "2", false), std::cmp::Ordering::Less);
     }
 
     #[test]
     fn cmp_values_negative_numbers() {
-        assert_eq!(
-            cmp_values("-10", "-2", true),
-            std::cmp::Ordering::Less
-        );
-        assert_eq!(
-            cmp_values("-3.5", "2.5", true),
-            std::cmp::Ordering::Less
-        );
+        assert_eq!(cmp_values("-10", "-2", true), std::cmp::Ordering::Less);
+        assert_eq!(cmp_values("-3.5", "2.5", true), std::cmp::Ordering::Less);
     }
 
     #[test]
@@ -4793,10 +4823,7 @@ mod tests {
     #[test]
     fn cmp_values_mixed_uses_lexicographic() {
         // One parseable + one not → lexicographic.
-        assert_eq!(
-            cmp_values("42", "foo", true),
-            "42".cmp("foo")
-        );
+        assert_eq!(cmp_values("42", "foo", true), "42".cmp("foo"));
     }
 
     #[test]
@@ -5055,17 +5082,16 @@ mod tests {
         if total == 0 {
             return None;
         }
-        let search: Box<dyn Iterator<Item = usize>> = if reverse {
-            Box::new((0..=from.min(total - 1)).rev().chain((from + 1..total).rev()))
+        let mut search: Box<dyn Iterator<Item = usize>> = if reverse {
+            Box::new(
+                (0..=from.min(total - 1))
+                    .rev()
+                    .chain((from + 1..total).rev()),
+            )
         } else {
             Box::new((from..total).chain(0..from))
         };
-        for i in search {
-            if !hidden.contains(&i) {
-                return Some(i);
-            }
-        }
-        None
+        search.find(|i| !hidden.contains(i))
     }
 
     #[test]
@@ -5111,21 +5137,21 @@ mod tests {
     #[test]
     fn render_ndjson_line_basic_row() {
         let pairs = vec![("id", "42"), ("name", "alice")];
-        let out = render_ndjson_line(pairs.into_iter());
+        let out = render_ndjson_line(pairs);
         assert_eq!(out, r#"{"id": "42", "name": "alice"}"#);
     }
 
     #[test]
     fn render_ndjson_line_nulls_are_bare() {
         let pairs = vec![("a", "1"), ("b", "null"), ("c", "x")];
-        let out = render_ndjson_line(pairs.into_iter());
+        let out = render_ndjson_line(pairs);
         assert_eq!(out, r#"{"a": "1", "b": null, "c": "x"}"#);
     }
 
     #[test]
     fn render_ndjson_line_escapes_special_chars_in_values() {
         let pairs = vec![("q", "he said \"hi\""), ("nl", "a\nb")];
-        let out = render_ndjson_line(pairs.into_iter());
+        let out = render_ndjson_line(pairs);
         // Round-trip: the result must parse as valid JSON.
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("must parse");
         assert_eq!(parsed["q"], "he said \"hi\"");
@@ -5136,7 +5162,7 @@ mod tests {
     fn render_ndjson_line_preserves_column_order() {
         // JSON technically doesn't guarantee key order, but our output does.
         let pairs = vec![("z", "1"), ("a", "2"), ("m", "3")];
-        let out = render_ndjson_line(pairs.into_iter());
+        let out = render_ndjson_line(pairs);
         let z_pos = out.find("\"z\"").unwrap();
         let a_pos = out.find("\"a\"").unwrap();
         let m_pos = out.find("\"m\"").unwrap();

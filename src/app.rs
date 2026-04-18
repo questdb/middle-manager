@@ -3446,14 +3446,16 @@ impl App {
         }
 
         // Ctrl-modified keys take precedence over any plain-letter bindings.
+        // Unmatched Ctrl chords fall through rather than returning `Action::None`,
+        // so Ctrl+C / Ctrl+Q and other well-known chords aren't silently eaten.
         if ctrl {
-            return match key.code {
-                KeyCode::Char('a') => Action::ParquetSelectAll,
-                KeyCode::Char('i') => Action::ParquetInvertSelection,
-                KeyCode::Char('u') => Action::ParquetHalfPageUp,
-                KeyCode::Char('d') => Action::ParquetHalfPageDown,
-                _ => Action::None,
-            };
+            match key.code {
+                KeyCode::Char('a') => return Action::ParquetSelectAll,
+                KeyCode::Char('i') => return Action::ParquetInvertSelection,
+                KeyCode::Char('u') => return Action::ParquetHalfPageUp,
+                KeyCode::Char('d') => return Action::ParquetHalfPageDown,
+                _ => {}
+            }
         }
 
         match key.code {

@@ -178,11 +178,15 @@ fn render_table(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
     }
     // Active search indicator (committed, not while typing).
     if let Some(ref s) = state.search {
-        if !s.input_open && !s.query.is_empty() {
+        if !s.input_open && !s.query().is_empty() {
             // Truncate long queries in the title so they don't push the
             // more important metadata off-screen.
-            let q: String = s.query.chars().take(40).collect();
-            let suffix = if s.query.chars().count() > 40 { "…" } else { "" };
+            let q: String = s.query().chars().take(40).collect();
+            let suffix = if s.query().chars().count() > 40 {
+                "…"
+            } else {
+                ""
+            };
             title_text.push_str(&format!(" /{}{}/ ", q, suffix));
         }
     }
@@ -304,12 +308,12 @@ fn render_table(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
     // the visible range, we replace the first/last character of the gutter
     // with a ◄/► indicator.
     let gutter_label_style = Style::default()
-        .fg(Color::DarkGray)
+        .fg(t.parquet_gutter_fg)
         .bg(t.bg)
         .add_modifier(Modifier::BOLD);
     let has_left = col_start > 0;
     let has_right = visible_end < state.table_columns.len();
-    let indicator_style = Style::default().fg(Color::Yellow).bg(t.bg);
+    let indicator_style = Style::default().fg(t.parquet_indicator_fg).bg(t.bg);
 
     // Precompute a hidden bitmap for quick lookups in the span builders.
     let hidden: Vec<bool> = (0..state.table_columns.len())
@@ -334,7 +338,11 @@ fn render_table(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
     // Frozen column for the header row.
     if let Some(fc) = effective_frozen {
         let fw = col_widths.get(fc).copied().unwrap_or(8);
-        let name = state.table_columns.get(fc).map(|s| s.as_str()).unwrap_or("");
+        let name = state
+            .table_columns
+            .get(fc)
+            .map(|s| s.as_str())
+            .unwrap_or("");
         header_spans.push(Span::styled(fit(name, fw), header_style));
         header_spans.push(Span::styled(" ║ ", ts.sep));
     }
@@ -344,13 +352,16 @@ fn render_table(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
     } else {
         scroll_content_width
     };
+    let header_layout = ColLayout {
+        col_widths,
+        hidden: &hidden,
+        col_start,
+        col_end: visible_end,
+        inner_width: header_target_width,
+    };
     header_spans.extend(build_row_spans(
         &state.table_columns,
-        col_widths,
-        &hidden,
-        col_start,
-        visible_end,
-        header_target_width,
+        &header_layout,
         header_style,
         &ts,
     ));
@@ -382,11 +393,15 @@ fn render_table(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
 
     let cursor_row = state.table_cursor_row;
     let cursor_col = state.table_cursor_col;
-    let gutter_row_style = Style::default().fg(Color::DarkGray).bg(t.bg);
+    let gutter_row_style = Style::default().fg(t.parquet_gutter_fg).bg(t.bg);
     let gutter_cursor_style = Style::default()
-        .fg(Color::White)
-        .bg(Color::Rgb(40, 60, 90))
+        .fg(t.parquet_cursor_gutter_fg)
+        .bg(t.parquet_cursor_row_bg)
         .add_modifier(Modifier::BOLD);
+    // Compile the search regex once per render rather than per row: the
+    // per-`TableSearch` cache keeps the result across renders, but hoisting
+    // also avoids one RefCell borrow per visible row.
+    let search_re = state.search_regex();
     for i in 0..state.table_visible_rows {
         let global_row = state.table_scroll_row + i;
         if global_row >= state.table_total_rows {
@@ -410,7 +425,7 @@ fn render_table(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
             gutter_cursor_style
         } else if is_selected {
             Style::default()
-                .fg(Color::LightGreen)
+                .fg(t.parquet_selected_row_fg)
                 .bg(t.bg)
                 .add_modifier(Modifier::BOLD)
         } else {
@@ -421,7 +436,6 @@ fn render_table(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
         if let Some(row) = state.table_row(global_row) {
             let mut all_spans = Vec::<Span<'static>>::with_capacity(16);
             all_spans.push(gutter_prefix);
-            let search_re = state.search_regex();
 
             // Render the frozen column (if any) before the scrolled range.
             if let Some(fc) = effective_frozen {
@@ -430,9 +444,9 @@ fn render_table(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
                 let is_cursor_cell = is_cursor_row && cursor_col == fc;
                 let fg_style = if val == "null" { ts.null } else { ts.data };
                 let cell_bg = if is_cursor_cell {
-                    Color::Rgb(70, 100, 140)
+                    t.parquet_cursor_cell_bg
                 } else if is_cursor_row {
-                    Color::Rgb(40, 60, 90)
+                    t.parquet_cursor_row_bg
                 } else {
                     ts.bg.bg.unwrap_or(Color::Reset)
                 };
@@ -445,46 +459,49 @@ fn render_table(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
                         .copied()
                         .unwrap_or(Alignment::Left)
                 };
-                let display_val: String = if state.thousands_separators
-                    && align == Alignment::Right
-                    && val != "null"
-                {
-                    format_with_thousands(val)
-                } else {
-                    val.to_string()
-                };
+                let display_val: String =
+                    if state.thousands_separators && align == Alignment::Right && val != "null" {
+                        format_with_thousands(val)
+                    } else {
+                        val.to_string()
+                    };
                 let fitted = fit_aligned(&display_val, fw, align);
                 let cell_spans = split_with_matches(
                     &fitted,
                     search_re.as_ref(),
                     fg_style.bg(cell_bg),
-                    Style::default().fg(Color::Black).bg(Color::Yellow),
+                    Style::default().fg(t.search_label_fg).bg(t.search_label_bg),
                 );
                 all_spans.extend(cell_spans);
                 // Vertical double-bar divider between the frozen column and
                 // the scrolled area.
                 let sep_bg = if is_cursor_row {
-                    Color::Rgb(40, 60, 90)
+                    t.parquet_cursor_row_bg
                 } else {
                     ts.bg.bg.unwrap_or(Color::Reset)
                 };
                 all_spans.push(Span::styled(" ║ ", ts.sep.bg(sep_bg)));
             }
 
-            all_spans.extend(build_data_row_spans(
-                row,
+            let data_layout = ColLayout {
                 col_widths,
-                &state.table_column_aligns,
-                &hidden,
+                hidden: &hidden,
                 col_start,
-                visible_end,
-                scroll_content_width,
-                &ts,
+                col_end: visible_end,
+                inner_width: scroll_content_width,
+            };
+            let data_ctx = DataRowCtx {
+                col_aligns: &state.table_column_aligns,
                 is_cursor_row,
-                if is_cursor_row { Some(cursor_col) } else { None },
-                search_re.as_ref(),
-                state.thousands_separators,
-            ));
+                cursor_col: if is_cursor_row {
+                    Some(cursor_col)
+                } else {
+                    None
+                },
+                search: search_re.as_ref(),
+                thousands_separators: state.thousands_separators,
+            };
+            all_spans.extend(build_data_row_spans(row, &data_layout, &ts, &data_ctx));
             lines.push(Line::from(all_spans));
         } else {
             let mut spans = vec![
@@ -520,11 +537,7 @@ fn render_table(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
 
     // Hint / status / search input bar, in order of precedence.
     let hint_text = if state.search_is_input_open() {
-        let q = state
-            .search
-            .as_ref()
-            .map(|s| s.query.as_str())
-            .unwrap_or("");
+        let q = state.search.as_ref().map(|s| s.query()).unwrap_or("");
         format!(" /{} (Enter=find, Esc=cancel) ", q)
     } else if let Some(ref msg) = state.status {
         format!(" {} ", msg)
@@ -559,7 +572,6 @@ fn render_table(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
         render_row_detail(frame, area, state);
     }
 }
-
 
 // ---------------------------------------------------------------------------
 // Row detail popup
@@ -613,35 +625,12 @@ fn render_row_detail(frame: &mut Frame, area: Rect, state: &mut ParquetViewerSta
         }
     };
 
-    // Size: ~80% of area, centered.
-    let pw = area.width.saturating_sub(6).max(20);
-    let ph = area.height.saturating_sub(4).max(10);
-    let px = area.x + (area.width.saturating_sub(pw)) / 2;
-    let py = area.y + (area.height.saturating_sub(ph)) / 2;
-    let popup_area = Rect::new(px, py, pw, ph);
-
-    // Clear the popup region so the underlying table doesn't bleed through.
-    {
-        let buf = frame.buffer_mut();
-        let bg = Style::default().bg(t.bg);
-        for y in popup_area.top()..popup_area.bottom() {
-            for x in popup_area.left()..popup_area.right() {
-                if let Some(cell) = buf.cell_mut((x, y)) {
-                    cell.set_symbol(" ");
-                    cell.set_style(bg);
-                }
-            }
-        }
-    }
-
-    let block = Block::default()
-        .title(Span::styled(title, t.title_style()))
-        .borders(Borders::ALL)
-        .border_style(t.border_style(true))
-        .style(t.bg_style());
-
-    let inner = block.inner(popup_area);
-    frame.render_widget(block, popup_area);
+    // Size: ~80% of area. `render_dialog_frame` adds its own outer margins,
+    // so subtract a bit to leave room for them.
+    let pw = area.width.saturating_sub(10).max(18);
+    let ph = area.height.saturating_sub(6).max(8);
+    let layout = crate::ui::dialog_helpers::render_dialog_frame(frame, &title, pw, ph);
+    let inner = layout.inner;
 
     let inner_width = inner.width as usize;
     let inner_height = inner.height as usize;
@@ -658,14 +647,14 @@ fn render_row_detail(frame: &mut Frame, area: Rect, state: &mut ParquetViewerSta
         *p.scroll_mut() = scroll;
     }
 
-    let bg = Style::default().bg(t.bg);
+    let bg = t.dialog_bg_style();
     let name_style = Style::default()
-        .fg(Color::Yellow)
-        .bg(t.bg)
+        .fg(t.dialog_title_fg)
+        .bg(t.dialog_bg)
         .add_modifier(Modifier::BOLD);
-    let value_style = Style::default().fg(Color::LightCyan).bg(t.bg);
-    let null_style = Style::default().fg(Color::DarkGray).bg(t.bg);
-    let cont_style = Style::default().fg(Color::Gray).bg(t.bg);
+    let value_style = Style::default().fg(t.dialog_text_fg).bg(t.dialog_bg);
+    let null_style = Style::default().fg(t.dialog_hint_fg).bg(t.dialog_bg);
+    let cont_style = Style::default().fg(t.parquet_popup_cont_fg).bg(t.dialog_bg);
 
     let mut lines: Vec<Line> = Vec::with_capacity(inner_height);
     for i in 0..inner_height {
@@ -701,9 +690,9 @@ fn render_row_detail(frame: &mut Frame, area: Rect, state: &mut ParquetViewerSta
     if total > inner_height {
         let indicator = format!(" {}/{} ", scroll + 1, max_scroll + 1);
         let iw = indicator.chars().count() as u16;
-        if popup_area.width > iw + 2 {
-            let ix = popup_area.right().saturating_sub(iw + 1);
-            let iy = popup_area.bottom().saturating_sub(1);
+        if layout.area.width > iw + 2 {
+            let ix = layout.area.right().saturating_sub(iw + 1);
+            let iy = layout.area.bottom().saturating_sub(1);
             let ind_area = Rect::new(ix, iy, iw, 1);
             frame.render_widget(
                 Paragraph::new(Span::styled(
@@ -743,8 +732,20 @@ fn render_row_pairs_lines(
         let wrapped = wrap_value(value, value_w);
         let mut iter = wrapped.into_iter();
         let first = iter.next().unwrap_or_default();
-        let header = format!("{}{}  {}", truncate_chars(name, name_w), pad_to_width(name, name_w), first);
-        rendered.push((if is_null { RenderRole::Null } else { RenderRole::Name }, header));
+        let header = format!(
+            "{}{}  {}",
+            truncate_chars(name, name_w),
+            pad_to_width(name, name_w),
+            first
+        );
+        rendered.push((
+            if is_null {
+                RenderRole::Null
+            } else {
+                RenderRole::Name
+            },
+            header,
+        ));
         let indent = " ".repeat(name_w + 2);
         for seg in iter {
             rendered.push((RenderRole::Continuation, format!("{}{}", indent, seg)));
@@ -761,7 +762,11 @@ fn render_cell_lines(value: &str, inner_width: usize) -> Vec<(RenderRole, String
     // pretty-printing — they'd just be the same text. Invalid JSON falls
     // back to the raw wrapped value.
     let source = maybe_pretty_json(value).unwrap_or_else(|| value.to_string());
-    let role = if is_null { RenderRole::Null } else { RenderRole::Value };
+    let role = if is_null {
+        RenderRole::Null
+    } else {
+        RenderRole::Value
+    };
     wrap_value(&source, inner_width.max(1))
         .into_iter()
         .map(|line| (role, line))
@@ -842,60 +847,70 @@ struct TableStyles {
     null: Style,
 }
 
-fn build_row_spans(
-    values: &[String],
-    col_widths: &[usize],
-    hidden: &[bool],
+/// Column-layout view shared between the header row, separator, and data
+/// rows. Groups the "which columns are visible and how wide" parameters so
+/// the span builders don't need 6+ positional args.
+struct ColLayout<'a> {
+    col_widths: &'a [usize],
+    hidden: &'a [bool],
     col_start: usize,
     col_end: usize,
     inner_width: usize,
+}
+
+/// Per-row context for `build_data_row_spans`. Factors out cursor, search,
+/// and display-format state that the header row doesn't need.
+struct DataRowCtx<'a> {
+    col_aligns: &'a [Alignment],
+    is_cursor_row: bool,
+    cursor_col: Option<usize>,
+    search: Option<&'a regex::Regex>,
+    thousands_separators: bool,
+}
+
+fn build_row_spans(
+    values: &[String],
+    layout: &ColLayout,
     value_style: Style,
     ts: &TableStyles,
 ) -> Vec<Span<'static>> {
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::styled(" ", ts.bg));
     let mut first_visible = true;
-    for i in col_start..col_end {
-        if hidden.get(i).copied().unwrap_or(false) {
+    for i in layout.col_start..layout.col_end {
+        if layout.hidden.get(i).copied().unwrap_or(false) {
             continue;
         }
         if !first_visible {
             spans.push(Span::styled(" | ", ts.sep));
         }
         first_visible = false;
-        let w = col_widths.get(i).copied().unwrap_or(8);
+        let w = layout.col_widths.get(i).copied().unwrap_or(8);
         let val = values.get(i).map(|s| s.as_str()).unwrap_or("");
         spans.push(Span::styled(fit(val, w), value_style));
     }
 
     let used: usize = spans.iter().map(|s| s.width()).sum();
-    if used < inner_width {
-        spans.push(Span::styled(" ".repeat(inner_width - used), ts.bg));
+    if used < layout.inner_width {
+        spans.push(Span::styled(" ".repeat(layout.inner_width - used), ts.bg));
     }
     spans
 }
 
 fn build_data_row_spans(
     values: &[String],
-    col_widths: &[usize],
-    col_aligns: &[Alignment],
-    hidden: &[bool],
-    col_start: usize,
-    col_end: usize,
-    inner_width: usize,
+    layout: &ColLayout,
     ts: &TableStyles,
-    is_cursor_row: bool,
-    cursor_col: Option<usize>,
-    search: Option<&regex::Regex>,
-    thousands_separators: bool,
+    ctx: &DataRowCtx,
 ) -> Vec<Span<'static>> {
     // Row highlight is BG only (bold widens glyphs and breaks alignment).
     // Cell highlight is a brighter BG overlaid only on the cursor column.
-    let row_bg = Color::Rgb(40, 60, 90);
-    let cell_bg = Color::Rgb(70, 100, 140);
-    let match_fg = Color::Black;
-    let match_bg = Color::Yellow;
-    let base_bg = if is_cursor_row {
+    let t = theme();
+    let row_bg = t.parquet_cursor_row_bg;
+    let cell_bg = t.parquet_cursor_cell_bg;
+    let match_fg = t.search_label_fg;
+    let match_bg = t.search_label_bg;
+    let base_bg = if ctx.is_cursor_row {
         row_bg
     } else {
         ts.bg.bg.unwrap_or(Color::Reset)
@@ -905,17 +920,17 @@ fn build_data_row_spans(
     let mut spans: Vec<Span<'static>> = Vec::new();
     spans.push(Span::styled(" ", row_bg_style));
     let mut first_visible = true;
-    for i in col_start..col_end {
-        if hidden.get(i).copied().unwrap_or(false) {
+    for i in layout.col_start..layout.col_end {
+        if layout.hidden.get(i).copied().unwrap_or(false) {
             continue;
         }
-        let is_cursor_cell = is_cursor_row && cursor_col == Some(i);
+        let is_cursor_cell = ctx.is_cursor_row && ctx.cursor_col == Some(i);
         let col_bg = if is_cursor_cell { cell_bg } else { base_bg };
         if !first_visible {
             spans.push(Span::styled(" | ", ts.sep.bg(base_bg)));
         }
         first_visible = false;
-        let w = col_widths.get(i).copied().unwrap_or(8);
+        let w = layout.col_widths.get(i).copied().unwrap_or(8);
         let val = values.get(i).map(|s| s.as_str()).unwrap_or("");
         let fg_style = if val == "null" { ts.null } else { ts.data };
         // Null renders left-aligned regardless of column type so "null" reads
@@ -923,13 +938,13 @@ fn build_data_row_spans(
         let align = if val == "null" {
             Alignment::Left
         } else {
-            col_aligns.get(i).copied().unwrap_or(Alignment::Left)
+            ctx.col_aligns.get(i).copied().unwrap_or(Alignment::Left)
         };
         // Apply thousands separators only for right-aligned (numeric) cells
         // when the viewer's global toggle is on. Non-integer values pass
         // through `format_with_thousands` unchanged.
         let display_val: String =
-            if thousands_separators && align == Alignment::Right && val != "null" {
+            if ctx.thousands_separators && align == Alignment::Right && val != "null" {
                 format_with_thousands(val)
             } else {
                 val.to_string()
@@ -940,7 +955,7 @@ fn build_data_row_spans(
         // contrast yellow background.
         let mut cell_spans = split_with_matches(
             &fitted,
-            search,
+            ctx.search,
             fg_style.bg(col_bg),
             Style::default().fg(match_fg).bg(match_bg),
         );
@@ -948,8 +963,11 @@ fn build_data_row_spans(
     }
 
     let used: usize = spans.iter().map(|s| s.width()).sum();
-    if used < inner_width {
-        spans.push(Span::styled(" ".repeat(inner_width - used), row_bg_style));
+    if used < layout.inner_width {
+        spans.push(Span::styled(
+            " ".repeat(layout.inner_width - used),
+            row_bg_style,
+        ));
     }
     spans
 }
@@ -971,10 +989,16 @@ fn split_with_matches(
     let mut last = 0usize;
     for m in re.find_iter(text) {
         if m.start() > last {
-            out.push(Span::styled(text[last..m.start()].to_string(), normal_style));
+            out.push(Span::styled(
+                text[last..m.start()].to_string(),
+                normal_style,
+            ));
         }
         if m.start() < m.end() {
-            out.push(Span::styled(text[m.start()..m.end()].to_string(), match_style));
+            out.push(Span::styled(
+                text[m.start()..m.end()].to_string(),
+                match_style,
+            ));
         } else {
             // Zero-width match (e.g. regex "a*" on empty): advance past it to
             // avoid infinite loop; don't emit a highlight span.
