@@ -140,9 +140,17 @@ fn render_tree(frame: &mut Frame, area: Rect, state: &mut ParquetViewerState) {
     let paragraph = Paragraph::new(lines).block(block);
     frame.render_widget(paragraph, area);
 
-    // Hint bar
-    let hint = " Up/Dn: Navigate | Enter/Right: Expand | Left: Collapse | Tab: Table View | g: Go to | q/Esc: Close ";
-    render_hint(frame, area, hint);
+    // Hint bar. When search is open we show the live prompt so the user can
+    // see what they're typing; same treatment as the Table view.
+    let hint_text = if state.search_is_input_open() {
+        let q = state.search.as_ref().map(|s| s.query()).unwrap_or("");
+        format!(" /{} (Enter=find, Esc=cancel) ", q)
+    } else if let Some(ref msg) = state.status {
+        format!(" {} ", msg)
+    } else {
+        " Up/Dn: Navigate | Enter/Right: Expand | Left: Collapse | /: Search | Tab: Table View | g: Go to | q/Esc: Close ".to_string()
+    };
+    render_hint(frame, area, &hint_text);
 }
 
 // ---------------------------------------------------------------------------
