@@ -144,7 +144,6 @@ pub struct TableSearch {
     pub input: crate::text_input::TextInput,
     /// True while the user is typing the query; false once accepted with Enter.
     pub input_open: bool,
-    pub last_match_row: Option<usize>,
     /// Cached compiled regex plus the query string it was built from.
     /// Rebuilt lazily from `query()` when the query changes; looked up from
     /// render on every row, so this avoids ~100 recompilations per keystroke.
@@ -887,7 +886,6 @@ impl ParquetViewerState {
         self.search = Some(TableSearch {
             input: crate::text_input::TextInput::new(String::new()),
             input_open: true,
-            last_match_row: None,
             cached_regex: std::cell::RefCell::new(None),
         });
     }
@@ -958,7 +956,6 @@ impl ParquetViewerState {
         self.search = Some(TableSearch {
             input: crate::text_input::TextInput::new(pattern.clone()),
             input_open: false,
-            last_match_row: None,
             cached_regex: std::cell::RefCell::new(None),
         });
         let start = if reverse {
@@ -1145,9 +1142,6 @@ impl ParquetViewerState {
                 self.table_cursor_row = row;
                 self.ensure_cursor_visible();
                 self.ensure_table_data();
-                if let Some(s) = &mut self.search {
-                    s.last_match_row = Some(row);
-                }
                 self.status = if wrapped {
                     Some(format!("Match (wrapped) at row {}", row + 1))
                 } else {
