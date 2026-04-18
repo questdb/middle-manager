@@ -798,13 +798,14 @@ fn render_goto_line_dialog(frame: &mut Frame, dlg: &crate::app::GotoLineDialogSt
         (" Go to Line ", "Line[:Col]:")
     };
 
-    // Layout (inner rows):
+    // Layout (inner rows) — matches the F7 Search dialog's spacing:
     //   y=1  label
     //   y=2  input field
-    //   y=3  separator
-    //   y=4  buttons
-    // + 2 rows of border → dialog_height = 7
-    let layout = dialog_helpers::render_dialog_frame(frame, title, 44, 7);
+    //   y=3  (blank — breathing room between input and separator)
+    //   y=4  separator
+    //   y=5  buttons
+    // + 2 rows of border → dialog_height = 8
+    let layout = dialog_helpers::render_dialog_frame(frame, title, 44, 8);
     let (normal, highlight, input_normal) = dialog_helpers::dialog_styles();
     let t = theme();
 
@@ -836,19 +837,19 @@ fn render_goto_line_dialog(frame: &mut Frame, dlg: &crate::app::GotoLineDialogSt
         layout.cw,
     );
 
-    // y=3: separator above the button row
+    // y=4: separator above the button row (y=3 is left blank on purpose).
     dialog_helpers::render_separator(
         frame,
         layout.area,
-        layout.inner.y + 3,
+        layout.inner.y + 4,
         t.dialog_border_style(),
     );
 
-    // y=4: buttons
+    // y=5: buttons
     dialog_helpers::render_buttons(
         frame,
         layout.content,
-        4,
+        5,
         &[
             ("{ Go }", dlg.focused == GotoLineDialogField::ButtonOk),
             (
