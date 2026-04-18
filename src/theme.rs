@@ -296,8 +296,11 @@ impl Theme {
             dialog_hint_fg: text_very_dim,
             selected_fg: pink_light,
             selected_highlight_fg: Color::Rgb(26, 21, 32), // dark bg text on magenta highlight
-            input_selection_fg: text,
-            input_selection_bg: Color::Rgb(74, 56, 96), // muted purple selection
+            input_selection_fg: Color::White,
+            // Magenta — must contrast against `dialog_input_bg` (which is
+            // `selection`, a near-identical muted purple). Without this the
+            // selected range is invisible inside a focused TextInput.
+            input_selection_bg: magenta,
             viewer_line_num_fg: magenta,
             viewer_text_fg: text,
             viewer_hint_fg: bg,
