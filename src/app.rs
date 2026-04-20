@@ -61,8 +61,10 @@ pub struct App {
     pub ci_panel_areas: [Option<Rect>; 2],
     pub shell_panel_areas: [Option<Rect>; 2],
     last_click: Option<(Instant, u16, u16, u8)>,
-    /// Go-to-line prompt state. When Some, an input overlay is shown.
-    pub goto_line_input: Option<String>,
+    /// Go-to-line / go-to-offset dialog state. When Some, an overlay is shown.
+    /// Structured like the F7 Search dialog: labelled `TextInput` + confirm
+    /// and cancel buttons, with Tab/Shift+Tab focus cycling.
+    pub goto_line_dialog: Option<GotoLineDialogState>,
     /// Set to true when the UI needs a full terminal clear (e.g. leaving full-screen mode).
     pub needs_clear: bool,
     /// Search dialog overlay (shown on top of editor).
@@ -781,6 +783,52 @@ impl SearchDialogField {
             Self::CaseSensitive => Self::Direction,
             Self::ButtonFind => Self::CaseSensitive,
             Self::ButtonCancel => Self::ButtonFind,
+        }
+    }
+}
+
+// --- Go to Line / Offset dialog ---
+
+#[derive(Clone)]
+pub struct GotoLineDialogState {
+    pub input: TextInput,
+    pub focused: GotoLineDialogField,
+    /// When true, the dialog accepts hex digits (for the hex viewer's goto-
+    /// offset); otherwise decimal digits + `:` for the editor's
+    /// goto-line[:col].
+    pub is_hex: bool,
+}
+
+impl GotoLineDialogState {
+    pub fn new(is_hex: bool) -> Self {
+        Self {
+            input: TextInput::new(String::new()),
+            focused: GotoLineDialogField::Input,
+            is_hex,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+pub enum GotoLineDialogField {
+    Input,
+    ButtonOk,
+    ButtonCancel,
+}
+
+impl GotoLineDialogField {
+    pub fn next(self) -> Self {
+        match self {
+            Self::Input => Self::ButtonOk,
+            Self::ButtonOk => Self::ButtonCancel,
+            Self::ButtonCancel => Self::Input,
+        }
+    }
+    pub fn prev(self) -> Self {
+        match self {
+            Self::Input => Self::ButtonCancel,
+            Self::ButtonOk => Self::Input,
+            Self::ButtonCancel => Self::ButtonOk,
         }
     }
 }
@@ -1755,7 +1803,7 @@ impl App {
             ci_panel_areas: [None, None],
             shell_panel_areas: [None, None],
             last_click: None,
-            goto_line_input: None,
+            goto_line_dialog: None,
             needs_clear: false,
             search_dialog: None,
             unsaved_dialog: None,
@@ -2203,13 +2251,41 @@ impl App {
             };
         }
 
-        // Goto-line prompt intercepts keys
-        if self.goto_line_input.is_some() {
+        // Goto-line dialog intercepts keys. Accepts hex digits (plus `x`/`X`
+        // for the `0x` prefix) when opened from the hex viewer; decimal
+        // digits and `:` for the line[:col] form otherwise. Layout mirrors
+        // the F7 Search dialog: input + { OK } [ Cancel ] buttons with
+        // Tab/Shift+Tab focus cycling.
+        if let Some(ref dlg) = self.goto_line_dialog {
+            let is_hex = dlg.is_hex;
+            let on_input = dlg.focused == GotoLineDialogField::Input;
+            let on_buttons = matches!(
+                dlg.focused,
+                GotoLineDialogField::ButtonOk | GotoLineDialogField::ButtonCancel
+            );
             return match key.code {
                 KeyCode::Esc => Action::DialogCancel,
                 KeyCode::Enter => Action::DialogConfirm,
-                KeyCode::Backspace => Action::DialogBackspace,
-                KeyCode::Char(c) if c.is_ascii_digit() || c == ':' => Action::DialogInput(c),
+                KeyCode::Tab => Action::MoveDown,
+                KeyCode::BackTab => Action::MoveUp,
+                KeyCode::Left if on_buttons => Action::SwitchPanelReverse,
+                KeyCode::Right if on_buttons => Action::SwitchPanel,
+                KeyCode::Down if on_input => Action::MoveDown,
+                KeyCode::Up if on_buttons => Action::MoveUp,
+                // Input-field editing keys (only active when the input is focused)
+                KeyCode::Backspace if on_input => Action::DialogBackspace,
+                KeyCode::Delete if on_input => Action::EditorDeleteForward,
+                KeyCode::Left if on_input => Action::CursorLeft,
+                KeyCode::Right if on_input => Action::CursorRight,
+                KeyCode::Home if on_input => Action::CursorLineStart,
+                KeyCode::End if on_input => Action::CursorLineEnd,
+                KeyCode::Char(c)
+                    if on_input
+                        && ((is_hex && (c.is_ascii_hexdigit() || c == 'x' || c == 'X'))
+                            || (!is_hex && (c.is_ascii_digit() || c == ':'))) =>
+                {
+                    Action::DialogInput(c)
+                }
                 _ => Action::None,
             };
         }
@@ -3428,14 +3504,47 @@ impl App {
 
     fn map_parquet_key(&self, key: KeyEvent) -> Action {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+
+        // If the parquet search input is open, characters feed the query;
+        // Enter accepts it; Esc cancels.
+        if let AppMode::ParquetViewing(ref p) = self.mode {
+            if p.search_is_input_open() {
+                return match key.code {
+                    KeyCode::Char(c) => Action::ParquetSearchChar(c),
+                    KeyCode::Backspace => Action::ParquetSearchBackspace,
+                    KeyCode::Enter => Action::ParquetSearchAccept,
+                    KeyCode::Esc => Action::ParquetSearchCancel,
+                    _ => Action::None,
+                };
+            }
+        }
+
+        // Ctrl-modified keys take precedence over any plain-letter bindings.
+        // Unmatched Ctrl chords fall through rather than returning `Action::None`,
+        // so Ctrl+C / Ctrl+Q and other well-known chords aren't silently eaten.
+        if ctrl {
+            match key.code {
+                KeyCode::Char('a') => return Action::ParquetSelectAll,
+                KeyCode::Char('i') => return Action::ParquetInvertSelection,
+                KeyCode::Char('u') => return Action::ParquetHalfPageUp,
+                KeyCode::Char('d') => return Action::ParquetHalfPageDown,
+                _ => {}
+            }
+        }
+
         match key.code {
             // Opt+a/e on Mac → top/bottom of file (reliable across all terminals)
             KeyCode::Char('a') if alt => Action::MoveToTop,
             KeyCode::Char('e') if alt => Action::MoveToBottom,
             KeyCode::Up => Action::MoveUp,
             KeyCode::Down => Action::MoveDown,
+            KeyCode::Left if shift => Action::ParquetPageLeft,
+            KeyCode::Right if shift => Action::ParquetPageRight,
             KeyCode::Left => Action::CursorLeft,
             KeyCode::Right => Action::CursorRight,
+            KeyCode::Enter if shift => Action::ParquetRowDetail,
             KeyCode::Enter => Action::Enter,
             KeyCode::PageUp => Action::PageUp,
             KeyCode::PageDown => Action::PageDown,
@@ -3443,6 +3552,36 @@ impl App {
             KeyCode::End => Action::MoveToBottom,
             KeyCode::Tab => Action::Toggle,
             KeyCode::Char('g') => Action::GotoLinePrompt,
+            KeyCode::Char('/') => Action::ParquetSearchOpen,
+            KeyCode::Char('n') if shift => Action::ParquetSearchPrev,
+            KeyCode::Char('N') => Action::ParquetSearchPrev,
+            KeyCode::Char('n') => Action::ParquetSearchNext,
+            KeyCode::Char('Y') => Action::ParquetCopyRow,
+            KeyCode::Char('y') => Action::ParquetCopyCell,
+            KeyCode::Char('E') => Action::ParquetExportCsvAll,
+            KeyCode::Char('e') => Action::ParquetExportCsv,
+            KeyCode::Char(']') => Action::ParquetNextRowGroup,
+            KeyCode::Char('[') => Action::ParquetPrevRowGroup,
+            KeyCode::Char(' ') => Action::ParquetToggleSelect,
+            KeyCode::Char('a') => Action::ParquetClearSelect,
+            KeyCode::Char('c') => Action::ParquetCopyColumn,
+            KeyCode::Char('w') => Action::ParquetColWiden,
+            KeyCode::Char('W') => Action::ParquetColNarrow,
+            KeyCode::Char('=') => Action::ParquetColReset,
+            KeyCode::Char('f') => Action::ParquetColFreezeToggle,
+            KeyCode::Char('j') => Action::ParquetCopyRowJson,
+            KeyCode::Char('J') => Action::ParquetExportNdjson,
+            KeyCode::Char('h') => Action::ParquetColHide,
+            KeyCode::Char('H') => Action::ParquetColUnhideAll,
+            KeyCode::Char('^') => Action::ParquetColFirst,
+            KeyCode::Char('$') => Action::ParquetColLast,
+            KeyCode::Char('~') => Action::ParquetColAutofit,
+            KeyCode::Char('i') => Action::ParquetColInfo,
+            KeyCode::Char('R') => Action::ParquetReload,
+            KeyCode::Char(',') => Action::ParquetToggleThousands,
+            KeyCode::Char('*') => Action::ParquetSearchCurrentForward,
+            KeyCode::Char('#') => Action::ParquetSearchCurrentBackward,
+            KeyCode::Char('s') => Action::ParquetCycleSort,
             KeyCode::Char('q') | KeyCode::Esc => Action::DialogCancel,
             _ => Action::None,
         }
@@ -4019,7 +4158,7 @@ impl App {
         }
 
         // Go-to-line prompt intercepts all input when active
-        if self.goto_line_input.is_some() {
+        if self.goto_line_dialog.is_some() {
             self.handle_goto_line_action(action);
             return;
         }
@@ -4453,7 +4592,7 @@ impl App {
                 }
                 Action::GotoLinePrompt => {
                     if matches!(self.mode, AppMode::DiffViewing(_)) {
-                        self.goto_line_input = Some(String::new());
+                        self.goto_line_dialog = Some(GotoLineDialogState::new(false));
                     }
                     return;
                 }
@@ -4521,7 +4660,7 @@ impl App {
             Action::GotoLinePrompt => {
                 // Only works in hex/editor/parquet modes
                 if matches!(self.mode, AppMode::ParquetViewing(_) | AppMode::Editing(_)) {
-                    self.goto_line_input = Some(String::new());
+                    self.goto_line_dialog = Some(GotoLineDialogState::new(false));
                 }
             }
             Action::EditBuiltin => self.handle_edit_builtin(),
@@ -4533,6 +4672,229 @@ impl App {
             Action::CursorRight => {
                 if let AppMode::ParquetViewing(ref mut p) = self.mode {
                     p.scroll_right();
+                }
+            }
+            Action::ParquetPageLeft => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.page_left();
+                }
+            }
+            Action::ParquetPageRight => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.page_right();
+                }
+            }
+            Action::ParquetSearchOpen => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_open();
+                }
+            }
+            Action::ParquetSearchChar(c) => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_input_char(c);
+                }
+            }
+            Action::ParquetSearchBackspace => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_input_backspace();
+                }
+            }
+            Action::ParquetSearchAccept => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_input_accept();
+                }
+            }
+            Action::ParquetSearchCancel => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_input_cancel();
+                }
+            }
+            Action::ParquetSearchNext => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_next();
+                }
+            }
+            Action::ParquetSearchPrev => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_prev();
+                }
+            }
+            Action::ParquetCopyCell => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    if let Some(s) = p.clipboard_selection() {
+                        crate::clipboard::copy(&s);
+                        p.set_status("Copied");
+                    }
+                }
+            }
+            Action::ParquetCopyRow => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    if let Some(s) = p.clipboard_row_tsv() {
+                        crate::clipboard::copy(&s);
+                        p.set_status("Copied row");
+                    }
+                }
+            }
+            Action::ParquetRowDetail => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.activate_row_detail();
+                }
+            }
+            Action::ParquetExportCsv => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    match p.export_current_row_group_csv() {
+                        Ok(path) => p.set_status(format!("Exported → {}", path.display())),
+                        Err(e) => p.set_status(format!("Export failed: {}", e)),
+                    }
+                }
+            }
+            Action::ParquetExportCsvAll => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    match p.export_full_file_csv() {
+                        Ok(path) => p.set_status(format!("Exported all → {}", path.display())),
+                        Err(e) => p.set_status(format!("Export failed: {}", e)),
+                    }
+                }
+            }
+            Action::ParquetNextRowGroup => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.next_row_group();
+                }
+            }
+            Action::ParquetPrevRowGroup => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.prev_row_group();
+                }
+            }
+            Action::ParquetToggleSelect => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.toggle_row_selection();
+                }
+            }
+            Action::ParquetClearSelect => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.clear_row_selection();
+                }
+            }
+            Action::ParquetCopyColumn => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    if let Some((s, n)) = p.clipboard_column_values() {
+                        crate::clipboard::copy(&s);
+                        p.set_status(format!("Copied {} values", n));
+                    }
+                }
+            }
+            Action::ParquetColWiden => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.widen_current_column();
+                }
+            }
+            Action::ParquetColNarrow => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.narrow_current_column();
+                }
+            }
+            Action::ParquetColReset => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.reset_column_widths();
+                }
+            }
+            Action::ParquetColFreezeToggle => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.toggle_column_freeze();
+                }
+            }
+            Action::ParquetCopyRowJson => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    if let Some(s) = p.clipboard_row_json() {
+                        crate::clipboard::copy(&s);
+                        p.set_status("Copied row JSON");
+                    }
+                }
+            }
+            Action::ParquetExportNdjson => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    match p.export_full_file_ndjson() {
+                        Ok(path) => p.set_status(format!("Exported NDJSON → {}", path.display())),
+                        Err(e) => p.set_status(format!("Export failed: {}", e)),
+                    }
+                }
+            }
+            Action::ParquetColHide => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.hide_current_column();
+                }
+            }
+            Action::ParquetColUnhideAll => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.unhide_all_columns();
+                }
+            }
+            Action::ParquetColFirst => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.jump_to_first_column();
+                }
+            }
+            Action::ParquetColLast => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.jump_to_last_column();
+                }
+            }
+            Action::ParquetColAutofit => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.autofit_current_column();
+                }
+            }
+            Action::ParquetColInfo => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.open_column_info();
+                }
+            }
+            Action::ParquetReload => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    if let Err(e) = p.reload() {
+                        p.set_status(format!("Reload failed: {}", e));
+                    }
+                }
+            }
+            Action::ParquetToggleThousands => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.toggle_thousands_separators();
+                }
+            }
+            Action::ParquetSelectAll => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.select_all_rows();
+                }
+            }
+            Action::ParquetInvertSelection => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.invert_row_selection();
+                }
+            }
+            Action::ParquetSearchCurrentForward => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_current_cell(false);
+                }
+            }
+            Action::ParquetSearchCurrentBackward => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.search_current_cell(true);
+                }
+            }
+            Action::ParquetHalfPageUp => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.half_page_up();
+                }
+            }
+            Action::ParquetHalfPageDown => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.half_page_down();
+                }
+            }
+            Action::ParquetCycleSort => {
+                if let AppMode::ParquetViewing(ref mut p) = self.mode {
+                    p.cycle_sort();
                 }
             }
             Action::CursorLineStart
@@ -4898,9 +5260,9 @@ impl App {
     }
 
     fn handle_enter(&mut self) {
-        // Parquet: Enter toggles expand/collapse
+        // Parquet: Enter activates (expand tree node / open row detail / close popup)
         if let AppMode::ParquetViewing(ref mut p) = self.mode {
-            p.toggle_expand();
+            p.activate();
             return;
         }
 
@@ -5070,39 +5432,94 @@ impl App {
     }
 
     fn handle_goto_line_action(&mut self, action: Action) {
-        let is_hex = matches!(self.mode, AppMode::HexViewing(_));
         match action {
             Action::DialogCancel => {
-                self.goto_line_input = None;
+                self.goto_line_dialog = None;
             }
             Action::DialogConfirm | Action::EditorNewline | Action::Enter => {
-                if let Some(input) = self.goto_line_input.take() {
-                    if is_hex {
+                // Confirm only when OK or Input is focused; Cancel button
+                // treats Enter as cancellation.
+                let confirm = matches!(
+                    self.goto_line_dialog.as_ref().map(|d| d.focused),
+                    Some(GotoLineDialogField::Input | GotoLineDialogField::ButtonOk)
+                );
+                if !confirm {
+                    self.goto_line_dialog = None;
+                    return;
+                }
+                if let Some(dlg) = self.goto_line_dialog.take() {
+                    if dlg.is_hex {
                         if let AppMode::HexViewing(ref mut h) = self.mode {
-                            if let Err(e) = h.goto_offset(&input) {
+                            if let Err(e) = h.goto_offset(&dlg.input.text) {
                                 h.status_msg = Some(e);
                             }
                         }
                     } else {
-                        self.goto_line_col(&input);
+                        self.goto_line_col(&dlg.input.text);
                     }
                 }
             }
+            // Tab / Shift+Tab cycle focus through input → OK → Cancel
+            Action::MoveDown => {
+                if let Some(ref mut dlg) = self.goto_line_dialog {
+                    dlg.focused = dlg.focused.next();
+                }
+            }
+            Action::MoveUp => {
+                if let Some(ref mut dlg) = self.goto_line_dialog {
+                    dlg.focused = dlg.focused.prev();
+                }
+            }
+            // Left/Right on buttons swaps between OK and Cancel
+            Action::SwitchPanel | Action::SwitchPanelReverse => {
+                if let Some(ref mut dlg) = self.goto_line_dialog {
+                    dlg.focused = match dlg.focused {
+                        GotoLineDialogField::ButtonOk => GotoLineDialogField::ButtonCancel,
+                        GotoLineDialogField::ButtonCancel => GotoLineDialogField::ButtonOk,
+                        other => other,
+                    };
+                }
+            }
             Action::DialogInput(c) => {
-                let valid = if is_hex {
-                    c.is_ascii_hexdigit() || c == 'x' || c == 'X'
-                } else {
-                    c.is_ascii_digit() || c == ':'
-                };
-                if valid {
-                    if let Some(ref mut input) = self.goto_line_input {
-                        input.push(c);
+                if let Some(ref mut dlg) = self.goto_line_dialog {
+                    let valid = if dlg.is_hex {
+                        c.is_ascii_hexdigit() || c == 'x' || c == 'X'
+                    } else {
+                        c.is_ascii_digit() || c == ':'
+                    };
+                    if valid {
+                        dlg.input.insert_char(c);
                     }
                 }
             }
             Action::DialogBackspace => {
-                if let Some(ref mut input) = self.goto_line_input {
-                    input.pop();
+                if let Some(ref mut dlg) = self.goto_line_dialog {
+                    dlg.input.backspace();
+                }
+            }
+            Action::EditorDeleteForward => {
+                if let Some(ref mut dlg) = self.goto_line_dialog {
+                    dlg.input.delete_forward();
+                }
+            }
+            Action::CursorLeft => {
+                if let Some(ref mut dlg) = self.goto_line_dialog {
+                    dlg.input.move_left();
+                }
+            }
+            Action::CursorRight => {
+                if let Some(ref mut dlg) = self.goto_line_dialog {
+                    dlg.input.move_right();
+                }
+            }
+            Action::CursorLineStart => {
+                if let Some(ref mut dlg) = self.goto_line_dialog {
+                    dlg.input.move_home();
+                }
+            }
+            Action::CursorLineEnd => {
+                if let Some(ref mut dlg) = self.goto_line_dialog {
+                    dlg.input.move_end();
                 }
             }
             _ => {}
@@ -5965,7 +6382,7 @@ impl App {
                 }
             }
             Action::GotoLinePrompt => {
-                self.goto_line_input = Some(String::new());
+                self.goto_line_dialog = Some(GotoLineDialogState::new(true));
             }
             Action::SearchPrompt => {
                 // Open search dialog with last hex search pre-filled
@@ -6150,7 +6567,7 @@ impl App {
                 }
             }
             Action::GotoLinePrompt => {
-                self.goto_line_input = Some(String::new());
+                self.goto_line_dialog = Some(GotoLineDialogState::new(false));
             }
             Action::DialogCancel => {
                 let modified = matches!(self.mode, AppMode::Editing(ref e) if e.modified);
@@ -6387,13 +6804,9 @@ impl App {
                 } else {
                     None
                 };
-                if let Some(mut params) = params {
-                    params.direction = if action == Action::FindNext {
-                        SearchDirection::Forward
-                    } else {
-                        SearchDirection::Backward
-                    };
-                    self.do_find(params, false);
+                if let Some(params) = params {
+                    let repeat = params.repeat(action == Action::FindPrev);
+                    self.do_find(repeat, false);
                 } else if let AppMode::Editing(ref mut e) = self.mode {
                     e.status_msg = Some("No previous search".to_string());
                 }
@@ -6795,8 +7208,9 @@ impl App {
     }
 
     /// Run a non-wrapping search. If not found, show the wrap confirmation dialog.
-    /// When `save` is true, updates `last_search` (used by the dialog). FindNext/FindPrev
-    /// pass false so they don't overwrite the dialog's direction setting.
+    /// `save` updates `last_search` — only the dialog-confirm path sets it; a
+    /// FindNext/FindPrev repeat keeps the dialog's original params intact so
+    /// later repeats keep reading from the same baseline direction.
     fn do_find(&mut self, params: crate::editor::SearchParams, save: bool) {
         if let AppMode::Editing(ref mut e) = self.mode {
             if save {
@@ -9605,7 +10019,8 @@ impl App {
             e.click_at(col, row);
             return;
         }
-        if matches!(self.mode, AppMode::ParquetViewing(_)) {
+        if let AppMode::ParquetViewing(ref mut p) = self.mode {
+            p.click_at(col, row);
             return;
         }
         // Diff viewer: click positions cursor on left or right side
@@ -10017,6 +10432,12 @@ impl App {
     }
 
     fn handle_dialog_cancel(&mut self) {
+        // Let the parquet viewer swallow Esc when a row-detail popup is open.
+        if let AppMode::ParquetViewing(ref mut p) = self.mode {
+            if p.close_popup_if_open() {
+                return;
+            }
+        }
         match &self.mode {
             AppMode::ParquetViewing(_) | AppMode::DiffViewing(_) => {
                 self.mode = AppMode::Normal;

@@ -1217,6 +1217,7 @@ dependencies = [
  "portable-pty",
  "quick-xml",
  "ratatui",
+ "regex",
  "serde",
  "serde_json",
  "tar",

@@ -82,7 +82,6 @@ pub struct Theme {
     pub dialog_text_fg: Color,
     pub dialog_input_fg: Color,
     pub dialog_prompt_fg: Color,
-    pub dialog_cursor_fg: Color,
     pub dialog_input_fg_focused: Color,
     pub dialog_input_bg: Color,
     pub dialog_hint_fg: Color,
@@ -136,6 +135,14 @@ pub struct Theme {
     pub git_conflict_fg: Color,
     pub git_renamed_fg: Color,
     pub git_branch_fg: Color,
+    // Parquet viewer table
+    pub parquet_gutter_fg: Color,
+    pub parquet_cursor_gutter_fg: Color,
+    pub parquet_cursor_row_bg: Color,
+    pub parquet_cursor_cell_bg: Color,
+    pub parquet_selected_row_fg: Color,
+    pub parquet_indicator_fg: Color,
+    pub parquet_popup_cont_fg: Color,
 }
 
 impl Theme {
@@ -180,7 +187,6 @@ impl Theme {
             dialog_text_fg: Color::Black,
             dialog_input_fg: Color::Black,
             dialog_prompt_fg: Color::Yellow,
-            dialog_cursor_fg: Color::Black,
             dialog_input_fg_focused: Color::White,
             dialog_input_bg: Color::Rgb(0, 128, 128),
             dialog_hint_fg: Color::DarkGray,
@@ -228,6 +234,13 @@ impl Theme {
             git_conflict_fg: Color::LightRed,
             git_renamed_fg: Color::Magenta,
             git_branch_fg: Color::LightGreen,
+            parquet_gutter_fg: Color::DarkGray,
+            parquet_cursor_gutter_fg: Color::White,
+            parquet_cursor_row_bg: Color::Rgb(40, 60, 90),
+            parquet_cursor_cell_bg: Color::Rgb(70, 100, 140),
+            parquet_selected_row_fg: Color::LightGreen,
+            parquet_indicator_fg: Color::Yellow,
+            parquet_popup_cont_fg: Color::Gray,
         }
     }
 
@@ -278,14 +291,16 @@ impl Theme {
             dialog_text_fg: text,
             dialog_input_fg: text,
             dialog_prompt_fg: rose,
-            dialog_cursor_fg: text,
             dialog_input_fg_focused: Color::White,
             dialog_input_bg: selection,
             dialog_hint_fg: text_very_dim,
             selected_fg: pink_light,
             selected_highlight_fg: Color::Rgb(26, 21, 32), // dark bg text on magenta highlight
-            input_selection_fg: text,
-            input_selection_bg: Color::Rgb(74, 56, 96), // muted purple selection
+            input_selection_fg: Color::White,
+            // Magenta — must contrast against `dialog_input_bg` (which is
+            // `selection`, a near-identical muted purple). Without this the
+            // selected range is invisible inside a focused TextInput.
+            input_selection_bg: magenta,
             viewer_line_num_fg: magenta,
             viewer_text_fg: text,
             viewer_hint_fg: bg,
@@ -326,6 +341,13 @@ impl Theme {
             git_conflict_fg: red,
             git_renamed_fg: purple_light,
             git_branch_fg: green,
+            parquet_gutter_fg: text_very_dim,
+            parquet_cursor_gutter_fg: text,
+            parquet_cursor_row_bg: selection,
+            parquet_cursor_cell_bg: magenta,
+            parquet_selected_row_fg: green,
+            parquet_indicator_fg: pink_light,
+            parquet_popup_cont_fg: text_dim,
         }
     }
 }

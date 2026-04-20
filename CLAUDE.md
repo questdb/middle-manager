@@ -18,16 +18,16 @@ cargo test test_name           # single test
 cargo test test_name -- --nocapture  # with stdout
 cargo fmt --check              # format check
 cargo fmt                      # format fix
-cargo clippy -- -D warnings    # lint (CI enforces -D warnings)
+cargo clippy --all-targets     # lint (no -D warnings — see "Fixing issues")
 ```
 
-CI runs: fmt check, clippy with `-D warnings`, tests on both Ubuntu and macOS.
+CI runs: fmt check, clippy, tests on both Ubuntu and macOS.
 
 ## Fixing issues
 
 Fix every issue you encounter, even if it's pre-existing and unrelated to your current task — do not leave broken clippy lints, failing tests, fmt drift, or compiler warnings for a later PR. If CI is red because of a problem that exists on master, fix it here rather than skipping it. Scope creep from a few mechanical fixes is cheaper than a persistently red main branch.
 
-`cargo clippy -- -D warnings` is not good enough — it only checks the default (bin) target. Always verify with `cargo clippy --all-targets -- -D warnings` so test-code lints are not missed, and fix anything it surfaces.
+Do **not** pass `-D warnings` to clippy when you run it locally. Run plain `cargo clippy --all-targets` so warnings surface without aborting the build on the first hit — that lets you read the full list and fix them together. Every reported warning still needs to be fixed before the change lands, because CI does treat warnings as errors; "the command exited 0 without `-D`" is not a substitute for a clean warning-free output.
 
 ## Architecture
 

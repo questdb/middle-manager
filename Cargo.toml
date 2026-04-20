@@ -32,6 +32,7 @@ ignore = "0.4"
 grep-regex = "0.1"
 grep-searcher = "0.1"
 grep-matcher = "0.1"
+regex = "1"
 parquet2 = { git = "https://github.com/questdb/parquet2", branch = "main" }
 tar = "0.4"
 flate2 = "1"
