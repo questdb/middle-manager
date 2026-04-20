@@ -3697,4 +3697,123 @@ mod tests {
             needle1
         );
     }
+
+    // ---------------------------------------------------------------
+    // Shift+PageUp / Shift+PageDown regression tests
+    //
+    // These guard against three past failure modes:
+    //   1. the selection anchor not being set (cursor moves, nothing
+    //      becomes selected),
+    //   2. the cursor not actually advancing by a page,
+    //   3. existing selection being clobbered instead of extended.
+    // ---------------------------------------------------------------
+
+    fn make_lines(n: usize) -> String {
+        let mut s = String::with_capacity(n * 4);
+        for i in 0..n {
+            s.push_str(&format!("L{:03}\n", i));
+        }
+        s
+    }
+
+    #[test]
+    fn select_page_down_sets_anchor_and_advances_cursor() {
+        let mut e = create_test_editor(&make_lines(200));
+        e.visible_lines = 20;
+        e.cursor_line = 5;
+        e.cursor_col = 0;
+        assert!(e.selection_anchor.is_none());
+
+        e.select_page_down();
+
+        assert_eq!(
+            e.selection_anchor,
+            Some((5, 0)),
+            "anchor must be set to the cursor position before the jump",
+        );
+        assert_eq!(
+            e.cursor_line, 25,
+            "cursor must advance by visible_lines (one page)",
+        );
+        assert!(
+            e.selection_range().is_some(),
+            "a selection must exist after select_page_down",
+        );
+    }
+
+    #[test]
+    fn select_page_up_sets_anchor_and_retreats_cursor() {
+        let mut e = create_test_editor(&make_lines(200));
+        e.visible_lines = 20;
+        e.cursor_line = 100;
+        e.cursor_col = 0;
+
+        e.select_page_up();
+
+        assert_eq!(e.selection_anchor, Some((100, 0)));
+        assert_eq!(e.cursor_line, 80);
+        assert!(e.selection_range().is_some());
+    }
+
+    #[test]
+    fn select_page_down_extends_existing_selection() {
+        let mut e = create_test_editor(&make_lines(200));
+        e.visible_lines = 20;
+        e.cursor_line = 5;
+        e.cursor_col = 0;
+        // Pre-seed an anchor one line above cursor: selection is (4..5)
+        e.selection_anchor = Some((4, 0));
+
+        e.select_page_down();
+
+        // Anchor must be preserved — ensure_anchor only sets it if None
+        assert_eq!(
+            e.selection_anchor,
+            Some((4, 0)),
+            "pre-existing anchor must not be clobbered",
+        );
+        assert_eq!(e.cursor_line, 25);
+    }
+
+    #[test]
+    fn select_page_down_clamps_at_end_of_file() {
+        let mut e = create_test_editor(&make_lines(10));
+        e.visible_lines = 20;
+        e.cursor_line = 5;
+        e.cursor_col = 0;
+
+        e.select_page_down();
+
+        assert_eq!(e.selection_anchor, Some((5, 0)));
+        // Clamped to last line (total_virtual_lines - 1)
+        let last = e.total_virtual_lines().saturating_sub(1);
+        assert_eq!(e.cursor_line, last);
+        assert!(e.selection_range().is_some());
+    }
+
+    #[test]
+    fn select_page_up_clamps_at_top_of_file() {
+        let mut e = create_test_editor(&make_lines(200));
+        e.visible_lines = 50;
+        e.cursor_line = 10;
+        e.cursor_col = 0;
+
+        e.select_page_up();
+
+        assert_eq!(e.selection_anchor, Some((10, 0)));
+        assert_eq!(e.cursor_line, 0, "page_up saturates at line 0");
+        assert!(e.selection_range().is_some());
+    }
+
+    #[test]
+    fn clear_selection_resets_after_select_page_down() {
+        let mut e = create_test_editor(&make_lines(200));
+        e.visible_lines = 20;
+        e.cursor_line = 5;
+        e.select_page_down();
+        assert!(e.selection_anchor.is_some());
+
+        e.clear_selection();
+        assert!(e.selection_anchor.is_none());
+    }
 }

@@ -54,7 +54,15 @@ impl EventHandler {
             }
             if event::poll(tick_rate).unwrap_or(false) {
                 let app_event = match event::read() {
-                    Ok(Event::Key(key)) => Some(AppEvent::Key(key)),
+                    Ok(Event::Key(key)) => {
+                        if crate::debug_log::is_enabled() {
+                            crate::debug_log::log(&format!(
+                                "KEY code={:?} mods={:?} kind={:?}",
+                                key.code, key.modifiers, key.kind,
+                            ));
+                        }
+                        Some(AppEvent::Key(key))
+                    }
                     Ok(Event::Mouse(mouse)) => Some(AppEvent::Mouse(mouse)),
                     Ok(Event::Resize(w, h)) => Some(AppEvent::Resize(w, h)),
                     _ => None,

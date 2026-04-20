@@ -3,6 +3,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Cell, Clear, Row, Table};
 use ratatui::Frame;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::app::{FuzzySearchState, GotoPathState};
 use crate::panel::github::PrCheckStatus;
@@ -64,6 +65,40 @@ pub fn render_with_overlays(
     }
 }
 
+/// Compute the horizontal-scroll byte offset and the cursor's display-column
+/// offset within the visible window, given `text`, a byte cursor position,
+/// and the `available` number of terminal columns.
+///
+/// Returns `(visible_start_byte, cursor_col_in_view)`. The cursor is kept
+/// inside the viewport, leaving one column for the caret itself.
+fn compute_scroll(text: &str, cursor: usize, available: usize) -> (usize, usize) {
+    let before = &text[..cursor];
+    let before_w = UnicodeWidthStr::width(before);
+
+    if available == 0 {
+        return (cursor, 0);
+    }
+
+    // Need the cursor to fit: width(before[visible_start..]) + 1 <= available.
+    if before_w < available {
+        return (0, before_w);
+    }
+
+    let need_to_trim = before_w + 1 - available;
+    let mut trimmed = 0usize;
+    let mut visible_start = cursor;
+    for (i, ch) in before.char_indices() {
+        if trimmed >= need_to_trim {
+            visible_start = i;
+            break;
+        }
+        trimmed += UnicodeWidthChar::width(ch).unwrap_or(0);
+        visible_start = i + ch.len_utf8();
+    }
+    let visible_before_w = UnicodeWidthStr::width(&text[visible_start..cursor]);
+    (visible_start, visible_before_w)
+}
+
 /// Shared scrollable text-input bar with prompt, selection, and cursor positioning.
 /// `suffix_spans` are appended after the input text (e.g. result count).
 fn render_input_bar(
@@ -85,25 +120,15 @@ fn render_input_bar(
 
     let text = &input.text;
     let cursor = input.cursor;
-    let before = &text[..cursor];
     let after = &text[cursor..];
 
-    let available = area.width as usize - prompt.len();
-    let before_chars = before.chars().count();
-    let scroll_offset = if before_chars > available {
-        before_chars - available + 1
-    } else {
-        0
-    };
-    let visible_start = if scroll_offset > 0 {
-        before
-            .char_indices()
-            .nth(scroll_offset)
-            .map(|(i, _)| i)
-            .unwrap_or(0)
-    } else {
-        0
-    };
+    // Widths and offsets are computed in terminal columns (display width),
+    // not bytes or chars, so multi-byte chars (e.g. `●`, 3 bytes / 1 col)
+    // and wide chars (e.g. CJK / emoji, 1 char / 2 cols) both position the
+    // cursor correctly.
+    let prompt_w = UnicodeWidthStr::width(prompt);
+    let available = (area.width as usize).saturating_sub(prompt_w);
+    let (visible_start, visible_before_w) = compute_scroll(text, cursor, available);
 
     let mut spans = vec![Span::styled(prompt, prompt_style)];
 
@@ -134,14 +159,13 @@ fn render_input_bar(
                 area,
             );
 
-            let visible_before_cursor = &text[visible_start..cursor];
-            let cursor_x = area.x + prompt.len() as u16 + visible_before_cursor.len() as u16;
+            let cursor_x = area.x + prompt_w as u16 + visible_before_w as u16;
             crate::ui::set_cursor(cursor_x, area.y);
             return;
         }
     }
 
-    let visible_before = &before[visible_start..];
+    let visible_before = &text[visible_start..cursor];
     spans.push(Span::styled(visible_before.to_string(), input_style));
     if !after.is_empty() {
         spans.push(Span::styled(after.to_string(), input_style));
@@ -155,7 +179,7 @@ fn render_input_bar(
         area,
     );
 
-    let cursor_x = area.x + prompt.len() as u16 + visible_before.len() as u16;
+    let cursor_x = area.x + prompt_w as u16 + visible_before_w as u16;
     crate::ui::set_cursor(cursor_x, area.y);
 }
 
@@ -648,5 +672,136 @@ fn header_cell(
         Span::styled(format!("{}{}", name, arrow), style)
     } else {
         Span::styled(name.to_string(), style)
+    }
+}
+
+#[cfg(test)]
+mod compute_scroll_tests {
+    use super::compute_scroll;
+
+    // When text fits entirely, no scrolling and the cursor column equals
+    // the display width of the text before the cursor.
+    #[test]
+    fn ascii_fits_no_scroll() {
+        let (start, col) = compute_scroll("hello", 5, 20);
+        assert_eq!(start, 0);
+        assert_eq!(col, 5);
+    }
+
+    #[test]
+    fn ascii_cursor_mid_string() {
+        let (start, col) = compute_scroll("hello", 2, 20);
+        assert_eq!(start, 0);
+        assert_eq!(col, 2);
+    }
+
+    // Regression for the reported bug: bullet `●` is 3 bytes, 1 column.
+    // Cursor col must be 1 per bullet, not 3.
+    #[test]
+    fn multibyte_narrow_char_bullet() {
+        let text = "●";
+        let cursor = text.len(); // 3 bytes
+        let (start, col) = compute_scroll(text, cursor, 20);
+        assert_eq!(start, 0);
+        assert_eq!(col, 1, "cursor after `●` must be at column 1, not 3");
+    }
+
+    #[test]
+    fn multibyte_narrow_run() {
+        let text = "●●●●●";
+        let cursor = text.len(); // 15 bytes, 5 cols
+        let (start, col) = compute_scroll(text, cursor, 20);
+        assert_eq!(start, 0);
+        assert_eq!(col, 5);
+    }
+
+    #[test]
+    fn cursor_between_multibyte_chars() {
+        // cursor after the second `●` (6 bytes in)
+        let text = "●●●";
+        let cursor = 6;
+        let (_, col) = compute_scroll(text, cursor, 20);
+        assert_eq!(col, 2);
+    }
+
+    // Wide chars (e.g. CJK) are 2 columns each, even though `.chars()` is 1.
+    #[test]
+    fn wide_cjk_char_takes_two_columns() {
+        let text = "中文";
+        let cursor = text.len(); // 6 bytes, 4 cols
+        let (start, col) = compute_scroll(text, cursor, 20);
+        assert_eq!(start, 0);
+        assert_eq!(col, 4);
+    }
+
+    // Mixed: ASCII + multi-byte narrow + wide
+    #[test]
+    fn mixed_ascii_bullet_cjk() {
+        // "a●中" = 1 + 3 + 3 = 7 bytes; widths 1 + 1 + 2 = 4 cols
+        let text = "a●中";
+        assert_eq!(text.len(), 7);
+        let (_, col) = compute_scroll(text, text.len(), 20);
+        assert_eq!(col, 4);
+    }
+
+    // Scrolling: text overflows available width, so visible_start moves
+    // forward and the cursor stays on the last visible column.
+    #[test]
+    fn scrolls_when_ascii_overflows() {
+        // 10 chars, width available 5 → last 4 + caret
+        let text = "abcdefghij";
+        let (start, col) = compute_scroll(text, text.len(), 5);
+        assert!(start > 0, "must scroll when text overflows");
+        // Cursor is inside viewport, leaving 1 col for caret.
+        assert!(col < 5, "cursor col {} must be < available 5", col);
+    }
+
+    #[test]
+    fn scrolls_with_multibyte_chars() {
+        // 10 bullets (10 cols wide, 30 bytes). available = 5.
+        let text = "●●●●●●●●●●";
+        let (start, col) = compute_scroll(text, text.len(), 5);
+        assert!(start > 0);
+        assert_eq!(start % 3, 0, "scroll must land on a char boundary");
+        assert!(col < 5);
+    }
+
+    // Returned byte offset must always be on a char boundary so slicing is safe.
+    #[test]
+    fn visible_start_is_always_char_boundary() {
+        let text = "●abc●def●";
+        let cursor = text.len();
+        for available in 1..=12 {
+            let (start, _) = compute_scroll(text, cursor, available);
+            assert!(
+                text.is_char_boundary(start),
+                "visible_start {} not a char boundary for available={} text={:?}",
+                start,
+                available,
+                text,
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_at_zero() {
+        let (start, col) = compute_scroll("●●●", 0, 10);
+        assert_eq!(start, 0);
+        assert_eq!(col, 0);
+    }
+
+    // available = 0 is a degenerate case; ensure we don't panic.
+    #[test]
+    fn zero_available_does_not_panic() {
+        let (_start, col) = compute_scroll("abc", 2, 0);
+        assert_eq!(col, 0);
+    }
+
+    // Empty text — cursor is always at column 0.
+    #[test]
+    fn empty_text() {
+        let (start, col) = compute_scroll("", 0, 10);
+        assert_eq!(start, 0);
+        assert_eq!(col, 0);
     }
 }

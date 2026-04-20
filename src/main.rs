@@ -33,12 +33,15 @@ mod vt;
 mod watcher;
 pub mod webdav;
 
-use std::io;
+use std::io::{self, Write};
 use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -68,6 +71,8 @@ fn main() -> Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
+        let _ = io::stdout().write_all(b"\x1b[>4m");
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
         let _ = execute!(
             io::stdout(),
             LeaveAlternateScreen,
@@ -81,6 +86,44 @@ fn main() -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+
+    // Ask the terminal to forward every keystroke — including chords the
+    // terminal would normally intercept (Shift+PageDown, Ctrl+Ins, Ctrl+C,
+    // terminal-level copy/scroll shortcuts). Two orthogonal extensions are
+    // pushed so at least one takes effect on whatever terminal is running:
+    //
+    //   1. kitty keyboard protocol (CSI = N u). Supported by Kitty, WezTerm,
+    //      Ghostty, foot, Alacritty, recent Konsole/iTerm2. Flags:
+    //        - DISAMBIGUATE_ESCAPE_CODES: encode modifier-qualified function
+    //          keys as distinct CSI-u sequences.
+    //        - REPORT_ALL_KEYS_AS_ESCAPE_CODES: report *every* key as a
+    //          CSI-u sequence, even ones the terminal normally consumes
+    //          (scroll shortcuts, copy/paste). This is what makes
+    //          Shift+PageDown reach the app on Ghostty/Kitty/etc. without
+    //          requiring per-user terminal config edits.
+    //      We deliberately do not request REPORT_EVENT_TYPES — the app
+    //      treats every KeyEvent as a press, so enabling release/repeat
+    //      events would double actions.
+    //   2. xterm modifyOtherKeys=2 (CSI > 4;2 m). Supported by xterm,
+    //      gnome-terminal/VTE, Konsole, tmux, and most xterm-compatible
+    //      terminals. Makes the terminal encode Shift+FKey etc. using the
+    //      extended `CSI ... ; <mod> ~` form that crossterm already parses.
+    //      This does NOT override GUI-level keybinds (those must be
+    //      unbound in terminal settings) — it only ensures the modifier
+    //      bits are included on keys the terminal does forward.
+    //
+    // Terminals that don't understand a given sequence ignore it silently,
+    // so this is safe to send unconditionally.
+    let _ = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+        ),
+    );
+    let _ = stdout.write_all(b"\x1b[>4;2m");
+    let _ = stdout.flush();
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -88,6 +131,8 @@ fn main() -> Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
+    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    let _ = terminal.backend_mut().write_all(b"\x1b[>4m"); // modifyOtherKeys off
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
@@ -96,7 +141,6 @@ fn main() -> Result<()> {
     )?;
     terminal.show_cursor()?;
     // Flush to ensure all escape sequences are fully written before the shell takes over
-    use std::io::Write;
     let _ = io::stdout().flush();
 
     if let Err(e) = result {
