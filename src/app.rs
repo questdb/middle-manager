@@ -6804,13 +6804,9 @@ impl App {
                 } else {
                     None
                 };
-                if let Some(mut params) = params {
-                    params.direction = if action == Action::FindNext {
-                        SearchDirection::Forward
-                    } else {
-                        SearchDirection::Backward
-                    };
-                    self.do_find(params, false);
+                if let Some(params) = params {
+                    let repeat = params.repeat(action == Action::FindPrev);
+                    self.do_find(repeat, false);
                 } else if let AppMode::Editing(ref mut e) = self.mode {
                     e.status_msg = Some("No previous search".to_string());
                 }
@@ -7212,8 +7208,9 @@ impl App {
     }
 
     /// Run a non-wrapping search. If not found, show the wrap confirmation dialog.
-    /// When `save` is true, updates `last_search` (used by the dialog). FindNext/FindPrev
-    /// pass false so they don't overwrite the dialog's direction setting.
+    /// `save` updates `last_search` — only the dialog-confirm path sets it; a
+    /// FindNext/FindPrev repeat keeps the dialog's original params intact so
+    /// later repeats keep reading from the same baseline direction.
     fn do_find(&mut self, params: crate::editor::SearchParams, save: bool) {
         if let AppMode::Editing(ref mut e) = self.mode {
             if save {

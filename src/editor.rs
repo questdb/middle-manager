@@ -14,6 +14,28 @@ pub struct SearchParams {
     pub case_sensitive: bool,
 }
 
+impl SearchParams {
+    /// Params for a "repeat search" keystroke (Shift+F7 / Ctrl+N / Ctrl+P) given
+    /// the last search the user confirmed. `reverse` flips the stored direction;
+    /// the non-reversed case keeps it — so the user's dialog choice (Forward vs
+    /// Backward) is preserved across repeats.
+    pub fn repeat(&self, reverse: bool) -> SearchParams {
+        let direction = if reverse {
+            match self.direction {
+                SearchDirection::Forward => SearchDirection::Backward,
+                SearchDirection::Backward => SearchDirection::Forward,
+            }
+        } else {
+            self.direction
+        };
+        SearchParams {
+            query: self.query.clone(),
+            direction,
+            case_sensitive: self.case_sensitive,
+        }
+    }
+}
+
 const INDEX_INTERVAL: usize = 1000;
 
 pub struct EditorState {
@@ -2289,6 +2311,103 @@ mod tests {
             direction,
             case_sensitive,
         }
+    }
+
+    // --- SearchParams::repeat tests ---
+    //
+    // These pin down the rule: a "repeat search" keystroke (Shift+F7 / Ctrl+N,
+    // or Ctrl+P for the reverse variant) must preserve the direction the user
+    // picked in the F7 dialog. Previously `FindNext` hard-forced Forward, so a
+    // backward search from the dialog flipped to forward on the first repeat.
+
+    #[test]
+    fn repeat_preserves_backward_direction() {
+        // User searched Backward via dialog → FindNext (reverse=false) keeps it.
+        let last = make_search("foo", SearchDirection::Backward, true);
+        let next = last.repeat(false);
+        assert!(matches!(next.direction, SearchDirection::Backward));
+    }
+
+    #[test]
+    fn repeat_preserves_forward_direction() {
+        let last = make_search("foo", SearchDirection::Forward, true);
+        let next = last.repeat(false);
+        assert!(matches!(next.direction, SearchDirection::Forward));
+    }
+
+    #[test]
+    fn repeat_reverse_flips_backward_to_forward() {
+        // User searched Backward → FindPrev (reverse=true) goes the other way.
+        let last = make_search("foo", SearchDirection::Backward, true);
+        let prev = last.repeat(true);
+        assert!(matches!(prev.direction, SearchDirection::Forward));
+    }
+
+    #[test]
+    fn repeat_reverse_flips_forward_to_backward() {
+        let last = make_search("foo", SearchDirection::Forward, true);
+        let prev = last.repeat(true);
+        assert!(matches!(prev.direction, SearchDirection::Backward));
+    }
+
+    #[test]
+    fn repeat_preserves_query_and_case_sensitive() {
+        let last = make_search("Hello", SearchDirection::Backward, true);
+        let next = last.repeat(false);
+        assert_eq!(next.query, "Hello");
+        assert!(next.case_sensitive);
+
+        let prev = last.repeat(true);
+        assert_eq!(prev.query, "Hello");
+        assert!(prev.case_sensitive);
+
+        let insensitive = make_search("hi", SearchDirection::Forward, false);
+        assert!(!insensitive.repeat(false).case_sensitive);
+        assert!(!insensitive.repeat(true).case_sensitive);
+    }
+
+    /// End-to-end regression test: simulate the reported scenario using
+    /// `EditorState::find` with the params `SearchParams::repeat` produces.
+    /// If FindNext ever regresses to forcing Forward, this test will fail
+    /// because the cursor will land on line 2 instead of line 0.
+    #[test]
+    fn repeat_after_backward_dialog_search_continues_backward() {
+        let mut editor = create_test_editor("hello world\nfoo bar\nhello again\n");
+        // Simulate the dialog confirm: user set direction=Backward, search hit
+        // "hello" on line 2 (cursor at match start, anchor at match end).
+        editor.cursor_line = 2;
+        editor.cursor_col = 0;
+        editor.selection_anchor = Some((2, 5));
+        let dialog_params = make_search("hello", SearchDirection::Backward, true);
+        editor.last_search = Some(dialog_params.clone());
+
+        // Press Shift+F7 (FindNext == reverse=false).
+        let repeat = editor.last_search.as_ref().unwrap().repeat(false);
+        assert!(matches!(repeat.direction, SearchDirection::Backward));
+        assert!(editor.find(&repeat));
+        // Must find the earlier "hello" on line 0, not walk forward.
+        assert_eq!(editor.cursor_line, 0);
+        assert_eq!(editor.cursor_col, 0);
+    }
+
+    /// Same scenario the other way: dialog search Forward, then FindPrev
+    /// (reverse=true) must search backward even though last_search says Forward.
+    #[test]
+    fn repeat_prev_after_forward_dialog_search_goes_backward() {
+        let mut editor = create_test_editor("hello world\nfoo bar\nhello again\n");
+        // Forward search landed on "hello" on line 2.
+        editor.cursor_line = 2;
+        editor.cursor_col = 0;
+        editor.selection_anchor = Some((2, 5));
+        let dialog_params = make_search("hello", SearchDirection::Forward, true);
+        editor.last_search = Some(dialog_params.clone());
+
+        // Ctrl+P / FindPrev — reverse of the saved direction.
+        let repeat = editor.last_search.as_ref().unwrap().repeat(true);
+        assert!(matches!(repeat.direction, SearchDirection::Backward));
+        assert!(editor.find(&repeat));
+        assert_eq!(editor.cursor_line, 0);
+        assert_eq!(editor.cursor_col, 0);
     }
 
     #[test]
