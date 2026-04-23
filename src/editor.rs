@@ -3,6 +3,7 @@ use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write as IoWrite};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use unicode_width::UnicodeWidthChar;
 
 use crate::app::SearchDirection;
 use crate::syntax::SyntaxHighlighter;
@@ -38,9 +39,18 @@ impl SearchParams {
 
 const INDEX_INTERVAL: usize = 1000;
 
+/// UTF-8 byte-order mark. When present as the first three bytes of a file,
+/// it's treated as file-level metadata: hidden from cursor/column math and
+/// re-emitted verbatim on save, regardless of which lines were edited.
+const UTF8_BOM: [u8; 3] = [0xEF, 0xBB, 0xBF];
+
 pub struct EditorState {
     pub path: PathBuf,
     pub file_size: u64,
+
+    /// Length of the leading BOM in bytes (0 for no BOM, 3 for UTF-8 BOM).
+    /// Original segments are indexed past this offset; save() re-emits it.
+    bom_len: u64,
 
     // Line-level piece table
     segments: Vec<Segment>,
@@ -136,17 +146,19 @@ enum Segment {
 impl EditorState {
     pub fn open(path: PathBuf) -> Self {
         let file_size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let bom_len = detect_utf8_bom(&path, file_size);
         let syntax = SyntaxHighlighter::new(&path, ratatui::style::Color::LightCyan);
         let mut state = Self {
             path,
             file_size,
+            bom_len,
             segments: vec![Segment::Original {
                 start_line: 0,
                 count: usize::MAX / 2,
             }],
-            line_index: vec![0],
+            line_index: vec![bom_len],
             lines_scanned: 0,
-            scan_byte_offset: 0,
+            scan_byte_offset: bom_len,
             scan_complete: false,
             cursor_line: 0,
             cursor_col: 0,
@@ -1056,12 +1068,23 @@ impl EditorState {
         if self.visible_lines > 0 && self.cursor_line >= self.scroll_y + self.visible_lines {
             self.scroll_y = self.cursor_line - self.visible_lines + 1;
         }
-        // Horizontal
-        if self.cursor_col < self.scroll_x {
-            self.scroll_x = self.cursor_col;
+        // Horizontal. scroll_x and cursor_col are char indices; visible_cols is
+        // display cells. Mixing the two only works for pure ASCII, so compute
+        // both positions as display columns before deciding where to scroll.
+        if self.visible_cols == 0 {
+            return;
         }
-        if self.visible_cols > 0 && self.cursor_col >= self.scroll_x + self.visible_cols {
-            self.scroll_x = self.cursor_col - self.visible_cols + 1;
+        let text = self.current_line_text();
+        let cursor_disp = display_col_of(&text, self.cursor_col);
+        let scroll_disp = display_col_of(&text, self.scroll_x);
+
+        if cursor_disp < scroll_disp {
+            self.scroll_x = self.cursor_col;
+        } else if cursor_disp >= scroll_disp + self.visible_cols {
+            // Pick the leftmost char whose display col keeps the cursor one
+            // cell from the right edge.
+            let target_disp = cursor_disp + 1 - self.visible_cols;
+            self.scroll_x = char_at_display_col(&text, target_disp);
         }
     }
 
@@ -1145,15 +1168,23 @@ impl EditorState {
             // Horizontally center the match when it fits; otherwise anchor its
             // start at the left edge so the beginning is visible. Default
             // scroll_to_cursor would clip a long match to a single char at the
-            // right edge.
-            if self.visible_cols > 0
-                && (col < self.scroll_x || col + match_len > self.scroll_x + self.visible_cols)
-            {
-                self.scroll_x = if match_len < self.visible_cols {
-                    col.saturating_sub((self.visible_cols - match_len) / 2)
-                } else {
-                    col
-                };
+            // right edge. Display-cell units throughout — tabs and wide chars
+            // would otherwise push the match off-screen silently.
+            if self.visible_cols > 0 {
+                let text = self.current_line_text();
+                let match_start_disp = display_col_of(&text, col);
+                let match_end_disp = display_col_of(&text, col + match_len);
+                let match_width = match_end_disp.saturating_sub(match_start_disp);
+                let scroll_disp = display_col_of(&text, self.scroll_x);
+                let fits = match_end_disp <= scroll_disp + self.visible_cols;
+                if !fits {
+                    let target_disp = if match_width < self.visible_cols {
+                        match_start_disp.saturating_sub((self.visible_cols - match_width) / 2)
+                    } else {
+                        match_start_disp
+                    };
+                    self.scroll_x = char_at_display_col(&text, target_disp);
+                }
             }
             return true;
         }
@@ -1727,6 +1758,14 @@ impl EditorState {
                 std::io::BufWriter::with_capacity(256 * 1024, File::create(&temp_path)?);
             let orig_file = File::open(&self.path)?;
 
+            // Preserve the BOM as file-level metadata. Original segments are
+            // indexed past it (line_index[0] == bom_len), so it's never in
+            // any segment's byte range; writing it here keeps it in the file
+            // regardless of which lines were edited.
+            if self.bom_len > 0 {
+                writer.write_all(&UTF8_BOM[..self.bom_len as usize])?;
+            }
+
             for (i, seg) in segments_snapshot.iter().enumerate() {
                 match seg {
                     Segment::Original { .. } => {
@@ -1762,15 +1801,16 @@ impl EditorState {
         std::fs::rename(&temp_path, &self.path)
             .with_context(|| format!("Failed to rename temp file to {:?}", self.path))?;
 
-        // Reinitialize
+        // Reinitialize. bom_len stays the same: save() just re-emitted the
+        // BOM verbatim, so if the file had one going in, it still does.
         self.file_size = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
         self.segments = vec![Segment::Original {
             start_line: 0,
             count: usize::MAX / 2,
         }];
-        self.line_index = vec![0];
+        self.line_index = vec![self.bom_len];
         self.lines_scanned = 0;
-        self.scan_byte_offset = 0;
+        self.scan_byte_offset = self.bom_len;
         self.scan_complete = false;
         self.modified = false;
         self.status_msg = Some("Saved.".to_string());
@@ -1841,12 +1881,7 @@ impl EditorState {
                 Ok(_) => {
                     if current_line == orig_line {
                         let trimmed = buf.trim_end_matches('\n').trim_end_matches('\r');
-                        let stripped = if orig_line == 0 {
-                            trimmed.strip_prefix('\u{FEFF}').unwrap_or(trimmed)
-                        } else {
-                            trimmed
-                        };
-                        return Some(stripped.to_string());
+                        return Some(trimmed.to_string());
                     }
                     current_line += 1;
                 }
@@ -2203,6 +2238,70 @@ fn char_to_byte(s: &str, char_pos: usize) -> usize {
         .nth(char_pos)
         .map(|(i, _)| i)
         .unwrap_or(s.len())
+}
+
+/// Display column (in terminal cells) after the first `char_idx` chars of
+/// `text`. Tabs expand to the next multiple of 4; control chars are
+/// zero-width; everything else uses `UnicodeWidthChar`. Mirrors the
+/// conventions used by the renderer in `ui/editor_view.rs`.
+fn display_col_of(text: &str, char_idx: usize) -> usize {
+    let mut disp = 0;
+    for (i, ch) in text.chars().enumerate() {
+        if i >= char_idx {
+            break;
+        }
+        if ch == '\t' {
+            disp += 4 - (disp % 4);
+        } else if ch.is_control() {
+            continue;
+        } else {
+            disp += UnicodeWidthChar::width(ch).unwrap_or(1);
+        }
+    }
+    disp
+}
+
+/// Smallest char index whose `display_col_of` is >= `target_disp`. If the
+/// target falls in the middle of a wide char or tab, returns the index past
+/// that char. If the target exceeds the line width, returns the char count.
+fn char_at_display_col(text: &str, target_disp: usize) -> usize {
+    let mut disp = 0;
+    let mut count = 0;
+    for (i, ch) in text.chars().enumerate() {
+        if disp >= target_disp {
+            return i;
+        }
+        if ch == '\t' {
+            disp += 4 - (disp % 4);
+        } else if ch.is_control() {
+            // zero-width
+        } else {
+            disp += UnicodeWidthChar::width(ch).unwrap_or(1);
+        }
+        count = i + 1;
+    }
+    count
+}
+
+/// Returns 3 if the file starts with a UTF-8 BOM, else 0. Best-effort: any
+/// I/O error or short file returns 0.
+fn detect_utf8_bom(path: &std::path::Path, file_size: u64) -> u64 {
+    if file_size < 3 {
+        return 0;
+    }
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(_) => return 0,
+    };
+    let mut head = [0u8; 3];
+    if f.read_exact(&mut head).is_err() {
+        return 0;
+    }
+    if head == UTF8_BOM {
+        3
+    } else {
+        0
+    }
 }
 
 #[cfg(test)]
@@ -3875,5 +3974,288 @@ mod tests {
 
         e.clear_selection();
         assert!(e.selection_anchor.is_none());
+    }
+
+    // ---------------------------------------------------------------
+    // UTF-8 BOM handling
+    //
+    // The BOM is treated as file-level metadata: stripped from display
+    // (cursor lands on visible content, not the zero-width marker) and
+    // re-emitted verbatim on save regardless of which lines were edited.
+    // ---------------------------------------------------------------
+
+    fn write_bytes(path: &std::path::Path, bytes: &[u8]) {
+        let mut f = std::fs::File::create(path).unwrap();
+        f.write_all(bytes).unwrap();
+    }
+
+    fn bom_file(content_after_bom: &str) -> std::path::PathBuf {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("mm_bom_{}_{}.txt", std::process::id(), id,));
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&UTF8_BOM);
+        bytes.extend_from_slice(content_after_bom.as_bytes());
+        write_bytes(&path, &bytes);
+        path
+    }
+
+    #[test]
+    fn bom_detected_at_open() {
+        let path = bom_file("hello\nworld\n");
+        let e = EditorState::open(path);
+        assert_eq!(e.bom_len, 3);
+    }
+
+    #[test]
+    fn no_bom_on_plain_ascii() {
+        let mut e = create_test_editor("hello\nworld\n");
+        assert_eq!(e.bom_len, 0);
+        assert_eq!(e.get_line_text(0), Some("hello".to_string()));
+    }
+
+    #[test]
+    fn bom_stripped_from_displayed_line_0() {
+        let path = bom_file("hello\nworld\n");
+        let mut e = EditorState::open(path);
+        assert_eq!(e.get_line_text(0), Some("hello".to_string()));
+        assert_eq!(e.get_line_text(1), Some("world".to_string()));
+    }
+
+    #[test]
+    fn bom_preserved_on_save_when_unmodified_line_0() {
+        let path = bom_file("hello\nworld\n");
+        let mut e = EditorState::open(path.clone());
+        // Edit line 1 only.
+        e.cursor_line = 1;
+        e.cursor_col = 5;
+        e.insert_char('!');
+        e.save().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..3], &UTF8_BOM);
+        assert_eq!(&bytes[3..], b"hello\nworld!\n");
+    }
+
+    #[test]
+    fn bom_preserved_on_save_when_line_0_edited() {
+        // Regression: editing line 0 used to silently drop the BOM because
+        // the materialized Buffer segment didn't include it.
+        let path = bom_file("hello\nworld\n");
+        let mut e = EditorState::open(path.clone());
+        e.cursor_line = 0;
+        e.cursor_col = 5;
+        e.insert_char('!');
+        e.save().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..3], &UTF8_BOM, "BOM must survive editing line 0");
+        assert_eq!(&bytes[3..], b"hello!\nworld\n");
+    }
+
+    #[test]
+    fn bom_preserved_on_save_when_unmodified() {
+        let path = bom_file("hello\nworld\n");
+        let mut e = EditorState::open(path.clone());
+        // Save without any edits.
+        e.save().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..3], &UTF8_BOM);
+        assert_eq!(&bytes[3..], b"hello\nworld\n");
+    }
+
+    #[test]
+    fn save_twice_does_not_accumulate_boms() {
+        let path = bom_file("hello\n");
+        let mut e = EditorState::open(path.clone());
+        e.cursor_line = 0;
+        e.cursor_col = 5;
+        e.insert_char('!');
+        e.save().unwrap();
+        // Second save: bom_len is still 3, Originals still indexed past it.
+        e.cursor_line = 0;
+        e.cursor_col = 6;
+        e.insert_char('?');
+        e.save().unwrap();
+
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(&bytes[..3], &UTF8_BOM);
+        // Exactly one BOM, not two.
+        assert_ne!(&bytes[3..6], &UTF8_BOM);
+        assert_eq!(&bytes[3..], b"hello!?\n");
+    }
+
+    #[test]
+    fn short_file_without_bom_is_fine() {
+        // 2-byte file can't have a complete BOM; bom_len must be 0.
+        let path = std::env::temp_dir().join(format!("mm_short_{}.txt", std::process::id(),));
+        write_bytes(&path, b"hi");
+        let e = EditorState::open(path);
+        assert_eq!(e.bom_len, 0);
+    }
+
+    // ---------------------------------------------------------------
+    // Horizontal-scroll unit-math tests
+    //
+    // Regression coverage for the bug where scroll_to_cursor compared
+    // char indices (cursor_col, scroll_x) to display cells (visible_cols).
+    // On lines with tabs or wide chars that caused the cursor to render
+    // off-screen because the scroll math said it was in range.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn display_col_of_ascii() {
+        assert_eq!(display_col_of("hello", 0), 0);
+        assert_eq!(display_col_of("hello", 3), 3);
+        assert_eq!(display_col_of("hello", 5), 5);
+    }
+
+    #[test]
+    fn display_col_of_wide_chars() {
+        // Each CJK char is 2 display cells.
+        assert_eq!(display_col_of("中文", 1), 2);
+        assert_eq!(display_col_of("中文", 2), 4);
+    }
+
+    #[test]
+    fn display_col_of_tabs() {
+        // Tabs advance to the next multiple of 4.
+        assert_eq!(display_col_of("\thi", 1), 4);
+        assert_eq!(display_col_of("\thi", 2), 5);
+        // Tab mid-line: "ab\t" → 'a'=1, 'b'=2, '\t' jumps from 2 to 4.
+        assert_eq!(display_col_of("ab\t", 3), 4);
+    }
+
+    #[test]
+    fn display_col_of_control_chars_zero_width() {
+        // \r is stripped in display.
+        assert_eq!(display_col_of("a\rb", 3), 2);
+    }
+
+    #[test]
+    fn char_at_display_col_ascii() {
+        assert_eq!(char_at_display_col("hello", 0), 0);
+        assert_eq!(char_at_display_col("hello", 3), 3);
+        assert_eq!(char_at_display_col("hello", 10), 5);
+    }
+
+    #[test]
+    fn char_at_display_col_wide_char_boundary_jumps_past() {
+        // Target falls inside "中" (cells 0..2). Returns index past it so
+        // scroll_x lands on a safe char boundary.
+        assert_eq!(char_at_display_col("中文", 1), 1);
+        assert_eq!(char_at_display_col("中文", 2), 1);
+        assert_eq!(char_at_display_col("中文", 3), 2);
+    }
+
+    #[test]
+    fn scroll_to_cursor_keeps_wide_char_cursor_visible() {
+        // Regression: pre-fix, cursor_col=6 (chars) < visible_cols=10 (cells),
+        // so scroll_to_cursor was a no-op and the cursor rendered at display
+        // col 12 — two cells past the viewport edge.
+        let mut e = create_test_editor("中中中中中中\n");
+        e.visible_cols = 10;
+        e.cursor_line = 0;
+        e.cursor_col = 6;
+        e.scroll_x = 0;
+
+        e.scroll_to_cursor();
+
+        let text = e.current_line_text();
+        let cursor_disp = display_col_of(&text, e.cursor_col);
+        let scroll_disp = display_col_of(&text, e.scroll_x);
+        assert!(
+            cursor_disp < scroll_disp + e.visible_cols,
+            "cursor disp {} must be < scroll {} + visible {} ",
+            cursor_disp,
+            scroll_disp,
+            e.visible_cols,
+        );
+    }
+
+    #[test]
+    fn scroll_to_cursor_keeps_tab_cursor_visible() {
+        // "\thello" — tab expands to 4 cells, 'hello' = 5 more, cursor after
+        // 'o' is at display col 9. visible_cols=6 means cursor_col=6 (chars)
+        // but display col 9 is off-screen. Fix must scroll so it's visible.
+        let mut e = create_test_editor("\thello\n");
+        e.visible_cols = 6;
+        e.cursor_line = 0;
+        e.cursor_col = 6;
+        e.scroll_x = 0;
+
+        e.scroll_to_cursor();
+
+        let text = e.current_line_text();
+        let cursor_disp = display_col_of(&text, e.cursor_col);
+        let scroll_disp = display_col_of(&text, e.scroll_x);
+        assert!(
+            cursor_disp < scroll_disp + e.visible_cols,
+            "cursor disp {} must be < scroll {} + visible {}",
+            cursor_disp,
+            scroll_disp,
+            e.visible_cols,
+        );
+    }
+
+    #[test]
+    fn scroll_to_cursor_ascii_one_cell_from_right_edge() {
+        // Baseline — pure ASCII still behaves as before (cursor at rightmost
+        // cell, one-cell margin for the caret).
+        let mut e = create_test_editor("abcdefghij\n");
+        e.visible_cols = 5;
+        e.cursor_line = 0;
+        e.cursor_col = 9; // past viewport
+        e.scroll_x = 0;
+
+        e.scroll_to_cursor();
+
+        // cursor_col - visible_cols + 1 = 5 → scroll_x = 5, cursor at disp 9,
+        // relative to scroll_disp 5 → in-view col 4 (last cell).
+        assert_eq!(e.scroll_x, 5);
+    }
+
+    #[test]
+    fn scroll_to_cursor_pulls_back_when_cursor_moves_left() {
+        // Cursor moved left of the viewport — scroll_x must snap to cursor_col.
+        let mut e = create_test_editor("abcdefghij\n");
+        e.visible_cols = 5;
+        e.cursor_line = 0;
+        e.cursor_col = 2;
+        e.scroll_x = 7;
+
+        e.scroll_to_cursor();
+
+        assert_eq!(e.scroll_x, 2);
+    }
+
+    #[test]
+    fn scroll_to_cursor_no_op_when_visible_cols_zero() {
+        // Pre-layout state (before the renderer has set visible_cols) must
+        // not mutate scroll_x — the bounds aren't known yet.
+        let mut e = create_test_editor("abcdefghij\n");
+        e.visible_cols = 0;
+        e.cursor_line = 0;
+        e.cursor_col = 5;
+        e.scroll_x = 3;
+
+        e.scroll_to_cursor();
+
+        assert_eq!(e.scroll_x, 3);
+    }
+
+    #[test]
+    fn scroll_to_cursor_stays_put_when_cursor_in_viewport() {
+        let mut e = create_test_editor("abcdefghij\n");
+        e.visible_cols = 10;
+        e.cursor_line = 0;
+        e.cursor_col = 5;
+        e.scroll_x = 2;
+
+        e.scroll_to_cursor();
+
+        assert_eq!(e.scroll_x, 2);
     }
 }
