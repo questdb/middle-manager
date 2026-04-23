@@ -78,6 +78,7 @@ fn main() -> Result<()> {
             io::stdout(),
             LeaveAlternateScreen,
             DisableMouseCapture,
+            DisableBracketedPaste,
             crossterm::cursor::SetCursorStyle::DefaultUserShape
         );
         original_hook(panic_info);
@@ -385,8 +386,14 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                 // Route each char through the normal DialogInput pipeline.
                 // Only one render fires per loop iteration, so the whole paste
                 // lands in a single frame instead of one char per draw.
+                // Newlines dispatch EditorNewline so multi-line pastes preserve
+                // line breaks in the editor; it is a no-op in other modes.
                 for c in text.chars() {
-                    if c == '\n' || c == '\r' {
+                    if c == '\r' {
+                        continue;
+                    }
+                    if c == '\n' {
+                        app.handle_action(action::Action::EditorNewline);
                         continue;
                     }
                     app.handle_action(action::Action::DialogInput(c));
