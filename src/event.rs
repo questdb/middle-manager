@@ -13,6 +13,8 @@ pub enum AppEvent {
     Tick,
     /// Wakeup signal — PTY has output ready, re-render immediately.
     Wakeup,
+    /// Bracketed paste — terminal pasted multi-char text in one chunk.
+    Paste(String),
 }
 
 /// A coalescing wakeup sender. Multiple sends between polls collapse into one Wakeup event.
@@ -65,6 +67,7 @@ impl EventHandler {
                     }
                     Ok(Event::Mouse(mouse)) => Some(AppEvent::Mouse(mouse)),
                     Ok(Event::Resize(w, h)) => Some(AppEvent::Resize(w, h)),
+                    Ok(Event::Paste(text)) => Some(AppEvent::Paste(text)),
                     _ => None,
                 };
                 if let Some(ev) = app_event {

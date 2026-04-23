@@ -1142,6 +1142,19 @@ impl EditorState {
             self.cursor_col = col;
             self.desired_col = self.cursor_col;
             self.scroll_to_cursor();
+            // Horizontally center the match when it fits; otherwise anchor its
+            // start at the left edge so the beginning is visible. Default
+            // scroll_to_cursor would clip a long match to a single char at the
+            // right edge.
+            if self.visible_cols > 0
+                && (col < self.scroll_x || col + match_len > self.scroll_x + self.visible_cols)
+            {
+                self.scroll_x = if match_len < self.visible_cols {
+                    col.saturating_sub((self.visible_cols - match_len) / 2)
+                } else {
+                    col
+                };
+            }
             return true;
         }
 
@@ -1606,6 +1619,22 @@ impl EditorState {
         self.ensure_anchor();
         self.cursor_right();
     }
+    pub fn select_word_left(&mut self) {
+        self.ensure_anchor();
+        self.word_left();
+    }
+    pub fn select_word_right(&mut self) {
+        self.ensure_anchor();
+        self.word_right();
+    }
+    pub fn select_to_top(&mut self) {
+        self.ensure_anchor();
+        self.goto_top();
+    }
+    pub fn select_to_bottom(&mut self) {
+        self.ensure_anchor();
+        self.goto_bottom();
+    }
     pub fn select_line_start(&mut self) {
         self.ensure_anchor();
         self.cursor_line_start();
@@ -1812,7 +1841,12 @@ impl EditorState {
                 Ok(_) => {
                     if current_line == orig_line {
                         let trimmed = buf.trim_end_matches('\n').trim_end_matches('\r');
-                        return Some(trimmed.to_string());
+                        let stripped = if orig_line == 0 {
+                            trimmed.strip_prefix('\u{FEFF}').unwrap_or(trimmed)
+                        } else {
+                            trimmed
+                        };
+                        return Some(stripped.to_string());
                     }
                     current_line += 1;
                 }
@@ -2686,6 +2720,32 @@ mod tests {
         assert_eq!(editor.selection_anchor, Some((0, 0)));
         assert_eq!(editor.cursor_col, 3);
         assert_eq!(editor.selected_text(), Some("hel".to_string()));
+    }
+
+    #[test]
+    fn select_word_right_at_top_of_file() {
+        let mut editor = create_test_editor("hello world foo\nsecond line here\n");
+        editor.cursor_line = 0;
+        editor.cursor_col = 0;
+        editor.select_word_right();
+        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        assert_eq!(editor.cursor_col, 6);
+        assert_eq!(editor.selected_text(), Some("hello ".to_string()));
+        editor.select_word_right();
+        assert_eq!(editor.selection_anchor, Some((0, 0)));
+        assert_eq!(editor.cursor_col, 12);
+        assert_eq!(editor.selected_text(), Some("hello world ".to_string()));
+    }
+
+    #[test]
+    fn select_word_right_at_line_2() {
+        let mut editor = create_test_editor("hello world foo\nsecond line here\n");
+        editor.cursor_line = 1;
+        editor.cursor_col = 0;
+        editor.select_word_right();
+        assert_eq!(editor.selection_anchor, Some((1, 0)));
+        assert_eq!(editor.cursor_col, 7);
+        assert_eq!(editor.selected_text(), Some("second ".to_string()));
     }
 
     #[test]

@@ -3621,8 +3621,12 @@ impl App {
                 KeyCode::Char('z') => Action::EditorUndo,
                 KeyCode::Char('g') => Action::GotoLinePrompt,
                 KeyCode::Char('q') => Action::DialogCancel,
+                KeyCode::Left if shift => Action::SelectWordLeft,
+                KeyCode::Right if shift => Action::SelectWordRight,
                 KeyCode::Left => Action::WordLeft, // Ctrl+Left (Linux)
                 KeyCode::Right => Action::WordRight, // Ctrl+Right (Linux)
+                KeyCode::Home | KeyCode::Up if shift => Action::SelectToTop,
+                KeyCode::End | KeyCode::Down if shift => Action::SelectToBottom,
                 KeyCode::Home | KeyCode::Up => Action::MoveToTop,
                 KeyCode::End | KeyCode::Down => Action::MoveToBottom,
                 _ => Action::None,
@@ -4933,6 +4937,10 @@ impl App {
             | Action::CopySelection
             | Action::WordLeft
             | Action::WordRight
+            | Action::SelectWordLeft
+            | Action::SelectWordRight
+            | Action::SelectToTop
+            | Action::SelectToBottom
             | Action::EditorUndo
             | Action::EditorRedo => {}
 
@@ -5744,8 +5752,10 @@ impl App {
             if let Some(ref mut w) = self.dir_watcher {
                 w.watch_dirs([&self.panels[0].current_dir, &self.panels[1].current_dir]);
             }
+        } else if path.is_file() {
+            self.open_file_for_edit(path);
         } else {
-            self.status_message = Some(format!("Not a directory: {}", expanded));
+            self.status_message = Some(format!("No such path: {}", expanded));
         }
     }
 
@@ -6615,6 +6625,26 @@ impl App {
             Action::SelectRight => {
                 if let AppMode::Editing(ref mut e) = self.mode {
                     e.select_right();
+                }
+            }
+            Action::SelectWordLeft => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.select_word_left();
+                }
+            }
+            Action::SelectWordRight => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.select_word_right();
+                }
+            }
+            Action::SelectToTop => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.select_to_top();
+                }
+            }
+            Action::SelectToBottom => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.select_to_bottom();
                 }
             }
             Action::SelectLineStart => {
@@ -11337,6 +11367,18 @@ mod editor_key_map_tests {
     fn shift_right_selects_right() {
         let ev = key(KeyCode::Right, KeyModifiers::SHIFT);
         assert!(matches!(App::map_editor_key(ev), Action::SelectRight));
+    }
+
+    #[test]
+    fn ctrl_shift_left_selects_word_left() {
+        let ev = key(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert!(matches!(App::map_editor_key(ev), Action::SelectWordLeft));
+    }
+
+    #[test]
+    fn ctrl_shift_right_selects_word_right() {
+        let ev = key(KeyCode::Right, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert!(matches!(App::map_editor_key(ev), Action::SelectWordRight));
     }
 
     // `handle_editor_action` has a `clears_selection` allowlist. If either
