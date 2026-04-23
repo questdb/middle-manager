@@ -33,17 +33,21 @@ mod vt;
 mod watcher;
 pub mod webdav;
 
-use std::io;
+use std::io::{self, Write};
 use std::process::Command;
 use std::time::Duration;
 
 use anyhow::Result;
-use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+use crossterm::event::{
+    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::Position;
 use ratatui::Terminal;
 
 use app::App;
@@ -68,10 +72,13 @@ fn main() -> Result<()> {
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let _ = disable_raw_mode();
+        let _ = io::stdout().write_all(b"\x1b[>4m");
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
         let _ = execute!(
             io::stdout(),
             LeaveAlternateScreen,
             DisableMouseCapture,
+            DisableBracketedPaste,
             crossterm::cursor::SetCursorStyle::DefaultUserShape
         );
         original_hook(panic_info);
@@ -80,7 +87,50 @@ fn main() -> Result<()> {
     // Setup terminal
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableBracketedPaste
+    )?;
+
+    // Ask the terminal to forward every keystroke — including chords the
+    // terminal would normally intercept (Shift+PageDown, Ctrl+Ins, Ctrl+C,
+    // terminal-level copy/scroll shortcuts). Two orthogonal extensions are
+    // pushed so at least one takes effect on whatever terminal is running:
+    //
+    //   1. kitty keyboard protocol (CSI = N u). Supported by Kitty, WezTerm,
+    //      Ghostty, foot, Alacritty, recent Konsole/iTerm2. Flags:
+    //        - DISAMBIGUATE_ESCAPE_CODES: encode modifier-qualified function
+    //          keys as distinct CSI-u sequences.
+    //        - REPORT_ALL_KEYS_AS_ESCAPE_CODES: report *every* key as a
+    //          CSI-u sequence, even ones the terminal normally consumes
+    //          (scroll shortcuts, copy/paste). This is what makes
+    //          Shift+PageDown reach the app on Ghostty/Kitty/etc. without
+    //          requiring per-user terminal config edits.
+    //      We deliberately do not request REPORT_EVENT_TYPES — the app
+    //      treats every KeyEvent as a press, so enabling release/repeat
+    //      events would double actions.
+    //   2. xterm modifyOtherKeys=2 (CSI > 4;2 m). Supported by xterm,
+    //      gnome-terminal/VTE, Konsole, tmux, and most xterm-compatible
+    //      terminals. Makes the terminal encode Shift+FKey etc. using the
+    //      extended `CSI ... ; <mod> ~` form that crossterm already parses.
+    //      This does NOT override GUI-level keybinds (those must be
+    //      unbound in terminal settings) — it only ensures the modifier
+    //      bits are included on keys the terminal does forward.
+    //
+    // Terminals that don't understand a given sequence ignore it silently,
+    // so this is safe to send unconditionally.
+    let _ = execute!(
+        stdout,
+        PushKeyboardEnhancementFlags(
+            KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                | KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES,
+        ),
+    );
+    let _ = stdout.write_all(b"\x1b[>4;2m");
+    let _ = stdout.flush();
+
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -88,15 +138,17 @@ fn main() -> Result<()> {
 
     // Restore terminal
     disable_raw_mode()?;
+    let _ = execute!(terminal.backend_mut(), PopKeyboardEnhancementFlags);
+    let _ = terminal.backend_mut().write_all(b"\x1b[>4m"); // modifyOtherKeys off
     execute!(
         terminal.backend_mut(),
         LeaveAlternateScreen,
         DisableMouseCapture,
+        DisableBracketedPaste,
         crossterm::cursor::SetCursorStyle::DefaultUserShape
     )?;
     terminal.show_cursor()?;
     // Flush to ensure all escape sequences are fully written before the shell takes over
-    use std::io::Write;
     let _ = io::stdout().flush();
 
     if let Err(e) = result {
@@ -234,7 +286,12 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
     app.restore_bottom_panels();
 
     // First render to compute actual panel areas, then resize PTYs to match
-    terminal.draw(|frame| ui::render(frame, &mut app))?;
+    terminal.draw(|frame| {
+        ui::render(frame, &mut app);
+        if let Some((x, y)) = ui::take_cursor() {
+            frame.set_cursor_position(Position { x, y });
+        }
+    })?;
     app.resize_all_bottom_panels();
 
     loop {
@@ -248,29 +305,28 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
         // Only redraw when state has changed (dirty flag).
         // Skipping draws on idle ticks lets the terminal's cursor blink undisturbed.
         if app.dirty {
-            terminal.draw(|frame| ui::render(frame, &mut app))?;
+            let mut cursor_pos: Option<(u16, u16)> = None;
+            terminal.draw(|frame| {
+                ui::render(frame, &mut app);
+                if let Some((x, y)) = ui::take_cursor() {
+                    frame.set_cursor_position(Position { x, y });
+                    cursor_pos = Some((x, y));
+                }
+            })?;
             app.resize_all_bottom_panels();
             app.dialog_content_area = ui::take_dialog_content();
             app.dirty = false;
 
-            // Manage cursor ourselves — ratatui always hides it (no set_cursor_position calls).
-            let new_cursor = ui::take_cursor();
-            match new_cursor {
+            // ratatui has shown + positioned the cursor (or hidden it). Apply
+            // our custom style on top when the cursor is visible.
+            match cursor_pos {
                 Some(pos) => {
                     let style = crate::theme::theme().editor_cursor;
-                    execute!(
-                        io::stdout(),
-                        crossterm::cursor::MoveTo(pos.0, pos.1),
-                        crossterm::cursor::Show,
-                        style
-                    )?;
+                    execute!(io::stdout(), style)?;
                     app.last_cursor_pos = Some(pos);
                 }
                 None => {
-                    if app.last_cursor_pos.is_some() {
-                        execute!(io::stdout(), crossterm::cursor::Hide)?;
-                        app.last_cursor_pos = None;
-                    }
+                    app.last_cursor_pos = None;
                 }
             }
         }
@@ -325,6 +381,23 @@ fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> 
                 app.dirty = true;
                 app.handle_action(action::Action::Tick);
                 events.ack_wakeup();
+            }
+            AppEvent::Paste(text) => {
+                // Route each char through the normal DialogInput pipeline.
+                // Only one render fires per loop iteration, so the whole paste
+                // lands in a single frame instead of one char per draw.
+                // Newlines dispatch EditorNewline so multi-line pastes preserve
+                // line breaks in the editor; it is a no-op in other modes.
+                for c in text.chars() {
+                    if c == '\r' {
+                        continue;
+                    }
+                    if c == '\n' {
+                        app.handle_action(action::Action::EditorNewline);
+                        continue;
+                    }
+                    app.handle_action(action::Action::DialogInput(c));
+                }
             }
         }
 

@@ -79,6 +79,10 @@ pub enum Action {
     // Word navigation (editor)
     WordLeft,
     WordRight,
+    SelectWordLeft,
+    SelectWordRight,
+    SelectToTop,
+    SelectToBottom,
 
     // Editor undo/redo
     EditorUndo,

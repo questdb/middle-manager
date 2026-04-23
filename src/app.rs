@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
 use std::env;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 const DOUBLE_CLICK_MS: u128 = 400;
@@ -1732,6 +1732,24 @@ fn strip_archive_extension(name: &str) -> &str {
     }
     // Try stripping just a single extension
     name.rsplit_once('.').map(|(base, _)| base).unwrap_or(name)
+}
+
+/// When the user types a single destination for a single source, we need to
+/// decide whether that destination is a target directory (Far Manager default)
+/// or an explicit target file path (rename-on-copy). Treat it as a file path
+/// only when all heuristics agree it can't be a directory.
+fn dest_is_file_path(dest: &Path) -> bool {
+    let s = dest.to_string_lossy();
+    if s.is_empty() {
+        return false;
+    }
+    if s.ends_with('/') || s.ends_with(std::path::MAIN_SEPARATOR) {
+        return false;
+    }
+    if dest.is_dir() {
+        return false;
+    }
+    true
 }
 
 pub struct ArchiveProgress {
@@ -3603,8 +3621,12 @@ impl App {
                 KeyCode::Char('z') => Action::EditorUndo,
                 KeyCode::Char('g') => Action::GotoLinePrompt,
                 KeyCode::Char('q') => Action::DialogCancel,
+                KeyCode::Left if shift => Action::SelectWordLeft,
+                KeyCode::Right if shift => Action::SelectWordRight,
                 KeyCode::Left => Action::WordLeft, // Ctrl+Left (Linux)
                 KeyCode::Right => Action::WordRight, // Ctrl+Right (Linux)
+                KeyCode::Home | KeyCode::Up if shift => Action::SelectToTop,
+                KeyCode::End | KeyCode::Down if shift => Action::SelectToBottom,
                 KeyCode::Home | KeyCode::Up => Action::MoveToTop,
                 KeyCode::End | KeyCode::Down => Action::MoveToBottom,
                 _ => Action::None,
@@ -4915,6 +4937,10 @@ impl App {
             | Action::CopySelection
             | Action::WordLeft
             | Action::WordRight
+            | Action::SelectWordLeft
+            | Action::SelectWordRight
+            | Action::SelectToTop
+            | Action::SelectToBottom
             | Action::EditorUndo
             | Action::EditorRedo => {}
 
@@ -5726,8 +5752,10 @@ impl App {
             if let Some(ref mut w) = self.dir_watcher {
                 w.watch_dirs([&self.panels[0].current_dir, &self.panels[1].current_dir]);
             }
+        } else if path.is_file() {
+            self.open_file_for_edit(path);
         } else {
-            self.status_message = Some(format!("Not a directory: {}", expanded));
+            self.status_message = Some(format!("No such path: {}", expanded));
         }
     }
 
@@ -6597,6 +6625,26 @@ impl App {
             Action::SelectRight => {
                 if let AppMode::Editing(ref mut e) = self.mode {
                     e.select_right();
+                }
+            }
+            Action::SelectWordLeft => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.select_word_left();
+                }
+            }
+            Action::SelectWordRight => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.select_word_right();
+                }
+            }
+            Action::SelectToTop => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.select_to_top();
+                }
+            }
+            Action::SelectToBottom => {
+                if let AppMode::Editing(ref mut e) = self.mode {
+                    e.select_to_bottom();
                 }
             }
             Action::SelectLineStart => {
@@ -9495,11 +9543,18 @@ impl App {
         }
 
         // Local → Local: use full copy options
+        let single_source = source_paths.len() == 1;
         if is_ask {
             let mut items = Vec::new();
             for dest in &dests {
+                let treat_as_file = single_source && dest_is_file_path(dest);
                 for source in &source_paths {
-                    match fs_ops::plan_copy(source, dest, opts.symlink_mode) {
+                    let result = if treat_as_file {
+                        fs_ops::plan_copy_to(source, dest, opts.symlink_mode)
+                    } else {
+                        fs_ops::plan_copy(source, dest, opts.symlink_mode)
+                    };
+                    match result {
                         Ok(plan) => items.extend(plan),
                         Err(e) => {
                             self.status_message = Some(format!("Error: {}", e));
@@ -9512,11 +9567,13 @@ impl App {
             self.continue_copy_ask(items, is_move, opts);
         } else {
             for dest in &dests {
+                let treat_as_file = single_source && dest_is_file_path(dest);
                 for source_path in &source_paths {
-                    let result = if is_move {
-                        fs_ops::move_entry(source_path, dest, &opts)
-                    } else {
-                        fs_ops::copy_entry(source_path, dest, &opts)
+                    let result = match (is_move, treat_as_file) {
+                        (true, true) => fs_ops::move_entry_to(source_path, dest, &opts),
+                        (true, false) => fs_ops::move_entry(source_path, dest, &opts),
+                        (false, true) => fs_ops::copy_entry_to(source_path, dest, &opts),
+                        (false, false) => fs_ops::copy_entry(source_path, dest, &opts),
                     };
                     if let Err(e) = result {
                         self.status_message = Some(format!("Error: {}", e));
@@ -11163,5 +11220,196 @@ mod azure_auth_dialog_tests {
         // AzCli has no input; active_input_mut returns tenant as a safe default.
         s.mode = AzureAuthMode::AzCli;
         let _ = s.active_input_mut();
+    }
+}
+
+#[cfg(test)]
+mod copy_dest_heuristic_tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn trailing_slash_is_treated_as_directory() {
+        assert!(!dest_is_file_path(Path::new("/tmp/foo/")));
+    }
+
+    #[test]
+    fn bare_directory_name_with_trailing_sep_is_directory() {
+        assert!(!dest_is_file_path(Path::new("/some/dir/")));
+    }
+
+    #[test]
+    fn existing_directory_without_trailing_slash_is_directory() {
+        let tmp = tempdir().unwrap();
+        let subdir = tmp.path().join("existing");
+        fs::create_dir_all(&subdir).unwrap();
+        assert!(!dest_is_file_path(&subdir));
+    }
+
+    #[test]
+    fn nonexistent_path_without_trailing_slash_is_file_path() {
+        // This is the user-reported case: /path/rd.md where rd.md doesn't
+        // exist as a directory — user intends to rename.
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("rd.md");
+        assert!(dest_is_file_path(&target));
+    }
+
+    #[test]
+    fn existing_regular_file_is_file_path() {
+        // Overwrite target: user points at an existing file — treat as file.
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("existing.txt");
+        fs::write(&target, "x").unwrap();
+        assert!(dest_is_file_path(&target));
+    }
+
+    #[test]
+    fn empty_path_is_not_file_path() {
+        assert!(!dest_is_file_path(Path::new("")));
+    }
+
+    #[test]
+    fn sibling_filename_does_not_confuse_heuristic() {
+        // /path/rd-blah.md exists, but user typed /path/rd.md — the target
+        // is not an existing dir and has no trailing slash, so it's a file
+        // path.
+        let tmp = tempdir().unwrap();
+        fs::write(tmp.path().join("rd-blah.md"), "sibling").unwrap();
+        let target = tmp.path().join("rd.md");
+        assert!(dest_is_file_path(&target));
+    }
+}
+
+#[cfg(test)]
+mod editor_key_map_tests {
+    //! Guard against regressions in which editor-mode keybindings fail to
+    //! produce the right action — in particular modifier-qualified keys
+    //! like Shift+PageDown that rely on terminal keyboard disambiguation.
+
+    use super::*;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(code: KeyCode, mods: KeyModifiers) -> KeyEvent {
+        KeyEvent::new(code, mods)
+    }
+
+    #[test]
+    fn shift_page_down_maps_to_select_page_down() {
+        let ev = key(KeyCode::PageDown, KeyModifiers::SHIFT);
+        assert!(matches!(App::map_editor_key(ev), Action::SelectPageDown));
+    }
+
+    #[test]
+    fn shift_page_up_maps_to_select_page_up() {
+        let ev = key(KeyCode::PageUp, KeyModifiers::SHIFT);
+        assert!(matches!(App::map_editor_key(ev), Action::SelectPageUp));
+    }
+
+    #[test]
+    fn plain_page_down_does_not_select() {
+        let ev = key(KeyCode::PageDown, KeyModifiers::NONE);
+        assert!(matches!(App::map_editor_key(ev), Action::PageDown));
+    }
+
+    #[test]
+    fn plain_page_up_does_not_select() {
+        let ev = key(KeyCode::PageUp, KeyModifiers::NONE);
+        assert!(matches!(App::map_editor_key(ev), Action::PageUp));
+    }
+
+    #[test]
+    fn alt_page_down_jumps_to_bottom() {
+        // Mac convention: Fn+Opt+Down → Alt+PageDown. Shift must not
+        // accidentally steal this binding.
+        let ev = key(KeyCode::PageDown, KeyModifiers::ALT);
+        assert!(matches!(App::map_editor_key(ev), Action::MoveToBottom));
+    }
+
+    #[test]
+    fn alt_page_up_jumps_to_top() {
+        let ev = key(KeyCode::PageUp, KeyModifiers::ALT);
+        assert!(matches!(App::map_editor_key(ev), Action::MoveToTop));
+    }
+
+    #[test]
+    fn shift_home_selects_line_start() {
+        let ev = key(KeyCode::Home, KeyModifiers::SHIFT);
+        assert!(matches!(App::map_editor_key(ev), Action::SelectLineStart));
+    }
+
+    #[test]
+    fn shift_end_selects_line_end() {
+        let ev = key(KeyCode::End, KeyModifiers::SHIFT);
+        assert!(matches!(App::map_editor_key(ev), Action::SelectLineEnd));
+    }
+
+    #[test]
+    fn shift_up_selects_up() {
+        let ev = key(KeyCode::Up, KeyModifiers::SHIFT);
+        assert!(matches!(App::map_editor_key(ev), Action::SelectUp));
+    }
+
+    #[test]
+    fn shift_down_selects_down() {
+        let ev = key(KeyCode::Down, KeyModifiers::SHIFT);
+        assert!(matches!(App::map_editor_key(ev), Action::SelectDown));
+    }
+
+    #[test]
+    fn shift_left_selects_left() {
+        let ev = key(KeyCode::Left, KeyModifiers::SHIFT);
+        assert!(matches!(App::map_editor_key(ev), Action::SelectLeft));
+    }
+
+    #[test]
+    fn shift_right_selects_right() {
+        let ev = key(KeyCode::Right, KeyModifiers::SHIFT);
+        assert!(matches!(App::map_editor_key(ev), Action::SelectRight));
+    }
+
+    #[test]
+    fn ctrl_shift_left_selects_word_left() {
+        let ev = key(KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert!(matches!(App::map_editor_key(ev), Action::SelectWordLeft));
+    }
+
+    #[test]
+    fn ctrl_shift_right_selects_word_right() {
+        let ev = key(KeyCode::Right, KeyModifiers::CONTROL | KeyModifiers::SHIFT);
+        assert!(matches!(App::map_editor_key(ev), Action::SelectWordRight));
+    }
+
+    // `handle_editor_action` has a `clears_selection` allowlist. If either
+    // SelectPageUp or SelectPageDown ever gets added to that list by
+    // mistake, selections would be wiped before the move — which is
+    // exactly the symptom the user reported. Cross-check here by asserting
+    // that the editor state keeps a selection after dispatching.
+    //
+    // We can't instantiate a full App in unit tests, but we can check the
+    // per-action behavior at the EditorState level.
+    #[test]
+    fn select_page_down_survives_dispatch_in_editor_state() {
+        use crate::editor::EditorState;
+        use std::io::Write;
+
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!("mm_dispatch_test_{}.txt", std::process::id()));
+        let mut lines = String::new();
+        for i in 0..200 {
+            lines.push_str(&format!("line {:03}\n", i));
+        }
+        let mut f = std::fs::File::create(&path).unwrap();
+        f.write_all(lines.as_bytes()).unwrap();
+        drop(f);
+
+        let mut e = EditorState::open(path);
+        e.visible_lines = 20;
+        e.cursor_line = 50;
+
+        e.select_page_down();
+        assert!(e.selection_anchor.is_some());
+        assert!(e.cursor_line > 50);
     }
 }

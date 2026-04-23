@@ -50,7 +50,8 @@ pub struct CopyItem {
 // Planning: flatten a source entry into individual copy items
 // ---------------------------------------------------------------------------
 
-/// Flatten a source entry into individual copy items.
+/// Flatten a source entry into individual copy items, placing them under
+/// `dest_dir` (the source's basename is appended).
 pub fn plan_copy(
     source: &Path,
     dest_dir: &Path,
@@ -58,8 +59,19 @@ pub fn plan_copy(
 ) -> Result<Vec<CopyItem>> {
     let file_name = source.file_name().context("source has no file name")?;
     let dest = dest_dir.join(file_name);
+    plan_copy_to(source, &dest, symlink_mode)
+}
+
+/// Flatten a source entry into individual copy items using `dest` as the
+/// final target path (rename-on-copy). Caller is responsible for deciding
+/// whether `dest` is a directory or a file path.
+pub fn plan_copy_to(
+    source: &Path,
+    dest: &Path,
+    symlink_mode: SymlinkCopyMode,
+) -> Result<Vec<CopyItem>> {
     let mut items = Vec::new();
-    plan_entry(source, &dest, symlink_mode, true, &mut items)?;
+    plan_entry(source, dest, symlink_mode, true, &mut items)?;
     Ok(items)
 }
 
@@ -142,10 +154,18 @@ pub fn exec_copy_item(item: &CopyItem, opts: &CopyOptions) -> Result<()> {
     copy_single_file(&item.src, &item.dst, opts)
 }
 
-/// Copy a full entry (file or directory tree) respecting all options.
+/// Copy a full entry (file or directory tree) into `dest_dir`, using the
+/// source's basename as the target name.
 pub fn copy_entry(source: &Path, dest_dir: &Path, opts: &CopyOptions) -> Result<()> {
     let file_name = source.file_name().context("source has no file name")?;
     let dest = dest_dir.join(file_name);
+    copy_entry_to(source, &dest, opts)
+}
+
+/// Copy a full entry (file or directory tree) to the exact path `dest`
+/// (rename-on-copy). Caller is responsible for deciding whether `dest` is a
+/// directory or a file path.
+pub fn copy_entry_to(source: &Path, dest: &Path, opts: &CopyOptions) -> Result<()> {
     let meta = source.symlink_metadata()?;
 
     if meta.is_symlink() {
@@ -155,14 +175,14 @@ pub fn copy_entry(source: &Path, dest_dir: &Path, opts: &CopyOptions) -> Result<
             SymlinkCopyMode::Smart => false, // top-level: follow
         };
         if should_preserve {
-            return copy_symlink(source, &dest);
+            return copy_symlink(source, dest);
         }
     }
 
     if source.is_dir() {
-        copy_dir_recursive(source, &dest, opts)?;
+        copy_dir_recursive(source, dest, opts)?;
     } else {
-        copy_single_file(source, &dest, opts)
+        copy_single_file(source, dest, opts)
             .with_context(|| format!("Failed to copy {:?} to {:?}", source, dest))?;
     }
     Ok(())
@@ -477,8 +497,12 @@ fn set_nocache(file: &fs::File) {
 pub fn move_entry(source: &Path, dest_dir: &Path, opts: &CopyOptions) -> Result<()> {
     let file_name = source.file_name().context("source has no file name")?;
     let dest = dest_dir.join(file_name);
+    move_entry_to(source, &dest, opts)
+}
 
-    let resolved = match resolve_dest(&dest, opts.conflict) {
+/// Move a source to the exact target path `dest` (rename-on-move).
+pub fn move_entry_to(source: &Path, dest: &Path, opts: &CopyOptions) -> Result<()> {
+    let resolved = match resolve_dest(dest, opts.conflict) {
         Some(p) => p,
         None => return Ok(()), // Skip
     };
@@ -1692,5 +1716,272 @@ mod tests {
         write_file(&path, "hi");
         let result = resolve_dest(&path, ConflictPolicy::Rename);
         assert_eq!(result, Some(tmp.path().join("exists(1).txt")));
+    }
+
+    // =====================================================================
+    // 13. Rename-on-copy (copy_entry_to / plan_copy_to / move_entry_to)
+    //
+    // Regression tests: copying a single file with an explicit target path
+    // (rename while copying) must write to that exact path — not join the
+    // source basename onto it as if it were a directory.
+    // =====================================================================
+
+    #[test]
+    fn copy_entry_to_renames_single_file() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("source.md");
+        write_file(&src, "hello");
+        let dst = tmp.path().join("renamed.md");
+
+        copy_entry_to(&src, &dst, &default_opts()).unwrap();
+
+        assert!(dst.exists());
+        assert_eq!(read_file(&dst), "hello");
+        // Source still exists (it's a copy, not a move)
+        assert!(src.exists());
+    }
+
+    #[test]
+    fn copy_entry_to_target_in_sibling_name_space() {
+        // User reported bug: /path/rd.md as destination while /path/rd-blah.md
+        // exists. Nothing must break on the sibling; the target gets created.
+        let tmp = tempdir().unwrap();
+        let dir = tmp.path().join("path");
+        fs::create_dir_all(&dir).unwrap();
+        write_file(&dir.join("rd-blah.md"), "sibling");
+
+        let src = tmp.path().join("source.md");
+        write_file(&src, "content");
+        let dst = dir.join("rd.md");
+
+        copy_entry_to(&src, &dst, &default_opts()).unwrap();
+
+        assert_eq!(read_file(&dst), "content");
+        assert_eq!(read_file(&dir.join("rd-blah.md")), "sibling");
+    }
+
+    #[test]
+    fn copy_entry_to_overwrites_existing_target() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("source.txt");
+        write_file(&src, "new");
+        let dst = tmp.path().join("target.txt");
+        write_file(&dst, "old");
+
+        let mut opts = default_opts();
+        opts.conflict = ConflictPolicy::Overwrite;
+        copy_entry_to(&src, &dst, &opts).unwrap();
+
+        assert_eq!(read_file(&dst), "new");
+    }
+
+    #[test]
+    fn copy_entry_to_skips_when_target_exists_and_policy_is_skip() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("source.txt");
+        write_file(&src, "new");
+        let dst = tmp.path().join("target.txt");
+        write_file(&dst, "old");
+
+        let mut opts = default_opts();
+        opts.conflict = ConflictPolicy::Skip;
+        copy_entry_to(&src, &dst, &opts).unwrap();
+
+        assert_eq!(read_file(&dst), "old");
+    }
+
+    #[test]
+    fn copy_entry_to_renames_on_conflict_when_policy_is_rename() {
+        // Rename policy creates a suffixed variant rather than using the
+        // user-specified target. This is the documented policy behavior.
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("source.txt");
+        write_file(&src, "new");
+        let dst = tmp.path().join("target.txt");
+        write_file(&dst, "old");
+
+        let mut opts = default_opts();
+        opts.conflict = ConflictPolicy::Rename;
+        copy_entry_to(&src, &dst, &opts).unwrap();
+
+        assert_eq!(read_file(&dst), "old");
+        assert_eq!(read_file(&tmp.path().join("target(1).txt")), "new");
+    }
+
+    #[test]
+    fn copy_entry_to_renames_directory() {
+        let tmp = tempdir().unwrap();
+        let src_dir = tmp.path().join("original");
+        fs::create_dir_all(src_dir.join("sub")).unwrap();
+        write_file(&src_dir.join("a.txt"), "A");
+        write_file(&src_dir.join("sub").join("b.txt"), "B");
+
+        let dst_dir = tmp.path().join("renamed");
+        copy_entry_to(&src_dir, &dst_dir, &default_opts()).unwrap();
+
+        assert!(dst_dir.is_dir());
+        assert_eq!(read_file(&dst_dir.join("a.txt")), "A");
+        assert_eq!(read_file(&dst_dir.join("sub").join("b.txt")), "B");
+        // Original still intact
+        assert!(src_dir.is_dir());
+    }
+
+    #[test]
+    fn copy_entry_to_fails_if_parent_missing() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("source.txt");
+        write_file(&src, "x");
+        let dst = tmp.path().join("missing_parent").join("target.txt");
+
+        // Surfaces an error (doesn't silently succeed)
+        let err = copy_entry_to(&src, &dst, &default_opts()).unwrap_err();
+        assert!(!dst.exists());
+        let msg = format!("{:#}", err);
+        assert!(msg.contains("Failed to copy") || msg.contains("Failed to create"));
+    }
+
+    #[test]
+    fn copy_entry_delegates_to_copy_entry_to() {
+        // copy_entry (the directory-style entry point) must still preserve
+        // legacy behavior: join source basename onto dest_dir.
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("file.txt");
+        write_file(&src, "abc");
+        let dst_dir = tmp.path().join("out");
+        fs::create_dir_all(&dst_dir).unwrap();
+
+        copy_entry(&src, &dst_dir, &default_opts()).unwrap();
+
+        assert_eq!(read_file(&dst_dir.join("file.txt")), "abc");
+    }
+
+    #[test]
+    fn plan_copy_to_produces_single_item_with_exact_dst() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("source.txt");
+        write_file(&src, "x");
+        let dst = tmp.path().join("renamed.txt");
+
+        let items = plan_copy_to(&src, &dst, SymlinkCopyMode::Follow).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].src, src);
+        assert_eq!(items[0].dst, dst);
+        assert!(!items[0].is_dir);
+        assert!(!items[0].is_symlink);
+    }
+
+    #[test]
+    fn plan_copy_to_directory_uses_dest_as_root() {
+        let tmp = tempdir().unwrap();
+        let src_dir = tmp.path().join("orig");
+        fs::create_dir_all(src_dir.join("inner")).unwrap();
+        write_file(&src_dir.join("a.txt"), "a");
+        write_file(&src_dir.join("inner").join("b.txt"), "b");
+
+        let dst = tmp.path().join("renamed");
+        let items = plan_copy_to(&src_dir, &dst, SymlinkCopyMode::Follow).unwrap();
+
+        // All dst paths must be rooted at `dst`, not at `dst/orig`.
+        for item in &items {
+            assert!(
+                item.dst == dst || item.dst.starts_with(&dst),
+                "dst {:?} not rooted at {:?}",
+                item.dst,
+                dst,
+            );
+            assert!(
+                !item.dst.starts_with(dst.join("orig")),
+                "dst {:?} unexpectedly contains source basename",
+                item.dst,
+            );
+        }
+    }
+
+    #[test]
+    fn plan_copy_delegates_to_plan_copy_to() {
+        // plan_copy (dir-style) must still join source basename onto dest_dir.
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("source.txt");
+        write_file(&src, "x");
+        let dst_dir = tmp.path().join("dst");
+        fs::create_dir_all(&dst_dir).unwrap();
+
+        let items = plan_copy(&src, &dst_dir, SymlinkCopyMode::Follow).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].dst, dst_dir.join("source.txt"));
+    }
+
+    #[test]
+    fn move_entry_to_renames_single_file_same_fs() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("source.txt");
+        write_file(&src, "payload");
+        let dst = tmp.path().join("renamed.txt");
+
+        move_entry_to(&src, &dst, &default_opts()).unwrap();
+
+        assert!(!src.exists());
+        assert_eq!(read_file(&dst), "payload");
+    }
+
+    #[test]
+    fn move_entry_to_skips_on_existing_target_with_skip_policy() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("source.txt");
+        write_file(&src, "new");
+        let dst = tmp.path().join("target.txt");
+        write_file(&dst, "old");
+
+        let mut opts = default_opts();
+        opts.conflict = ConflictPolicy::Skip;
+        move_entry_to(&src, &dst, &opts).unwrap();
+
+        // Source untouched, target untouched
+        assert_eq!(read_file(&src), "new");
+        assert_eq!(read_file(&dst), "old");
+    }
+
+    #[test]
+    fn move_entry_delegates_to_move_entry_to() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("file.txt");
+        write_file(&src, "abc");
+        let dst_dir = tmp.path().join("out");
+        fs::create_dir_all(&dst_dir).unwrap();
+
+        move_entry(&src, &dst_dir, &default_opts()).unwrap();
+
+        assert!(!src.exists());
+        assert_eq!(read_file(&dst_dir.join("file.txt")), "abc");
+    }
+
+    #[test]
+    fn copy_entry_to_preserves_content_of_large_file() {
+        // Guard against silent truncation when bypassing the dir-join path.
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("big.bin");
+        let content: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        fs::write(&src, &content).unwrap();
+
+        let dst = tmp.path().join("big_copy.bin");
+        copy_entry_to(&src, &dst, &default_opts()).unwrap();
+
+        let copied = fs::read(&dst).unwrap();
+        assert_eq!(copied, content);
+    }
+
+    #[test]
+    fn copy_entry_to_append_policy_concatenates() {
+        let tmp = tempdir().unwrap();
+        let src = tmp.path().join("src.txt");
+        write_file(&src, "NEW");
+        let dst = tmp.path().join("dst.txt");
+        write_file(&dst, "OLD");
+
+        let mut opts = default_opts();
+        opts.conflict = ConflictPolicy::Append;
+        copy_entry_to(&src, &dst, &opts).unwrap();
+
+        assert_eq!(read_file(&dst), "OLDNEW");
     }
 }

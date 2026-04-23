@@ -13,6 +13,8 @@ pub enum AppEvent {
     Tick,
     /// Wakeup signal — PTY has output ready, re-render immediately.
     Wakeup,
+    /// Bracketed paste — terminal pasted multi-char text in one chunk.
+    Paste(String),
 }
 
 /// A coalescing wakeup sender. Multiple sends between polls collapse into one Wakeup event.
@@ -54,9 +56,18 @@ impl EventHandler {
             }
             if event::poll(tick_rate).unwrap_or(false) {
                 let app_event = match event::read() {
-                    Ok(Event::Key(key)) => Some(AppEvent::Key(key)),
+                    Ok(Event::Key(key)) => {
+                        if crate::debug_log::is_enabled() {
+                            crate::debug_log::log(&format!(
+                                "KEY code={:?} mods={:?} kind={:?}",
+                                key.code, key.modifiers, key.kind,
+                            ));
+                        }
+                        Some(AppEvent::Key(key))
+                    }
                     Ok(Event::Mouse(mouse)) => Some(AppEvent::Mouse(mouse)),
                     Ok(Event::Resize(w, h)) => Some(AppEvent::Resize(w, h)),
+                    Ok(Event::Paste(text)) => Some(AppEvent::Paste(text)),
                     _ => None,
                 };
                 if let Some(ev) = app_event {
