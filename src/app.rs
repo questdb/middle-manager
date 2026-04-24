@@ -2641,7 +2641,65 @@ impl App {
             }
 
             // CI panel intercepts keys when focused
-            if matches!(self.focus, PanelFocus::Ci(_)) {
+            if let PanelFocus::Ci(side) = self.focus {
+                let editing = self.ci_panels[side]
+                    .as_ref()
+                    .map(|c| c.filter_editing)
+                    .unwrap_or(false);
+                let has_filter = self.ci_panels[side]
+                    .as_ref()
+                    .map(|c| !c.filter.is_empty())
+                    .unwrap_or(false);
+
+                // While editing the filter, most chars feed the filter input.
+                // F-keys still trigger their actions so the user can act on a
+                // filtered selection without committing first.
+                if editing {
+                    return match key.code {
+                        KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
+                            Action::BottomResizeUp
+                        }
+                        KeyCode::Down if key.modifiers.contains(KeyModifiers::ALT) => {
+                            Action::BottomResizeDown
+                        }
+                        KeyCode::Enter if key.modifiers.contains(KeyModifiers::ALT) => {
+                            Action::BottomMaximize
+                        }
+                        KeyCode::Esc => Action::CiFilterCancel,
+                        // Enter / Right commit the filter and take the
+                        // primary action (expand check or view step log).
+                        KeyCode::Enter => Action::Enter,
+                        KeyCode::Right => Action::CursorRight,
+                        KeyCode::Backspace => Action::CiFilterBackspace,
+                        KeyCode::Up => Action::MoveUp,
+                        KeyCode::Down => Action::MoveDown,
+                        KeyCode::PageUp => Action::PageUp,
+                        KeyCode::PageDown => Action::PageDown,
+                        KeyCode::Home => Action::MoveToTop,
+                        KeyCode::End => Action::MoveToBottom,
+                        KeyCode::Tab => Action::SwitchPanel,
+                        KeyCode::BackTab => Action::SwitchPanelReverse,
+                        KeyCode::F(2) => {
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                Action::ToggleSsh
+                            } else {
+                                Action::ToggleCi
+                            }
+                        }
+                        KeyCode::F(3) => Action::OpenPr,
+                        KeyCode::F(4) => Action::OpenAzureAuth,
+                        KeyCode::F(8) => Action::ExtractCiFailures,
+                        KeyCode::F(10) => Action::Quit,
+                        KeyCode::Char(c)
+                            if !key.modifiers.contains(KeyModifiers::CONTROL)
+                                && !key.modifiers.contains(KeyModifiers::ALT) =>
+                        {
+                            Action::CiFilterChar(c)
+                        }
+                        _ => Action::None,
+                    };
+                }
+
                 return match key.code {
                     KeyCode::Up if key.modifiers.contains(KeyModifiers::ALT) => {
                         Action::BottomResizeUp
@@ -2661,11 +2719,11 @@ impl App {
                     KeyCode::Enter => Action::Enter,
                     KeyCode::Right => Action::CursorRight,
                     KeyCode::Left => Action::GoUp,
-                    KeyCode::Char('o') => Action::OpenPr,
-                    KeyCode::Char('a') => Action::OpenAzureAuth,
-                    KeyCode::Char('e') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        Action::ExtractCiFailures
-                    }
+                    KeyCode::F(3) => Action::OpenPr,
+                    KeyCode::F(4) => Action::OpenAzureAuth,
+                    KeyCode::F(7) => Action::CiFilterOpen,
+                    KeyCode::F(8) => Action::ExtractCiFailures,
+                    KeyCode::Esc if has_filter => Action::CiFilterCancel,
                     KeyCode::Tab => Action::SwitchPanel,
                     KeyCode::BackTab => Action::SwitchPanelReverse,
                     KeyCode::F(2) => {
@@ -2676,6 +2734,13 @@ impl App {
                         }
                     }
                     KeyCode::F(10) => Action::Quit,
+                    // Type-to-search: any printable char auto-starts the filter.
+                    KeyCode::Char(c)
+                        if !key.modifiers.contains(KeyModifiers::CONTROL)
+                            && !key.modifiers.contains(KeyModifiers::ALT) =>
+                    {
+                        Action::CiFilterChar(c)
+                    }
                     _ => Action::None,
                 };
             }
@@ -5231,7 +5296,11 @@ impl App {
             Action::TerminalInput(_)
             | Action::TerminalOpenFile
             | Action::ToggleReverse
-            | Action::OpenAzureAuth => {} // handled by intercepts above
+            | Action::OpenAzureAuth
+            | Action::CiFilterOpen
+            | Action::CiFilterChar(_)
+            | Action::CiFilterBackspace
+            | Action::CiFilterCancel => {} // handled by intercepts above
         }
     }
 
@@ -7347,6 +7416,13 @@ impl App {
                 }
             }
             Action::Enter => {
+                // If user pressed Enter while still typing the filter, commit
+                // it first so the action operates on the filtered selection.
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    if ci.filter_editing {
+                        ci.filter_accept();
+                    }
+                }
                 // enter() returns Some if a step was selected for log viewing
                 let log_info = self.ci_panels[side].as_mut().and_then(|ci| ci.enter());
                 if let Some((run_id, step)) = log_info {
@@ -7354,8 +7430,12 @@ impl App {
                 }
             }
             Action::CursorRight => {
-                // Right: expand only (don't download on steps)
+                // Right: expand only (don't download on steps).
+                // Commit any in-progress filter first.
                 if let Some(ref mut ci) = self.ci_panels[side] {
+                    if ci.filter_editing {
+                        ci.filter_accept();
+                    }
                     ci.enter(); // returns Some for steps but we ignore it
                 }
             }
@@ -7393,6 +7473,26 @@ impl App {
             }
             Action::ExtractCiFailures => {
                 self.start_failure_extraction(side);
+            }
+            Action::CiFilterOpen => {
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.filter_open();
+                }
+            }
+            Action::CiFilterChar(c) => {
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.filter_input(c);
+                }
+            }
+            Action::CiFilterBackspace => {
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.filter_backspace();
+                }
+            }
+            Action::CiFilterCancel => {
+                if let Some(ref mut ci) = self.ci_panels[side] {
+                    ci.filter_cancel();
+                }
             }
             Action::BottomResizeUp => {
                 self.bottom_split_pct[side] = self.bottom_split_pct[side]
@@ -9022,18 +9122,25 @@ impl App {
             let job_id = self.ci_panels[side]
                 .as_ref()
                 .and_then(|ci| {
-                    if let crate::ci::CiView::Tree {
-                        items, selected, ..
+                    let crate::ci::CiView::Tree {
+                        items,
+                        checks,
+                        selected,
+                        ..
                     } = &ci.view
-                    {
-                        // Walk back from selected to find the parent check
-                        for i in (0..=*selected).rev() {
-                            if let crate::ci::TreeItem::Check { check, .. } = &items[i] {
-                                return Some(check.job_id);
-                            }
+                    else {
+                        return None;
+                    };
+                    // `selected` is a visible-position index; translate it
+                    // through the filter into the underlying items index.
+                    let visible = crate::ci::compute_visible(&ci.filter, items, checks);
+                    let item_idx = visible.get(*selected).copied()?;
+                    match items.get(item_idx)? {
+                        crate::ci::TreeItem::Check { check, .. } => Some(check.job_id),
+                        crate::ci::TreeItem::Step { check_idx, .. } => {
+                            checks.get(*check_idx).map(|c| c.job_id)
                         }
                     }
-                    None
                 })
                 .unwrap_or(0);
 
@@ -10134,7 +10241,7 @@ impl App {
                     && row < ci_area.y + ci_area.height
                 {
                     self.focus = PanelFocus::Ci(side);
-                    // Compute which item was clicked
+                    // Compute which item was clicked (display position → visible list)
                     if let Some(ref mut ci) = self.ci_panels[side] {
                         // Account for border (1 row for top border)
                         let inner_y = ci_area.y + 1;
@@ -10144,14 +10251,16 @@ impl App {
                                 crate::ci::CiView::Tree { scroll, .. } => *scroll,
                                 _ => 0,
                             };
-                            let target = scroll + click_offset;
-                            let item_count = match &ci.view {
-                                crate::ci::CiView::Tree { items, .. } => items.len(),
+                            let display_pos = scroll + click_offset;
+                            let visible_len = match &ci.view {
+                                crate::ci::CiView::Tree { items, checks, .. } => {
+                                    crate::ci::compute_visible(&ci.filter, items, checks).len()
+                                }
                                 _ => 0,
                             };
-                            if target < item_count {
+                            if display_pos < visible_len {
                                 if let crate::ci::CiView::Tree { selected, .. } = &mut ci.view {
-                                    *selected = target;
+                                    *selected = display_pos;
                                 }
                             }
                         }

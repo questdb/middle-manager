@@ -83,11 +83,12 @@ pub fn render_ci(frame: &mut Frame, area: Rect, view: &CiView) {
     let items: &[(&str, &str)] = match view {
         CiView::Tree { .. } => &[
             ("Enter", "Expand/Log"),
-            ("Ctrl+E", "Failures"),
-            ("o", "Browser"),
-            ("a", "Azure Auth"),
-            ("Tab", "Switch"),
             ("F2", "Close"),
+            ("F3", "Browser"),
+            ("F4", "Auth"),
+            ("F7", "Filter"),
+            ("F8", "Failures"),
+            ("Tab", "Switch"),
         ],
         _ => &[("Tab", "Switch"), ("F2", "Close")],
     };

@@ -115,6 +115,12 @@ pub enum Action {
     OpenAzureAuth,
     ToggleDiff,
 
+    // CI panel filter (inline text search)
+    CiFilterOpen,
+    CiFilterChar(char),
+    CiFilterBackspace,
+    CiFilterCancel,
+
     // Terminal / Shell / SSH / Sessions
     ToggleClaude,
     ToggleShell,

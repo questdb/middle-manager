@@ -4,7 +4,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph};
 use ratatui::Frame;
 
-use crate::ci::{CiPanel, CiStatus, CiView, TreeItem};
+use crate::ci::{compute_visible, CiPanel, CiStatus, CiView, TreeItem};
 use crate::theme::{theme, Theme};
 
 pub fn render(frame: &mut Frame, area: Rect, ci: &mut CiPanel, is_active: bool) {
@@ -14,7 +14,7 @@ pub fn render(frame: &mut Frame, area: Rect, ci: &mut CiPanel, is_active: bool) 
         format!(" {} ", dl.progress_text(ci.spinner_tick))
     } else {
         match &ci.view {
-            CiView::Tree { checks, .. } => {
+            CiView::Tree { checks, items, .. } => {
                 let total = checks.len();
                 let failed = checks
                     .iter()
@@ -24,10 +24,23 @@ pub fn render(frame: &mut Frame, area: Rect, ci: &mut CiPanel, is_active: bool) 
                     .pr_number
                     .map(|n| format!(" PR #{}", n))
                     .unwrap_or_default();
-                if failed > 0 {
-                    format!(" CI{} ({} failed / {}) ", pr_label, failed, total)
+                let base = if failed > 0 {
+                    format!(" CI{} ({} failed / {})", pr_label, failed, total)
                 } else {
-                    format!(" CI{} ({}) ", pr_label, total)
+                    format!(" CI{} ({})", pr_label, total)
+                };
+                if !ci.filter.is_empty() || ci.filter_editing {
+                    let visible_checks = compute_visible(&ci.filter, items, checks)
+                        .iter()
+                        .filter(|&&i| matches!(items.get(i), Some(TreeItem::Check { .. })))
+                        .count();
+                    let cursor = if ci.filter_editing { "_" } else { "" };
+                    format!(
+                        "{} /{}{} [{}/{}] ",
+                        base, ci.filter, cursor, visible_checks, total
+                    )
+                } else {
+                    format!("{} ", base)
                 }
             }
             CiView::Loading(msg) => format!(" {} ", msg),
@@ -58,14 +71,16 @@ pub fn render(frame: &mut Frame, area: Rect, ci: &mut CiPanel, is_active: bool) 
     match &ci.view {
         CiView::Tree {
             items,
+            checks,
             selected,
             scroll,
-            ..
         } => {
+            let visible = compute_visible(&ci.filter, items, checks);
             render_tree(
                 frame,
                 inner,
                 items,
+                &visible,
                 &TreeRenderCtx {
                     t: &t,
                     is_active,
@@ -94,7 +109,13 @@ struct TreeRenderCtx<'a> {
     spinner_tick: usize,
 }
 
-fn render_tree(frame: &mut Frame, area: Rect, items: &[TreeItem], ctx: &TreeRenderCtx) {
+fn render_tree(
+    frame: &mut Frame,
+    area: Rect,
+    items: &[TreeItem],
+    visible: &[usize],
+    ctx: &TreeRenderCtx,
+) {
     let visible_height = area.height as usize;
     let highlight = if ctx.is_active {
         ctx.t.highlight_style()
@@ -104,13 +125,17 @@ fn render_tree(frame: &mut Frame, area: Rect, items: &[TreeItem], ctx: &TreeRend
 
     let mut lines: Vec<Line> = Vec::with_capacity(visible_height);
 
-    for (i, item) in items
+    for (display_pos, &item_idx) in visible
         .iter()
         .enumerate()
         .skip(ctx.scroll)
         .take(visible_height)
     {
-        let is_sel = i == ctx.selected;
+        let item = match items.get(item_idx) {
+            Some(it) => it,
+            None => continue,
+        };
+        let is_sel = display_pos == ctx.selected;
 
         let t = ctx.t;
         let text_style = if is_sel { highlight } else { t.file_style() };

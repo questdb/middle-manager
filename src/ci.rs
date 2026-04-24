@@ -260,6 +260,34 @@ pub struct CiPanel {
     /// The check that last failed with an Azure auth error — used to auto-retry
     /// after the user completes authentication in the dialog.
     pending_auth_retry: Option<CiCheck>,
+    /// Substring filter applied to check display names (case-insensitive).
+    /// When non-empty, hides non-matching checks (and steps under them).
+    pub filter: String,
+    /// True while the user is editing the filter (typed chars go into it).
+    pub filter_editing: bool,
+}
+
+/// Indices of items that should be shown given the current filter.
+/// When filter is empty, returns 0..items.len(). When non-empty, includes
+/// each Check whose display_name contains the filter, plus any Steps whose
+/// parent check matches.
+pub fn compute_visible(filter: &str, items: &[TreeItem], checks: &[CiCheck]) -> Vec<usize> {
+    if filter.is_empty() {
+        return (0..items.len()).collect();
+    }
+    let needle = filter.to_lowercase();
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| match item {
+            TreeItem::Check { check, .. } => check.display_name().to_lowercase().contains(&needle),
+            TreeItem::Step { check_idx, .. } => checks
+                .get(*check_idx)
+                .map(|c| c.display_name().to_lowercase().contains(&needle))
+                .unwrap_or(false),
+        })
+        .map(|(i, _)| i)
+        .collect()
 }
 
 impl CiPanel {
@@ -279,6 +307,8 @@ impl CiPanel {
                 pending_steps: None,
                 failure_extraction: None,
                 pending_auth_retry: None,
+                filter: String::new(),
+                filter_editing: false,
             };
         }
 
@@ -304,6 +334,8 @@ impl CiPanel {
             pending_steps: None,
             failure_extraction: None,
             pending_auth_retry: None,
+            filter: String::new(),
+            filter_editing: false,
         }
     }
 
@@ -422,6 +454,7 @@ impl CiPanel {
     /// Returns Some((run_id, step)) if a step was activated for log viewing.
     pub fn enter(&mut self) -> Option<(u64, CiStep)> {
         let repo = self.repo.clone();
+        let filter = self.filter.clone();
         match &mut self.view {
             CiView::Tree {
                 checks,
@@ -429,7 +462,8 @@ impl CiPanel {
                 selected,
                 ..
             } => {
-                let sel = *selected;
+                let visible = compute_visible(&filter, items, checks);
+                let sel = visible.get(*selected).copied()?;
                 match items.get(sel) {
                     Some(TreeItem::Check { expanded: true, .. }) => {
                         // Collapse: remove step items below
@@ -558,39 +592,49 @@ impl CiPanel {
                 items,
                 selected,
                 ..
-            } => match items.get(*selected)? {
-                TreeItem::Check { check, .. } => Some(&check.details_url),
-                TreeItem::Step { check_idx, .. } => {
-                    checks.get(*check_idx).map(|c| c.details_url.as_str())
+            } => {
+                let visible = compute_visible(&self.filter, items, checks);
+                let item_idx = visible.get(*selected).copied()?;
+                match items.get(item_idx)? {
+                    TreeItem::Check { check, .. } => Some(&check.details_url),
+                    TreeItem::Step { check_idx, .. } => {
+                        checks.get(*check_idx).map(|c| c.details_url.as_str())
+                    }
                 }
-            },
+            }
             _ => None,
         }
     }
 
     /// Left arrow: collapse if on expanded check, jump to parent if on step.
     pub fn collapse_or_parent(&mut self) {
+        let filter = self.filter.clone();
         if let CiView::Tree {
             items,
+            checks,
             selected,
             scroll,
-            ..
         } = &mut self.view
         {
-            let sel = *selected;
-            match &items[sel] {
+            let visible = compute_visible(&filter, items, checks);
+            let Some(item_idx) = visible.get(*selected).copied() else {
+                return;
+            };
+            match &items[item_idx] {
                 TreeItem::Check { expanded: true, .. } => {
-                    Self::collapse_at(items, sel);
+                    Self::collapse_at(items, item_idx);
                 }
                 TreeItem::Step { .. } => {
-                    // Jump to parent check
-                    for i in (0..sel).rev() {
-                        if matches!(items[i], TreeItem::Check { .. }) {
-                            *selected = i;
-                            if *selected < *scroll {
-                                *scroll = *selected;
+                    // Jump to parent check (previous Check item in visible list)
+                    for vp in (0..*selected).rev() {
+                        if let Some(&i) = visible.get(vp) {
+                            if matches!(items[i], TreeItem::Check { .. }) {
+                                *selected = vp;
+                                if *selected < *scroll {
+                                    *scroll = *selected;
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
                 }
@@ -615,14 +659,16 @@ impl CiPanel {
 
     pub fn move_down(&mut self) {
         let vh = self.visible_height;
+        let filter = self.filter.clone();
         if let CiView::Tree {
             selected,
             scroll,
             items,
-            ..
+            checks,
         } = &mut self.view
         {
-            if *selected + 1 < items.len() {
+            let n = compute_visible(&filter, items, checks).len();
+            if *selected + 1 < n {
                 *selected += 1;
                 if vh > 0 && *selected >= *scroll + vh {
                     *scroll = *selected - vh + 1;
@@ -646,14 +692,16 @@ impl CiPanel {
 
     pub fn page_down(&mut self) {
         let vh = self.visible_height.max(1);
+        let filter = self.filter.clone();
         if let CiView::Tree {
             selected,
             scroll,
             items,
-            ..
+            checks,
         } = &mut self.view
         {
-            let max = items.len().saturating_sub(1);
+            let n = compute_visible(&filter, items, checks).len();
+            let max = n.saturating_sub(1);
             *selected = (*selected + vh).min(max);
             if vh > 0 && *selected >= *scroll + vh {
                 *scroll = *selected - vh + 1;
@@ -673,15 +721,80 @@ impl CiPanel {
 
     pub fn move_to_bottom(&mut self) {
         let vh = self.visible_height;
+        let filter = self.filter.clone();
         if let CiView::Tree {
             selected,
             scroll,
             items,
-            ..
+            checks,
         } = &mut self.view
         {
-            let max = items.len().saturating_sub(1);
+            let n = compute_visible(&filter, items, checks).len();
+            let max = n.saturating_sub(1);
             *selected = max;
+            if vh > 0 && *selected >= *scroll + vh {
+                *scroll = *selected - vh + 1;
+            }
+        }
+    }
+
+    // ---- Filter editing ----
+
+    /// Begin editing the filter (keeps existing filter text).
+    pub fn filter_open(&mut self) {
+        self.filter_editing = true;
+    }
+
+    /// Append a character to the filter; auto-starts editing so plain typing
+    /// (without a leading F7) opens the filter on the first keystroke.
+    pub fn filter_input(&mut self, c: char) {
+        self.filter_editing = true;
+        self.filter.push(c);
+        self.clamp_to_visible();
+    }
+
+    /// Remove the last character of the filter while editing.
+    pub fn filter_backspace(&mut self) {
+        if !self.filter_editing {
+            return;
+        }
+        self.filter.pop();
+        self.clamp_to_visible();
+    }
+
+    /// Commit the filter and exit editing mode (filter remains active).
+    pub fn filter_accept(&mut self) {
+        self.filter_editing = false;
+    }
+
+    /// Clear the filter and exit editing mode.
+    pub fn filter_cancel(&mut self) {
+        self.filter.clear();
+        self.filter_editing = false;
+        self.clamp_to_visible();
+    }
+
+    /// Clamp selected/scroll to the current visible list length.
+    fn clamp_to_visible(&mut self) {
+        let filter = self.filter.clone();
+        let vh = self.visible_height;
+        if let CiView::Tree {
+            items,
+            checks,
+            selected,
+            scroll,
+        } = &mut self.view
+        {
+            let n = compute_visible(&filter, items, checks).len();
+            if n == 0 {
+                *selected = 0;
+                *scroll = 0;
+                return;
+            }
+            *selected = (*selected).min(n - 1);
+            if *scroll > *selected {
+                *scroll = *selected;
+            }
             if vh > 0 && *selected >= *scroll + vh {
                 *scroll = *selected - vh + 1;
             }
@@ -1739,6 +1852,115 @@ mod tests {
         assert!(CiStatus::Failure.sort_priority() < CiStatus::Pending.sort_priority());
         assert!(CiStatus::Pending.sort_priority() < CiStatus::Success.sort_priority());
         assert!(CiStatus::Success.sort_priority() < CiStatus::Skipped.sort_priority());
+    }
+
+    fn make_check(workflow: &str, job: &str) -> CiCheck {
+        CiCheck {
+            workflow_name: workflow.to_string(),
+            job_name: job.to_string(),
+            status: CiStatus::Success,
+            details_url: format!("https://example.com/{}/{}", workflow, job),
+            run_id: 0,
+            job_id: 0,
+            azure_info: None,
+        }
+    }
+
+    #[test]
+    fn compute_visible_empty_filter_returns_all() {
+        let checks = vec![make_check("CI", "build"), make_check("CI", "lint")];
+        let items: Vec<TreeItem> = checks
+            .iter()
+            .map(|c| TreeItem::Check {
+                check: c.clone(),
+                expanded: false,
+                loading: false,
+            })
+            .collect();
+        let visible = compute_visible("", &items, &checks);
+        assert_eq!(visible, vec![0, 1]);
+    }
+
+    #[test]
+    fn compute_visible_filters_check_by_name_case_insensitive() {
+        let checks = vec![
+            make_check("CI", "Build (linux)"),
+            make_check("CI", "lint"),
+            make_check("CI", "test (BUILD)"),
+        ];
+        let items: Vec<TreeItem> = checks
+            .iter()
+            .map(|c| TreeItem::Check {
+                check: c.clone(),
+                expanded: false,
+                loading: false,
+            })
+            .collect();
+        let visible = compute_visible("build", &items, &checks);
+        assert_eq!(visible, vec![0, 2]); // both contain "build" (case-insensitive)
+    }
+
+    #[test]
+    fn compute_visible_includes_steps_under_matching_check() {
+        let checks = vec![make_check("CI", "build"), make_check("CI", "lint")];
+        // items: c0 (build), s0a, s0b, c1 (lint), s1a
+        let items = vec![
+            TreeItem::Check {
+                check: checks[0].clone(),
+                expanded: true,
+                loading: false,
+            },
+            TreeItem::Step {
+                step: CiStep {
+                    number: 1,
+                    name: "step1".to_string(),
+                    status: CiStatus::Success,
+                    log_url: None,
+                },
+                check_idx: 0,
+            },
+            TreeItem::Step {
+                step: CiStep {
+                    number: 2,
+                    name: "step2".to_string(),
+                    status: CiStatus::Success,
+                    log_url: None,
+                },
+                check_idx: 0,
+            },
+            TreeItem::Check {
+                check: checks[1].clone(),
+                expanded: true,
+                loading: false,
+            },
+            TreeItem::Step {
+                step: CiStep {
+                    number: 1,
+                    name: "step1".to_string(),
+                    status: CiStatus::Success,
+                    log_url: None,
+                },
+                check_idx: 1,
+            },
+        ];
+        // Filter "build" matches c0 → c0 and its steps visible; c1 (lint) hidden.
+        let visible = compute_visible("build", &items, &checks);
+        assert_eq!(visible, vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn compute_visible_no_matches_returns_empty() {
+        let checks = vec![make_check("CI", "build")];
+        let items: Vec<TreeItem> = checks
+            .iter()
+            .map(|c| TreeItem::Check {
+                check: c.clone(),
+                expanded: false,
+                loading: false,
+            })
+            .collect();
+        let visible = compute_visible("xyz_nope", &items, &checks);
+        assert!(visible.is_empty());
     }
 
     #[test]
