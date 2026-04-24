@@ -297,6 +297,10 @@ fn render_fuzzy_results(frame: &mut Frame, area: Rect, state: &FuzzySearchState)
 pub fn render(frame: &mut Frame, area: Rect, panel: &mut Panel, is_active: bool) {
     let t = theme();
 
+    // Record usable data rows (minus 2 border rows and 1 header row) so
+    // PageUp/PageDown can step by the actual viewport height.
+    panel.visible_rows = (area.height as usize).saturating_sub(3);
+
     let title_spans = build_panel_title(panel, &t, is_active, area.width as usize);
     let block = Block::default()
         .title(Line::from(title_spans))

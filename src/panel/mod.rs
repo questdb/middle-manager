@@ -66,6 +66,9 @@ pub struct Panel {
     pub dir_sizes: HashMap<PathBuf, DirSizeState>,
     /// Pending F3 size total: (dir paths to wait for, file bytes already summed, file count, dir count).
     pub pending_size_total: Option<(Vec<PathBuf>, u64, usize, usize)>,
+    /// Number of data rows the last render could display (excluding borders
+    /// and the header row). Used to size PageUp/PageDown to the window.
+    pub visible_rows: usize,
 }
 
 impl Panel {
@@ -83,6 +86,7 @@ impl Panel {
             source: PanelSource::Local,
             dir_sizes: HashMap::new(),
             pending_size_total: None,
+            visible_rows: 0,
         };
         panel.reload();
         if !panel.entries.is_empty() {

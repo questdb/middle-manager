@@ -5342,7 +5342,11 @@ impl App {
         match &mut self.mode {
             AppMode::ParquetViewing(p) => p.page_up(),
             AppMode::DiffViewing(d) => d.page_up(),
-            _ => self.active_panel_mut().move_selection(-20),
+            _ => {
+                let panel = self.active_panel_mut();
+                let page = panel.visible_rows.max(1) as i32;
+                panel.move_selection(-page);
+            }
         }
     }
 
@@ -5350,7 +5354,11 @@ impl App {
         match &mut self.mode {
             AppMode::ParquetViewing(p) => p.page_down(),
             AppMode::DiffViewing(d) => d.page_down(),
-            _ => self.active_panel_mut().move_selection(20),
+            _ => {
+                let panel = self.active_panel_mut();
+                let page = panel.visible_rows.max(1) as i32;
+                panel.move_selection(page);
+            }
         }
     }
 
